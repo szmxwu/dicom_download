@@ -1,0 +1,153 @@
+{
+  "orientation": {
+    "oblique_dominance_ratio": 0.9,
+    "fallback_keywords": {
+      "AX": ["ax", "tra", "trans"],
+      "SAG": ["sag", "sg"],
+      "COR": ["cor", "cr"],
+      "OBL": ["obl", "oblique"]
+    }
+  },
+  "fat_suppression": {
+    "ir_token": "IR",
+    "stir_ti_min": 100,
+    "stir_ti_max": 250,
+    "dixon_water_tokens": ["W", "WATER"],
+    "scan_options_fs_token": "FS",
+    "protocol_keywords": ["fs", "fatsat", "spair", "stir", "fat sep", "dixon"]
+  },
+  "atomic_features": {
+    "contrast_protocol_regex": "\\+c|post|gd|enh|contrast|\\u589e\\u5f3a|dyn",
+    "motion_correction_protocol_regex": "propeller|blade|radial|star"
+  },
+  "subtype_suffix": {
+    "water_tokens": ["WATER", " W ", "water"],
+    "fat_tokens": ["FAT", " F ", "fat"],
+    "inphase_tokens": ["INPHASE", " IP ", "in_phase", "inphase"],
+    "outphase_tokens": ["OUTPHASE", " OP ", "out_phase", "outphase"],
+    "t2_star_echo_marker": "t2_star_echo",
+    "t2_star_echo_split_token": "echo"
+  },
+  "thresholds": {
+    "field_strength": {
+      "3.0T": {
+        "t1_tr_max": 1800,
+        "t1_te_max": 40,
+        "t2_tr_min": 2500,
+        "t2_te_min": 75,
+        "pd_te_max": 50,
+        "flair_ti_min": 2000,
+        "stir_ti_max": 300
+      },
+      "1.5T": {
+        "t1_tr_max": 1200,
+        "t1_te_max": 40,
+        "t2_tr_min": 2000,
+        "t2_te_min": 70,
+        "pd_te_max": 50,
+        "flair_ti_min": 1800,
+        "stir_ti_max": 250
+      },
+      "Low-Field": {
+        "t1_tr_max": 1000,
+        "t1_te_max": 50,
+        "t2_tr_min": 1800,
+        "t2_te_min": 80,
+        "pd_te_max": 60,
+        "flair_ti_min": 1500,
+        "stir_ti_max": 200
+      },
+      "default": {
+        "t1_tr_max": 1500,
+        "t1_te_max": 40,
+        "t2_tr_min": 2000,
+        "t2_te_min": 75,
+        "pd_te_max": 50,
+        "flair_ti_min": 1800,
+        "stir_ti_max": 250
+      }
+    }
+  },
+  "classification": {
+    "ruleA": {
+      "LOCALIZER": {
+        "protocol_keywords": ["localizer", "survey", "scout"],
+        "refinedImageType": "LOCALIZER"
+      },
+      "T1_MAP": {"protocol_keywords": ["t1_map", "t1map"]},
+      "T2_MAP": {"protocol_keywords": ["t2_map", "t2map"]},
+      "ADC": {"protocol_keywords": ["adc"]},
+      "FA_MAP": {"protocol_keywords": ["fa_map"]},
+      "SUBTRACTION": {"protocol_keywords": ["sub", "subtract"]},
+      "MRA": {"protocol_keywords": ["mra", "mrv", "tof"]},
+      "SWI": {"protocol_keywords": ["swi", "swan"]},
+      "PWI": {"protocol_keywords": ["pwi", "perf", "dsc"]},
+      "MRS": {"protocol_keywords": ["mrs", "svs", "csi", "spectro"]},
+      "BREATH MOVEMENT": {"series_description_keywords": ["resp"]},
+      "MIP": {"series_description_keywords": ["mip"]}
+    },
+    "dwi_b_value_min": 50,
+    "fmri": {
+      "scan_seq_token": "ep",
+      "protocol_keywords": ["fmri", "bold"],
+      "class": "fMRI_BOLD"
+    },
+    "sequence_family": {
+      "gre_token": "gr",
+      "se_token": "se",
+      "steady_state_seq_variant_token": "ss",
+      "spoiled_seq_variant_token": "sp",
+      "single_shot_protocol_keywords": ["haste", "ssfse"],
+      "single_shot_etl_min": 128
+    },
+    "fallback": {
+      "tse_dark_fluid_to_flair": "tse_dark_fluid",
+      "tse_tokens": ["tse", "fse"],
+      "se_token": "se",
+      "mpr_iso_tokens": ["mpr", "iso"],
+      "requires_dimension_for_flash3d": "3D"
+    },
+    "motion_correction": {
+      "protocol_keywords": ["blade", "propeller"],
+      "suffix": "_MC"
+    }
+  },
+  "dynamic": {
+    "exclude_sequence_classes": [
+      "DWI",
+      "DTI",
+      "ADC",
+      "FA",
+      "MRS",
+      "PWI",
+      "ASL",
+      "LOCALIZER",
+      "DERIVED",
+      "SUBTRACTION",
+      "MAP",
+      "fMRI_BOLD",
+      "SWI",
+      "T2"
+    ],
+    "numeric_cols": ["RepetitionTime", "EchoTime", "FlipAngle", "SliceThickness", "SeriesTime"],
+    "spatial_cols": ["ImagePositionPatient", "ImageOrientationPatient"],
+    "list_round_decimals": 2,
+    "numeric_round_decimals": 1,
+    "fingerprint_cols": [
+      "ImagePositionPatient_str",
+      "ImageOrientationPatient_str",
+      "sequenceClass",
+      "SliceThickness",
+      "RepetitionTime",
+      "EchoTime",
+      "FlipAngle"
+    ],
+    "contrast_protocol_regex": "\\+c|post|gd|enh|contrast|\\u589e\\u5f3a|dyn",
+    "contrast_agent_exclude_regex": "no",
+    "exclude_sequence_regex": "DWI|T2|LOCALIZER"
+  },
+  "propagate": {
+    "t1_contains": "T1",
+    "propagated_phase": "POST_PROPAGATED"
+  }
+}

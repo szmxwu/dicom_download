@@ -6,7 +6,7 @@ DICOM处理Web应用
 
 修改说明：
 - 每个需要下载的任务都会自动创建新的DICOM客户端实例
-- 任务开始前自动登录DICOM服务 (admin/admin123)  
+- 任务开始前会调用DICOM客户端的兼容性登录接口（当前实现不做真实认证）
 - 任务完成后自动登出，确保会话安全
 - 上传文件处理不需要登录，仅处理本地文件
 - 全局客户端仅用于系统状态检查
@@ -25,13 +25,18 @@ import shutil
 from werkzeug.utils import secure_filename
 
 from dotenv import set_key
+import secrets
 
 # 导入我们的DICOM处理客户端
 from dicom_client_unified import DICOMDownloadClient
 
 # Flask应用配置
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-here'
+_secret_key = os.environ.get('FLASK_SECRET_KEY')
+if not _secret_key:
+    # 仅用于本地/临时运行；生产环境请通过环境变量提供固定值
+    _secret_key = secrets.token_hex(32)
+app.config['SECRET_KEY'] = _secret_key
 app.config['UPLOAD_FOLDER'] = './uploads'
 app.config['RESULT_FOLDER'] = './results'
 app.config['MAX_CONTENT_LENGTH'] = 1500 * 1024 * 1024  # 1500MB最大文件大小
@@ -594,18 +599,30 @@ def process_single_task(task):
             task.add_log(f"PACS connection check failed: {str(e)}", 'error')
             raise
         
-        # 自动登录
+        # 自动登录（兼容性接口：当前DICOM客户端不做真实认证）
         task.update_status('running', 10, 'Logging in to DICOM service')
         task.add_log("Logging in to DICOM service...")
         
         try:
-            if not task_client.login("admin", "admin123"):
+            username = os.getenv('DICOM_USERNAME', '')
+            password = os.getenv('DICOM_PASSWORD', '')
+            if not task_client.login(username, password):
                 raise Exception("DICOM service login failed")
             client_logged_in = True
             task.add_log("DICOM service login successful")
         except Exception as e:
             task.add_log(f"Login failed: {str(e)}", 'error')
             raise
+
+        # Attach progress callback so MR_clean can report progress back to task logs
+        def _mr_progress(msg, stage=None):
+            try:
+                task.add_log(msg)
+            except Exception:
+                pass
+            print(f"MR_PROGRESS[{stage}]: {msg}")
+
+        task_client.progress_callback = _mr_progress
         
         # 获取参数
         accession_number = task.parameters['accession_number']
@@ -716,13 +733,24 @@ def process_batch_task(task):
         # 创建新的DICOM客户端实例并登录
         task_client = DICOMDownloadClient()
         
-        # 自动登录
+        # 自动登录（兼容性接口：当前DICOM客户端不做真实认证）
         task.add_log("Logging in to DICOM service...")
-        if not task_client.login("admin", "admin123"):
+        username = os.getenv('DICOM_USERNAME', '')
+        password = os.getenv('DICOM_PASSWORD', '')
+        if not task_client.login(username, password):
             raise Exception("DICOM service login failed, please check service status")
         
         client_logged_in = True
         task.add_log("DICOM service login successful")
+        # Attach progress callback so MR_clean can report progress back to task logs
+        def _mr_progress(msg, stage=None):
+            try:
+                task.add_log(msg)
+            except Exception:
+                pass
+            print(f"MR_PROGRESS[{stage}]: {msg}")
+
+        task_client.progress_callback = _mr_progress
         
         task.update_status('running', 10, 'Initializing batch process')
         task.add_log(f"Start batch processing {len(accession_numbers)} studies")
@@ -920,7 +948,10 @@ if __name__ == '__main__':
         print("   仅支持本地文件上传处理")
     
     print("="*60)
-    print("🔐 使用认证信息: admin/admin123")
+    if os.getenv('DICOM_USERNAME') or os.getenv('DICOM_PASSWORD'):
+        print("🔐 已从环境变量读取DICOM登录信息")
+    else:
+        print("🔐 未配置DICOM登录信息（当前实现无需真实认证）")
     print("🚀 系统已就绪，等待用户请求...")
     print("📡 测试URL:")
     print("   - http://localhost:5005")

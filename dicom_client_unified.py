@@ -60,8 +60,10 @@ class DICOMDownloadClient:
         
         # 兼容性属性
         self.session_id = "dummy_session"
-        self.username = "admin"
-        self.role = "admin"
+        self.username = os.getenv('DICOM_USERNAME', '')
+        self.role = os.getenv('DICOM_ROLE', 'admin')
+        # optional progress callback to report MR_clean progress: function(message, stage)
+        self.progress_callback = None
     
     def _load_keywords(self, tags_dir="dicom_tags"):
         """加载不同模态的DICOM字段列表"""
@@ -1002,12 +1004,47 @@ class DICOMDownloadClient:
             print(f"📊 Total records: {total_files_read}")
             if dr_mg_dx_series > 0:
                 print(f"📋 DR/MG/DX series count: {dr_mg_dx_series} (all files read)")
+
+            self._append_mr_cleaned_sheet(df, output_excel)
             
             return output_excel
             
         except Exception as e:
             print(f"❌ Failed saving Excel file: {e}")
             return None
+
+    def _append_mr_cleaned_sheet(self, df: pd.DataFrame, output_excel: str) -> None:
+        """对 MR 记录做治理/规范化，并写回到同一个 Excel 的 MR_Cleaned sheet。"""
+        try:
+            if df is None or df.empty or 'Modality' not in df.columns:
+                return
+
+            mr_df = df[df['Modality'].astype(str).str.upper() == 'MR'].copy()
+            if mr_df.empty:
+                return
+
+            print(f"\n🔬 MR_clean: processing {len(mr_df)} MR records...")
+
+            from MR_clean import process_mri_dataframe
+
+            # forward optional progress callback
+            try:
+                cleaned_df = process_mri_dataframe(mr_df, progress_callback=self.progress_callback)
+            except TypeError:
+                # fallback for older MR_clean signature
+                cleaned_df = process_mri_dataframe(mr_df)
+
+            with pd.ExcelWriter(
+                output_excel,
+                engine='openpyxl',
+                mode='a',
+                if_sheet_exists='replace',
+            ) as writer:
+                cleaned_df.to_excel(writer, sheet_name='MR_Cleaned', index=False)
+
+            print("✅ MR_clean: MR_Cleaned sheet written.")
+        except Exception as e:
+            print(f"⚠️  MR_clean skipped/failed: {e}")
     
     def process_complete_workflow(self, accession_number, base_output_dir="./downloads",
                                 auto_extract=True, auto_organize=True, auto_metadata=True,

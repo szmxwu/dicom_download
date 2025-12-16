@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+
+# Ignore Excel outputs and temporary folders
+*.xlsx
+*.xls
+temp/
+
+# Ignore results and uploads (optional, already used)
+results/
+uploads/
+
+# Ignore caches
+*.cache
+
+# MacOS
+.DS_Store
+
+# Logs
+*.log
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dylib
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/

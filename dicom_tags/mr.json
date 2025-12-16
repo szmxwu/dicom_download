@@ -15,6 +15,7 @@
   "ManufacturerModelName",
   "StationName",
   "ProtocolName",
+  "ImageType",
   "Rows",
   "Columns",
   "BitsAllocated",

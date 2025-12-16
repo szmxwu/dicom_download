@@ -901,15 +901,19 @@ class DICOMProcessor {
     showResultCard(result) {
         const resultCard = document.getElementById('resultCard');
         const resultContent = document.getElementById('resultContent');
+
+        // 将来自后端的结果对象归一化为“仅包含安全原始类型”的结构，
+        // 避免将不可信数据直接拼接进 innerHTML。
+        const safeResult = this.normalizeResultForRender(result);
         
         let html = '';
         
         if (this.currentTask.type === 'single') {
-            html = this.renderSingleResult(result);
+            html = this.renderSingleResult(safeResult);
         } else if (this.currentTask.type === 'batch') {
-            html = this.renderBatchResult(result);
+            html = this.renderBatchResult(safeResult);
         } else if (this.currentTask.type === 'upload') {
-            html = this.renderUploadResult(result);
+            html = this.renderUploadResult(safeResult);
         }
         
         resultContent.innerHTML = html;
@@ -923,9 +927,30 @@ class DICOMProcessor {
         });
     }
 
+    // 将后端返回结果规整为安全可渲染的原始字段
+    normalizeResultForRender(result) {
+        const safe = {
+            excel_file: Boolean(result && result.excel_file),
+            result_zip: Boolean(result && result.result_zip),
+            total_processed: Number((result && result.total_processed) || 0),
+            total_failed: Number((result && result.total_failed) || 0),
+            series_count: Number((result && result.series_count) || 0)
+        };
+
+        if (result && result.series_info && typeof result.series_info === 'object') {
+            try {
+                safe.series_count = Object.keys(result.series_info).length;
+            } catch (error) {
+                // ignore
+            }
+        }
+
+        return safe;
+    }
+
     // 渲染单个处理结果
     renderSingleResult(result) {
-        const seriesCount = result.series_info ? Object.keys(result.series_info).length : 0;
+        const seriesCount = Number(result.series_count || 0);
         
         return `
             <div class="row">
