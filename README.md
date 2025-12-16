@@ -28,11 +28,11 @@ Create a `.env` file in the root directory with your PACS server details:
 
 ```ini
 # DICOM Server Configuration
-PACS_IP=172.17.250.192
-PACS_PORT=2104
-CALLING_AET=WMX01
-CALLED_AET=pacsFIR
-CALLING_PORT=1103
+PACS_IP=127.0.0.1
+PACS_PORT=1024
+CALLING_AET=cllient
+CALLED_AET=pacsServer
+CALLING_PORT=1023
 ```
 
 ### Metadata Templates
