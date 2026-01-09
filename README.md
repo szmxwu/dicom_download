@@ -79,3 +79,39 @@ MRI normalization rules (keywords/thresholds/regex) are externalized in `mr_clea
 - `static/`: Static assets (CSS, JS).
 - `uploads/`: Directory for uploaded files.
 - `results/`: Directory for processed results.
+
+## Output formats (NIfTI / NPZ)
+
+This project now supports exporting image data as either NIfTI (`.nii` / `.nii.gz`) or a normalized NPZ (`.npz`) file.
+
+- Front-end: there is an "Output Format" option in the Process Options panel where you can choose `NIfTI` (default) or `NPZ`.
+- Programmatic / CLI: when calling the processing workflow from Python, pass the `output_format` parameter to `process_complete_workflow`:
+
+```python
+from dicom_client_unified import DICOMDownloadClient
+
+client = DICOMDownloadClient()
+client.process_complete_workflow(
+      accession_number='M25053000056',
+      base_output_dir='./dicom_processed',
+      output_format='npz'  # 'nifti' or 'npz'
+)
+```
+
+- NPZ format details:
+   - The tool generates a compressed `.npz` file containing a single array named `data` (dtype: float32).
+   - The saved array shape is `[Z, Y, X]` where Z=depth (slices), Y=height (rows), X=width (cols). The file is normalized to a consistent patient-oriented coordinate system (based on DICOM ImageOrientationPatient / ImagePositionPatient):
+      - Z axis is ordered from head -> foot (Superior → Inferior).
+      - In-plane orientation is normalized to clinical axial (supine) view so that an extracted slice `arr[z]` is ready for display with common Python imaging tools.
+   - If your downstream pipeline expects a different layout (for example `[Z, X, Y]`), you can transpose the saved array easily after loading:
+
+```python
+import numpy as np
+
+arr = np.load('series.npz')['data']  # arr.shape == (Z, Y, X)
+arr_zxy = np.transpose(arr, (0, 2, 1))  # now shape == (Z, X, Y)
+```
+
+Notes:
+   - NPZ generation uses a temporary NIfTI intermediate (dcm2niix or Python libs) to obtain robust orientation information from DICOM tags.
+   - The `.npz` files are compressed with `np.savez_compressed` and use float32 to balance precision and size.
