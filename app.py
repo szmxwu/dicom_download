@@ -665,7 +665,8 @@ def process_single_task(task):
                 auto_organize=options.get('auto_organize', True),
                 auto_metadata=options.get('auto_metadata', True),
                 keep_zip=options.get('keep_zip', True),
-                keep_extracted=options.get('keep_extracted', False)
+                keep_extracted=options.get('keep_extracted', False),
+                output_format=options.get('output_format', 'nifti')
             )
             
             if results and results.get('success'):
@@ -774,7 +775,8 @@ def process_batch_task(task):
                     base_output_dir=result_dir,
                     auto_extract=options.get('auto_extract', True),
                     auto_organize=options.get('auto_organize', True),
-                    auto_metadata=options.get('auto_metadata', True)
+                    auto_metadata=options.get('auto_metadata', True),
+                    output_format=options.get('output_format', 'nifti')
                 )
                 results.append(result)
                 task.add_log(f'{accno} Process completed')
@@ -854,7 +856,10 @@ def process_upload_task(task):
                 # 整理文件
                 task.update_status('running', 50, 'Organizing files')
                 task.add_log("Organizing DICOM files by series...")
-                organized_dir, series_info = local_client.organize_dicom_files(extract_dir)
+                organized_dir, series_info = local_client.organize_dicom_files(
+                    extract_dir, 
+                    output_format=options.get('output_format', 'nifti')
+                )
                 task.add_log(f'File organization completed, found {len(series_info)} series')
                 
                 if options.get('auto_metadata', True):

@@ -377,14 +377,20 @@ class DICOMDownloadClient:
         
         return name if name else "Unknown"
     
-    def organize_dicom_files(self, extract_dir, organized_dir=None, convert_to_nifti=True):
-        """按Series整理DICOM文件并转换为NIfTI"""
+    def organize_dicom_files(self, extract_dir, organized_dir=None, output_format='nifti'):
+        """按Series整理DICOM文件并转换为指定格式 (nifti 或 npz)"""
         if organized_dir is None:
             organized_dir = os.path.join(extract_dir, "organized")
         
+        # 处理可能的旧版布尔参数兼容性
+        if output_format is True:
+            output_format = 'nifti'
+        elif output_format is False:
+            output_format = None
+
         os.makedirs(organized_dir, exist_ok=True)
         
-        print(f"📋 Organizing DICOM files...")
+        print(f"📋 Organizing DICOM files (format: {output_format})...")
         print(f"📂 Source directory: {extract_dir}")
         print(f"📂 Organized directory: {organized_dir}")
         
@@ -415,9 +421,11 @@ class DICOMDownloadClient:
                     'files': dicom_files
                 }
                 
-                # 如果需要转换为NIfTI
-                if convert_to_nifti:
+                # 执行转换
+                if output_format == 'nifti':
                     self.convert_dicom_to_nifti(series_path, series_folder)
+                elif output_format == 'npz':
+                    self._convert_to_npz(series_path, series_folder)
         
         print(f"✅ DICOM organization complete! Processed {processed_files} files")
         
@@ -449,6 +457,74 @@ class DICOMDownloadClient:
         except Exception as e:
             print(f"   ❌ NIfTI conversion failed: {e}")
             return {'success': False, 'error': str(e)}
+    
+    def _convert_to_npz(self, series_dir, series_name):
+        """将DICOM序列转换为NPZ格式，并按照要求规范化方向"""
+        try:
+            print(f"   🔄 Converting {series_name} to NPZ (Normalized)...")
+            
+            # Step 1: 先生成 NIfTI 作为中间文件，以便利用其成熟的方向处理逻辑
+            nifti_res = self._convert_with_dcm2niix(series_dir, series_name)
+            if not (nifti_res and nifti_res.get('success')):
+                nifti_res = self._convert_with_python_libs(series_dir, series_name)
+            
+            if not (nifti_res and nifti_res.get('success')):
+                return {'success': False, 'error': 'Failed to generate base volume for NPZ'}
+            
+            # Step 2: 加载 NIfTI 并进行规范化处理
+            output_files = []
+            if nifti_res.get('conversion_mode') == 'individual':
+                # 2D 模态 (DR/DX/MG)
+                for nii_file in nifti_res.get('output_files', []):
+                    nii_path = os.path.join(series_dir, nii_file)
+                    npz_file = nii_file.replace('.nii.gz', '.npz').replace('.nii', '.npz')
+                    npz_path = os.path.join(series_dir, npz_file)
+                    
+                    self._normalize_and_save_npz(nii_path, npz_path)
+                    output_files.append(npz_file)
+                    if os.path.exists(nii_path): os.remove(nii_path)
+            else:
+                # 3D 模态 (CT/MR)
+                nii_file = nifti_res.get('output_file')
+                nii_path = os.path.join(series_dir, nii_file)
+                npz_file = nii_file.replace('.nii.gz', '.npz').replace('.nii', '.npz')
+                npz_path = os.path.join(series_dir, npz_file)
+                
+                self._normalize_and_save_npz(nii_path, npz_path)
+                output_files.append(npz_file)
+                if os.path.exists(nii_path): os.remove(nii_path)
+                
+            return {
+                'success': True,
+                'method': 'npz_normalized',
+                'output_files': output_files
+            }
+            
+        except Exception as e:
+            print(f"   ❌ NPZ conversion failed: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def _normalize_and_save_npz(self, nii_path, npz_path):
+        """加载NIfTI，利用DICOM方向信息规范化并保存为NPZ"""
+        # 加载 NIfTI
+        img = nib.load(nii_path)
+        # 转为 RAS (Right, Anterior, Superior) 坐标系，此步骤已综合 DICOM Tag 中的方向信息
+        img_canonical = nib.as_closest_canonical(img)
+        data = img_canonical.get_fdata()
+        
+        # 按照用户要求进行翻转:
+        # 1. Z轴: Head to Feet (Superior -> Inferior). RAS 中 Z+ 为 Superior，故翻转 axis 2.
+        # 2. X,Y轴: 仰卧位横断位 (X: Right->Left, Y: Anterior->Posterior).
+        #    - RAS 中 X+ 为 Right，故翻转 axis 0 得到 Right->Left.
+        #    - RAS 中 Y+ 为 Anterior，故翻转 axis 1 得到 Anterior->Posterior.
+        data = data[::-1, ::-1, ::-1]
+        
+        # 转置为 [Z, Y, X] 格式 (Depth, Height, Width)
+        # 这样 data[0] 是最上层(Head)，且平面内满足仰卧位横断位视角
+        data = np.transpose(data, (2, 1, 0))
+        
+        # 压缩保存
+        np.savez_compressed(npz_path, data=data.astype(np.float32))
     
     def _convert_with_dcm2niix(self, series_dir, series_name):
         """使用dcm2niix工具转换"""
@@ -1048,7 +1124,7 @@ class DICOMDownloadClient:
     
     def process_complete_workflow(self, accession_number, base_output_dir="./downloads",
                                 auto_extract=True, auto_organize=True, auto_metadata=True,
-                                keep_zip=True, keep_extracted=False):
+                                keep_zip=True, keep_extracted=False, output_format='nifti'):
         """完整的工作流程：下载 -> 整理 -> 转换 -> 提取元数据"""
         print(f"\n{'='*80}")
         print(f"🚀 Starting full DICOM processing workflow")
@@ -1074,8 +1150,8 @@ class DICOMDownloadClient:
         
         if auto_organize:
             # 步骤2: 整理DICOM文件
-            print(f"\n📁 Step 2: Organize DICOM files by series")
-            organized_dir, series_info = self.organize_dicom_files(download_dir)
+            print(f"\n📁 Step 2: Organize DICOM files by series (format: {output_format})")
+            organized_dir, series_info = self.organize_dicom_files(download_dir, output_format=output_format)
             if not organized_dir:
                 print("❌ File organization failed, workflow terminated")
                 return results
@@ -1134,7 +1210,8 @@ def main():
             auto_organize=True,
             auto_metadata=True,
             keep_zip=False,     # 保持兼容性参数
-            keep_extracted=False
+            keep_extracted=False,
+            output_format='nifti'  # 可选 'nifti' 或 'npz'
         )
         
         if results and results['success']:

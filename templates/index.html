@@ -316,6 +316,33 @@
                             </div>
 
                             <div class="accordion-item">
+                                <h2 class="accordion-header" id="headingOutputFormat">
+                                    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseOutputFormat" aria-expanded="false" aria-controls="collapseOutputFormat">
+                                        <span data-i18n="output_format_settings">Output Format Settings</span>
+                                    </button>
+                                </h2>
+                                <div id="collapseOutputFormat" class="accordion-collapse collapse" aria-labelledby="headingOutputFormat" data-bs-parent="#processOptionsAccordion">
+                                    <div class="accordion-body pt-2">
+                                        <div class="mb-2">
+                                            <label class="form-label small mb-1" data-i18n="output_format">Output Format</label>
+                                            <div class="form-check">
+                                                <input class="form-check-input" type="radio" name="outputFormat" id="formatNifti" value="nifti" checked>
+                                                <label class="form-check-label small" for="formatNifti" data-i18n="nifti_format">
+                                                    NIfTI (.nii.gz)
+                                                </label>
+                                            </div>
+                                            <div class="form-check">
+                                                <input class="form-check-input" type="radio" name="outputFormat" id="formatNpz" value="npz">
+                                                <label class="form-check-label small" for="formatNpz" data-i18n="npz_format">
+                                                    NPZ (.npz - Normalized)
+                                                </label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="accordion-item">
                                 <h2 class="accordion-header" id="headingDicomServerConfig">
                                     <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseDicomServerConfig" aria-expanded="false" aria-controls="collapseDicomServerConfig">
                                         <span data-i18n="dicom_server_config">DICOM Server Config</span>

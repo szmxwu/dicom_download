@@ -69,6 +69,10 @@ class DICOMProcessor {
                 'keep_original_zip': 'Keep Original ZIP',
                 'keep_extracted_files': 'Keep Extracted Files',
                 'metadata_fields': 'Metadata Fields',
+                'output_format_settings': 'Output Format Settings',
+                'output_format': 'Output Format',
+                'nifti_format': 'NIfTI (.nii.gz)',
+                'npz_format': 'NPZ (.npz - Normalized)',
                 'dicom_server_config': 'DICOM Server Config',
                 'pacs_ip': 'PACS IP',
                 'pacs_port': 'PACS Port',
@@ -161,6 +165,10 @@ class DICOMProcessor {
                 'keep_original_zip': '保留原始ZIP',
                 'keep_extracted_files': '保留解压文件',
                 'metadata_fields': '元数据字段',
+                'output_format_settings': '输出格式设置',
+                'output_format': '输出格式',
+                'nifti_format': 'NIfTI (.nii.gz)',
+                'npz_format': 'NPZ (.npz - 严格规范化)',
                 'dicom_server_config': 'DICOM服务器配置',
                 'pacs_ip': 'PACS地址',
                 'pacs_port': 'PACS端口',
@@ -528,7 +536,8 @@ class DICOMProcessor {
             auto_organize: document.getElementById('autoOrganize').checked,
             auto_metadata: document.getElementById('autoMetadata').checked,
             keep_zip: document.getElementById('keepZip').checked,
-            keep_extracted: document.getElementById('keepExtracted').checked
+            keep_extracted: document.getElementById('keepExtracted').checked,
+            output_format: document.querySelector('input[name="outputFormat"]:checked')?.value || 'nifti'
         };
     }
 
