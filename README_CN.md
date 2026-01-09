@@ -77,3 +77,39 @@ MRI 治理的规则（关键词/阈值/正则等）已抽离到 `mr_clean_config
 - `static/`: 静态资源 (CSS, JS)。
 - `uploads/`: 上传文件目录。
 - `results/`: 处理结果目录。
+
+## 输出格式（NIfTI / NPZ）
+
+本项目现在支持将图像输出为 NIfTI（`.nii` / `.nii.gz`）或规范化的 NPZ（`.npz`）格式。
+
+- 前端：在界面右侧的“处理选项”中新增了“输出格式”选项，可选择 `NIfTI`（默认）或 `NPZ`。
+- 编程/脚本调用：在 Python 中调用处理流程时，可通过 `output_format` 参数控制输出：
+
+```python
+from dicom_client_unified import DICOMDownloadClient
+
+client = DICOMDownloadClient()
+client.process_complete_workflow(
+      accession_number='M25053000056',
+      base_output_dir='./dicom_processed',
+      output_format='npz'  # 'nifti' 或 'npz'
+)
+```
+
+- NPZ 格式说明：
+   - 生成的 `.npz` 文件包含单个数组 `data`（dtype: float32）。
+   - 保存数组的形状为 `[Z, Y, X]`，其中 Z=层数（切片），Y=高度（行），X=宽度（列）。该数据已根据 DICOM 的 `ImageOrientationPatient` / `ImagePositionPatient` 做过方向规范化：
+      - Z 轴顺序为从头到脚（Superior → Inferior）。
+      - 平面内方向已规范为临床常用的轴位（仰卧位），使得直接显示 `arr[z]` 时能得到期望的观察角度。
+   - 若下游处理需要不同的布局（例如 `[Z, X, Y]`），可在加载后简单转置：
+
+```python
+import numpy as np
+
+arr = np.load('series.npz')['data']  # arr.shape == (Z, Y, X)
+arr_zxy = np.transpose(arr, (0, 2, 1))  # 现在 shape == (Z, X, Y)
+```
+
+注意：
+   - NPZ 生成会先用 dcm2niix（若可用）或 Python 库生成 NIfTI 中间文件以获取可靠的方向信息。
+   - `.npz` 使用 `np.savez_compressed` 压缩并以 float32 存储，以平衡精度与文件大小。
