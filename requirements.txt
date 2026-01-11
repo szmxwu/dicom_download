@@ -18,6 +18,9 @@ openpyxl>=3.0.10
 python-socketio>=5.8.0
 python-engineio>=4.7.0
 
+# Windows 打包工具
+pyinstaller>=6.0.0
+
 # 环境变量管理
 python-dotenv>=1.0.0
 

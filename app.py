@@ -22,6 +22,7 @@ import threading
 from pathlib import Path
 import zipfile
 import shutil
+import sys
 from werkzeug.utils import secure_filename
 
 from dotenv import set_key
@@ -30,8 +31,17 @@ import secrets
 # 导入我们的DICOM处理客户端
 from dicom_client_unified import DICOMDownloadClient
 
-# Flask应用配置
-app = Flask(__name__)
+def get_base_path():
+    """获取程序运行时的根目录路径，兼容 PyInstaller 打包"""
+    if hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    return os.path.abspath(".")
+
+# Flask应用配置 - 指定静态文件和模板路径
+app = Flask(__name__,
+            static_folder=os.path.join(get_base_path(), 'static'),
+            template_folder=os.path.join(get_base_path(), 'templates'))
+
 _secret_key = os.environ.get('FLASK_SECRET_KEY')
 if not _secret_key:
     # 仅用于本地/临时运行；生产环境请通过环境变量提供固定值

@@ -12,26 +12,24 @@ import shutil
 from pathlib import Path
 import pandas as pd
 import pydicom
+import numpy as np
 from collections import defaultdict
 import re
 import nibabel as nib
-import numpy as np
 from datetime import datetime
-from typing import Dict, Any, Optional, List
-from dotenv import load_dotenv
-
-from pynetdicom import AE, evt
+import sys
+from pynetdicom import AE, evt, AllStoragePresentationContexts
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
-    StudyRootQueryRetrieveInformationModelMove,
+    StudyRootQueryRetrieveInformationModelMove
 )
-from pynetdicom import AllStoragePresentationContexts
 from pydicom.dataset import Dataset
 
-# 加载环境变量
-load_dotenv()
-
-os.environ['PATH'] = os.getcwd() + os.pathsep + os.environ['PATH']
+def get_base_path():
+    """获取程序运行时的根目录路径，兼容 PyInstaller 打包"""
+    if hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    return os.path.abspath(".")
 
 class DICOMDownloadClient:
     """统一版DICOM下载客户端，直接与PACS通信"""
@@ -77,10 +75,11 @@ class DICOMDownloadClient:
         try:
             if not os.path.exists(tags_dir):
                 # 尝试使用旧的keywords.json作为默认
-                if os.path.exists("keywords.json"):
-                    with open("keywords.json", 'r', encoding='utf-8') as f:
-                        default_keywords = json.load(f)
-                    print(f"⚠️  {tags_dir} not found, using keywords.json as default")
+                keywords_path = os.path.join(get_base_path(), "keywords.json")
+                if os.path.exists(keywords_path):
+                    with open(keywords_path, 'r', encoding='utf-8') as f:
+                        self.tag_mappings['DEFAULT'] = json.load(f)
+                    print(f"⚠️  {self.tags_dir} not found, using keywords.json as default")
                 else:
                     print(f"⚠️  {tags_dir} not found, using built-in default keywords")
                 return {'default': default_keywords}
