@@ -450,9 +450,10 @@ def download_result(task_id, file_type):
                 as_attachment=True,
                 download_name=f"metadata_{task_id}.xlsx"
             )
-        elif file_type == 'zip' and 'zip_file' in task.result:
+        elif (file_type == 'zip' or file_type == 'result_zip') and (task.result.get('zip_file') or task.result.get('result_zip')):
+            path = task.result.get('result_zip') or task.result.get('zip_file')
             return send_file(
-                task.result['zip_file'],
+                path,
                 as_attachment=True,
                 download_name=f"organized_{task_id}.zip"
             )
