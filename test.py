@@ -13,7 +13,7 @@ import argparse
 import zipfile
 import shutil
 
-SERVER_URL = "http://127.0.0.1:5005"
+SERVER_URL = "http://172.17.250.136:5005"
 API_SINGLE = f"{SERVER_URL}/api/process/single"
 API_STATUS = lambda task_id: f"{SERVER_URL}/api/task/{task_id}/status"
 API_DOWNLOAD = lambda task_id: f"{SERVER_URL}/api/download/{task_id}/zip"

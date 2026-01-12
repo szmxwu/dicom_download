@@ -23,6 +23,8 @@ from pathlib import Path
 import zipfile
 import shutil
 import sys
+import logging
+from logging.handlers import RotatingFileHandler
 from werkzeug.utils import secure_filename
 
 from dotenv import set_key
@@ -55,6 +57,36 @@ app.config['MAX_CONTENT_LENGTH'] = 1500 * 1024 * 1024  # 1500MB最大文件大�
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['RESULT_FOLDER'], exist_ok=True)
 os.makedirs('./temp', exist_ok=True)
+os.makedirs('./logs', exist_ok=True)
+
+# 配置日志系统
+def setup_logging():
+    logger = logging.getLogger('DICOMApp')
+    logger.setLevel(logging.INFO)
+    
+    # 防止重复添加 handler
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter(
+        '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+    )
+
+    # 文件日志 (按大小回滚)
+    file_handler = RotatingFileHandler(
+        'logs/app.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # 控制台日志
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logging()
 
 # WebSocket支持
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -120,7 +152,7 @@ def get_directory_size(directory):
                 if os.path.exists(filepath):
                     total_size += os.path.getsize(filepath)
     except (OSError, IOError) as e:
-        print(f"[WARNING] 计算目录大小时出错: {str(e)}")
+        logger.warning(f"计算目录大小时出错: {str(e)}")
     return total_size / (1024 ** 3)  # 转换为GB
 
 def cleanup_old_results():
@@ -131,7 +163,7 @@ def cleanup_old_results():
     if current_size < CLEANUP_THRESHOLD_GB:
         return
     
-    print(f"[CLEANUP] 结果目录大小: {current_size:.2f}GB, 启动自动清理")
+    logger.info(f"结果目录大小: {current_size:.2f}GB, 启动自动清理")
     
     # 获取所有子目录（任务目录和ZIP文件）
     items_to_check = []
@@ -159,7 +191,7 @@ def cleanup_old_results():
                 })
                 
     except Exception as e:
-        print(f"[ERROR] 扫描结果目录失败: {str(e)}")
+        logger.error(f"扫描结果目录失败: {str(e)}")
         return
     
     # 排除正在进行的任务
@@ -180,7 +212,7 @@ def cleanup_old_results():
             items_to_clean.append(item)
     
     if not items_to_clean:
-        print("[CLEANUP] 所有文件都属于活跃任务，跳过清理")
+        logger.info("所有文件都属于活跃任务，跳过清理")
         return
     
     # 按访问时间排序，先删除最旧的
@@ -194,7 +226,7 @@ def cleanup_old_results():
             break
             
         try:
-            print(f"[CLEANUP] 删除: {item['name']} ({item['size']:.2f}GB)")
+            logger.info(f"删除: {item['name']} ({item['size']:.2f}GB)")
             
             if item['is_dir']:
                 shutil.rmtree(item['path'])
@@ -204,10 +236,10 @@ def cleanup_old_results():
             cleaned_size += item['size']
             
         except Exception as e:
-            print(f"[ERROR] 删除 {item['name']} 失败: {str(e)}")
+            logger.error(f"删除 {item['name']} 失败: {str(e)}")
     
     final_size = get_directory_size(results_dir)
-    print(f"[CLEANUP] 清理完成: {current_size:.2f}GB → {final_size:.2f}GB (清理了 {cleaned_size:.2f}GB)")
+    logger.info(f"清理完成: {current_size:.2f}GB → {final_size:.2f}GB (清理了 {cleaned_size:.2f}GB)")
 
 def check_and_cleanup_results():
     """检查并清理结果目录的后台任务"""
@@ -215,7 +247,7 @@ def check_and_cleanup_results():
         try:
             cleanup_old_results()
         except Exception as e:
-            print(f"[ERROR] 自动清理失败: {str(e)}")
+            logger.error(f"自动清理失败: {str(e)}")
     
     # 异步执行清理，避免阻塞主线程
     threading.Thread(target=cleanup_thread, daemon=True).start()
@@ -245,19 +277,9 @@ class ProcessingTask:
         }
         self.logs.append(log_entry)
         
-        # 打印到控制台用于调试
-        print(f"[{log_entry['timestamp']}] [{level.upper()}] {message}")
-
-    def update_status(self, status, progress=None, step=None):
-        """更新任务状态"""
-        self.status = status
-        if progress is not None:
-            self.progress = progress
-        if step is not None:
-            self.current_step = step
-        
-        # 打印调试信息
-        print(f"[STATUS] Task {self.task_id}: {status}, Progress: {progress}%, Step: {step}")
+        # 使用统一日志系统记录
+        log_method = getattr(logger, level.lower(), logger.info)
+        log_method(f"[Task {self.task_id}] {message}")
         
         # 通过WebSocket发送更新
         try:
@@ -269,7 +291,30 @@ class ProcessingTask:
                 'logs': self.logs[-5:]  # 只发送最新5条日志
             }, room=None, broadcast=True)  # 广播给所有连接的客户端
         except Exception as e:
-            print(f"[ERROR] WebSocket发送失败: {str(e)}")
+            logger.error(f"WebSocket发送失败: {str(e)}")
+
+    def update_status(self, status, progress=None, step=None):
+        """更新任务状态"""
+        self.status = status
+        if progress is not None:
+            self.progress = progress
+        if step is not None:
+            self.current_step = step
+        
+        # 使用 logger 记录状态转换
+        logger.info(f"Task {self.task_id} status update: {status} ({progress or 0}% - {step or 'N/A'})")
+        
+        # 通过WebSocket发送更新
+        try:
+            socketio.emit('task_update', {
+                'task_id': self.task_id,
+                'status': self.status,
+                'progress': self.progress,
+                'current_step': self.current_step,
+                'logs': self.logs[-5:]  # 只发送最新5条日志
+            }, room=None, broadcast=True)  # 广播给所有连接的客户端
+        except Exception as e:
+            logger.error(f"WebSocket发送失败: {str(e)}")
 
 @app.route('/api/debug/test-connection')
 def test_connection():
@@ -302,7 +347,7 @@ def index():
 @app.route('/api/process/single', methods=['POST'])
 def process_single():
     """处理单个AccessionNumber"""
-    print(f"[DEBUG] process_single被调用，IP: {request.remote_addr}")
+    logger.debug(f"process_single被调用，IP: {request.remote_addr}")
     try:
         data = request.json
         accession_number = data.get('accession_number')
@@ -480,15 +525,16 @@ def system_status():
     dicom_status = 'unknown'
     error_msg = None
     try:
-        # 使用全局客户端实例，避免重复创建
-        if dicom_client_checker.check_status():
+        # 每次调用创建独立的客户端，避免持久连接状态异常
+        client = DICOMDownloadClient()
+        if client.check_status():
             dicom_status = 'connected'
         else:
             dicom_status = 'disconnected'
     except Exception as e:
         dicom_status = 'error'
         error_msg = str(e)
-        print(f"[ERROR] DICOM状态检查失败: {error_msg}")
+        logger.error(f"DICOM状态检查失败: {error_msg}")
     
     # 获取存储空间信息
     results_size_gb = get_directory_size(app.config['RESULT_FOLDER'])
@@ -547,7 +593,7 @@ def set_pacs_config():
         pacs_ip = _normalize_host(data.get('PACS_IP'))
         pacs_port = _parse_port(data.get('PACS_PORT'), 'PACS_PORT')
         calling_aet = _normalize_aet(data.get('CALLING_AET'), 'CALLING_AET')
-        called_aet = _normalize_aet(data.get('CALLED_AET'), 'CALLED_AET')
+        called_aet = _normalize_aet(data.get('CALLED_AET'), 'CALLING_AET')
         calling_port = _parse_port(data.get('CALLING_PORT'), 'CALLING_PORT')
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
@@ -587,8 +633,8 @@ def process_single_task(task):
         task.add_log("Connecting to DICOM service...")
         
         # 添加调试日志
-        print(f"[DEBUG] 开始处理任务: {task.task_id}")
-        print(f"[DEBUG] AccessionNumber: {task.parameters['accession_number']}")
+        logger.debug(f"开始处理任务: {task.task_id}")
+        logger.debug(f"AccessionNumber: {task.parameters['accession_number']}")
         
         # 创建新的DICOM客户端实例
         try:
@@ -631,7 +677,7 @@ def process_single_task(task):
                 task.add_log(msg)
             except Exception:
                 pass
-            print(f"MR_PROGRESS[{stage}]: {msg}")
+            logger.info(f"MR_PROGRESS[{stage}]: {msg}")
 
         task_client.progress_callback = _mr_progress
         
@@ -697,7 +743,7 @@ def process_single_task(task):
                 task.end_time = time.time()
                 
                 # 输出成功日志
-                print(f"[DEBUG] 任务完成: {task.task_id}")
+                logger.debug(f"任务完成: {task.task_id}")
                 
                 # 任务完成后检查并清理结果目录
                 check_and_cleanup_results()
@@ -714,7 +760,7 @@ def process_single_task(task):
             
     except Exception as e:
         error_msg = str(e)
-        print(f"[ERROR] 任务处理失败: {task.task_id}, 错误: {error_msg}")
+        logger.error(f"任务处理失败: {task.task_id}, 错误: {error_msg}")
         task.add_log(f'Process error: {error_msg}', 'error')
         task.update_status('failed')
         task.error = error_msg
@@ -726,10 +772,10 @@ def process_single_task(task):
             try:
                 task_client.logout()
                 task.add_log("Logged out from DICOM service")
-                print(f"[DEBUG] 已登出DICOM服务")
+                logger.debug(f"已登出DICOM服务")
             except Exception as e:
                 task.add_log(f"Error during logout: {str(e)}", 'warning')
-                print(f"[WARNING] 登出失败: {str(e)}")
+                logger.warning(f"登出失败: {str(e)}")
 
 def process_batch_task(task):
     """处理批量AccessionNumber任务"""
@@ -760,7 +806,7 @@ def process_batch_task(task):
                 task.add_log(msg)
             except Exception:
                 pass
-            print(f"MR_PROGRESS[{stage}]: {msg}")
+            logger.info(f"MR_PROGRESS[{stage}]: {msg}")
 
         task_client.progress_callback = _mr_progress
         
@@ -929,11 +975,11 @@ def create_result_zip(source_dir, task_id):
 # WebSocket事件处理
 @socketio.on('connect')
 def handle_connect():
-    print('客户端已连接')
+    logger.info('客户端已连接')
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print('客户端已断开')
+    logger.info('客户端已断开')
 
 @socketio.on('subscribe_task')
 def handle_subscribe_task(data):
@@ -943,37 +989,37 @@ def handle_subscribe_task(data):
         emit('task_subscribed', {'task_id': task_id})
 
 if __name__ == '__main__':
-    print("="*60)
-    print("🏥 DICOM处理Web应用启动")
-    print("="*60)
-    print("📡 访问地址: http://172.17.250.136:5005")
+    logger.info("="*60)
+    logger.info("🏥 DICOM处理Web应用启动")
+    logger.info("="*60)
+    logger.info("📡 访问地址: http://172.17.250.136:5005")
     
     # 检查DICOM服务连接状态
     try:
         checker = DICOMDownloadClient()
         if checker.check_status():
-            print("✅ PACS服务连接正常")
-            print(f"   - PACS IP: {checker.pacs_config['PACS_IP']}")
-            print(f"   - PACS Port: {checker.pacs_config['PACS_PORT']}")
-            print(f"   - Calling AET: {checker.pacs_config['CALLING_AET']}")
-            print(f"   - Called AET: {checker.pacs_config['CALLED_AET']}")
+            logger.info("✅ PACS服务连接正常")
+            logger.info(f"   - PACS IP: {checker.pacs_config['PACS_IP']}")
+            logger.info(f"   - PACS Port: {checker.pacs_config['PACS_PORT']}")
+            logger.info(f"   - Calling AET: {checker.pacs_config['CALLING_AET']}")
+            logger.info(f"   - Called AET: {checker.pacs_config['CALLED_AET']}")
         else:
-            print("⚠️  PACS服务连接异常，下载功能可能不可用")
+            logger.warning("⚠️  PACS服务连接异常，下载功能可能不可用")
     except Exception as e:
-        print(f"⚠️  无法连接PACS服务: {str(e)}")
-        print("   仅支持本地文件上传处理")
+        logger.error(f"⚠️  无法连接PACS服务: {str(e)}")
+        logger.info("   仅支持本地文件上传处理")
     
-    print("="*60)
+    logger.info("="*60)
     if os.getenv('DICOM_USERNAME') or os.getenv('DICOM_PASSWORD'):
-        print("🔐 已从环境变量读取DICOM登录信息")
+        logger.info("🔐 已从环境变量读取DICOM登录信息")
     else:
-        print("🔐 未配置DICOM登录信息（当前实现无需真实认证）")
-    print("🚀 系统已就绪，等待用户请求...")
-    print("📡 测试URL:")
-    print("   - http://localhost:5005")
-    print("   - http://127.0.0.1:5005") 
-    print("   - http://172.17.250.136:5005")
-    print("="*60)
+        logger.info("🔐 未配置DICOM登录信息（当前实现无需真实认证）")
+    logger.info("🚀 系统已就绪，等待用户请求...")
+    logger.info("📡 测试URL:")
+    logger.info("   - http://localhost:5005")
+    logger.info("   - http://127.0.0.1:5005") 
+    logger.info("   - http://172.17.250.136:5005")
+    logger.info("="*60)
     
     # 启动应用，开启调试模式和自动重载
     socketio.run(app, host='0.0.0.0', port=5005, debug=False, allow_unsafe_werkzeug=True)

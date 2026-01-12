@@ -18,12 +18,15 @@ import re
 import nibabel as nib
 from datetime import datetime
 import sys
+import logging
 from pynetdicom import AE, evt, AllStoragePresentationContexts
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
     StudyRootQueryRetrieveInformationModelMove
 )
 from pydicom.dataset import Dataset
+
+logger = logging.getLogger('DICOMApp')
 
 def get_base_path():
     """获取程序运行时的根目录路径，兼容 PyInstaller 打包"""
@@ -146,13 +149,13 @@ class DICOMDownloadClient:
             
             if assoc.is_established:
                 assoc.release()
-                print("✅ PACS connection status: OK")
+                logger.info("PACS connection status: OK")
                 return True
             else:
-                print("❌ Unable to connect to PACS")
+                logger.warning("Unable to connect to PACS")
                 return False
         except Exception as e:
-            print(f"❌ PACS connection error: {e}")
+            logger.error(f"PACS connection error: {e}")
             return False
     
     def _query_series_metadata(self, accession_number):
