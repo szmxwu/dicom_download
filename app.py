@@ -289,7 +289,7 @@ class ProcessingTask:
                 'progress': self.progress,
                 'current_step': self.current_step,
                 'logs': self.logs[-5:]  # 只发送最新5条日志
-            }, room=None, broadcast=True)  # 广播给所有连接的客户端
+            })  # 默认广播给所有连接的客户端
         except Exception as e:
             logger.error(f"WebSocket发送失败: {str(e)}")
 
@@ -312,7 +312,7 @@ class ProcessingTask:
                 'progress': self.progress,
                 'current_step': self.current_step,
                 'logs': self.logs[-5:]  # 只发送最新5条日志
-            }, room=None, broadcast=True)  # 广播给所有连接的客户端
+            })  # 默认广播给所有连接的客户端
         except Exception as e:
             logger.error(f"WebSocket发送失败: {str(e)}")
 
