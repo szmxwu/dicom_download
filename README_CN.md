@@ -113,3 +113,18 @@ arr_zxy = np.transpose(arr, (0, 2, 1))  # 现在 shape == (Z, X, Y)
 注意：
    - NPZ 生成会先用 dcm2niix（若可用）或 Python 库生成 NIfTI 中间文件以获取可靠的方向信息。
    - `.npz` 使用 `np.savez_compressed` 压缩并以 float32 存储，以平衡精度与文件大小。
+
+近期改进（2026-01-17）：
+
+- 转换过程中的质量检测：
+   - 在 NPZ 转换流程中新增了轻量级图像 QC（`_assess_image_quality`），用于检测低动态范围、低对比度、灰度反转（MONOCHROME1）和曝光异常（过暗/过亮），并对异常图像标记。
+   - 对于序列（CT/MR）新增序列级 QC 聚合函数（`_assess_series_quality`）：
+      - 当切片数 <= 200 时，对每张切片做全量 QC。
+      - 当切片数 > 200 时，采用中间 ±3 张（共 7 张）抽样做 QC。
+   - NPZ 转换的返回值中会包含 QC 元数据：`low_quality`、`low_quality_ratio`、`qc_mode`、`qc_sample_indices`。
+
+- Photometric 与 Rescale 处理：
+   - 在保存前应用 DICOM 的 `RescaleSlope/RescaleIntercept`。
+   - 对 `PhotometricInterpretation` 为 `MONOCHROME1` 的图像自动反转，使输出与常见显示（MONOCHROME2）一致。
+
+上述改进提高了对下游流程的鲁棒性，并可在早期检测出可疑序列以便人工复查。

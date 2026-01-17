@@ -186,3 +186,4 @@ all_data_match*
 radiology_classifier*
 *.db*
 output/*
+*.txt

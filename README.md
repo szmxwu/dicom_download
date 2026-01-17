@@ -115,3 +115,18 @@ arr_zxy = np.transpose(arr, (0, 2, 1))  # now shape == (Z, X, Y)
 Notes:
    - NPZ generation uses a temporary NIfTI intermediate (dcm2niix or Python libs) to obtain robust orientation information from DICOM tags.
    - The `.npz` files are compressed with `np.savez_compressed` and use float32 to balance precision and size.
+
+Recent improvements (2026-01-17):
+
+- Quality control during conversion:
+   - The tool now runs a lightweight QC (`_assess_image_quality`) on images during NPZ conversion. It detects low dynamic range, low contrast, grayscale inversion (MONOCHROME1-like), and exposure anomalies (under/over-exposed) and marks problematic images.
+   - For series (CT/MR) a sequence-level QC (`_assess_series_quality`) aggregates per-slice results. Behavior:
+      - If slice_count <= 200: full per-slice QC.
+      - If slice_count > 200: sampling QC using middle ±3 slices (7 samples).
+   - NPZ conversion returns QC metadata in its result dict: `low_quality`, `low_quality_ratio`, `qc_mode`, and `qc_sample_indices`.
+
+- Photometric & rescale handling:
+   - DICOM `RescaleSlope/RescaleIntercept` are applied before saving.
+   - `PhotometricInterpretation` MONOCHROME1 images are auto-inverted to match display expectation (consistent with MONOCHROME2).
+
+These changes improve robustness for downstream pipelines and provide early detection of problematic series.
