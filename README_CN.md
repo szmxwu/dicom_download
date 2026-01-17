@@ -60,7 +60,7 @@ MRI 治理的规则（关键词/阈值/正则等）已抽离到 `mr_clean_config
    ```bash
    python app.py
    ```
-2. 打开浏览器访问 `http://localhost:5000`。
+2. 打开浏览器访问 `http://localhost:5005`。
 3. 使用界面查询患者并开始下载/处理任务。
 
 ### 输出说明

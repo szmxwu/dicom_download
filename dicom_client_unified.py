@@ -464,6 +464,20 @@ class DICOMDownloadClient:
         """将DICOM序列转换为NPZ格式，并按照要求规范化方向"""
         try:
             print(f"   🔄 Converting {series_name} to NPZ (Normalized)...")
+
+            # Step 0: 序列QC (<=200全量，>200抽样)
+            dicom_files = []
+            for file in os.listdir(series_dir):
+                filepath = os.path.join(series_dir, file)
+                if os.path.isfile(filepath) and self._is_dicom_file(filepath):
+                    dicom_files.append(filepath)
+            dicom_files.sort()
+            qc_summary = self._assess_series_quality(dicom_files)
+            print(
+                f"   🧪 QC({qc_summary['qc_mode']}): "
+                f"low_ratio={qc_summary['low_quality_ratio']:.2f}, "
+                f"low_quality={qc_summary['low_quality']}"
+            )
             
             # Step 1: 先生成 NIfTI 作为中间文件，以便利用其成熟的方向处理逻辑
             nifti_res = self._convert_with_dcm2niix(series_dir, series_name)
@@ -499,7 +513,11 @@ class DICOMDownloadClient:
             return {
                 'success': True,
                 'method': 'npz_normalized',
-                'output_files': output_files
+                'output_files': output_files,
+                'low_quality': qc_summary.get('low_quality', 0),
+                'low_quality_ratio': qc_summary.get('low_quality_ratio', 0.0),
+                'qc_mode': qc_summary.get('qc_mode', 'none'),
+                'qc_sample_indices': qc_summary.get('qc_sample_indices', [])
             }
             
         except Exception as e:
@@ -669,6 +687,173 @@ class DICOMDownloadClient:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
+    def _apply_rescale(self, pixel_data, dcm):
+        """应用Rescale Slope/Intercept"""
+        try:
+            slope = float(getattr(dcm, 'RescaleSlope', 1.0))
+            intercept = float(getattr(dcm, 'RescaleIntercept', 0.0))
+            return pixel_data.astype(np.float32) * slope + intercept
+        except Exception:
+            return pixel_data.astype(np.float32)
+
+    def _apply_photometric(self, pixel_data, dcm):
+        """处理Photometric Interpretation (MONOCHROME1/2)"""
+        try:
+            photometric = str(getattr(dcm, 'PhotometricInterpretation', '')).upper()
+            if photometric == 'MONOCHROME1':
+                max_val = np.nanmax(pixel_data)
+                return max_val - pixel_data
+        except Exception:
+            pass
+        return pixel_data
+
+    def _build_affine_from_dicom(self, dcm, slice_spacing=1.0, slice_cosines=None):
+        """基于DICOM方向信息构建NIfTI仿射矩阵 (RAS)"""
+        try:
+            iop = getattr(dcm, 'ImageOrientationPatient', None)
+            ipp = getattr(dcm, 'ImagePositionPatient', None)
+            pixel_spacing = getattr(dcm, 'PixelSpacing', [1.0, 1.0])
+            if iop is None or ipp is None:
+                raise ValueError("Missing orientation/position")
+
+            row_cosine = np.array([float(i) for i in iop[:3]], dtype=np.float64)
+            col_cosine = np.array([float(i) for i in iop[3:6]], dtype=np.float64)
+            if slice_cosines is None:
+                slice_cosines = np.cross(row_cosine, col_cosine)
+
+            row_spacing = float(pixel_spacing[0])
+            col_spacing = float(pixel_spacing[1])
+
+            affine_lps = np.eye(4, dtype=np.float64)
+            affine_lps[:3, 0] = row_cosine * row_spacing
+            affine_lps[:3, 1] = col_cosine * col_spacing
+            affine_lps[:3, 2] = slice_cosines * float(slice_spacing)
+            affine_lps[:3, 3] = np.array([float(i) for i in ipp], dtype=np.float64)
+
+            lps_to_ras = np.diag([-1.0, -1.0, 1.0, 1.0])
+            affine_ras = lps_to_ras @ affine_lps
+            return affine_ras
+        except Exception:
+            return np.eye(4, dtype=np.float64)
+
+    def _assess_image_quality(self, dcm):
+        """基于直方图/对比度的简单质检，返回0/1"""
+        try:
+            if not hasattr(dcm, 'pixel_array'):
+                return 1
+
+            pixel_data = dcm.pixel_array.astype(np.float32)
+            pixel_data = self._apply_rescale(pixel_data, dcm)
+            pixel_data = self._apply_photometric(pixel_data, dcm)
+
+            flat = pixel_data[np.isfinite(pixel_data)].ravel()
+            if flat.size == 0:
+                return 1
+
+            # 采样避免超大图像的性能问题
+            if flat.size > 200000:
+                flat = flat[:: max(1, flat.size // 200000)]
+
+            p2, p98 = np.percentile(flat, [2, 98])
+            dynamic_range = p98 - p2
+            std = float(np.std(flat))
+            unique_ratio = len(np.unique(flat)) / max(1, flat.size)
+
+            if dynamic_range <= 0:
+                return 1
+
+            range_eps = max(dynamic_range, 1e-6)
+            mean_val = float(np.mean(flat))
+
+            # 曝光异常：过暗/过亮或饱和比例过高
+            low_thresh = p2 + 0.01 * range_eps
+            high_thresh = p98 - 0.01 * range_eps
+            low_ratio = float(np.mean(flat <= low_thresh))
+            high_ratio = float(np.mean(flat >= high_thresh))
+
+            under_exposed = mean_val < (p2 + 0.1 * range_eps) or low_ratio > 0.6
+            over_exposed = mean_val > (p98 - 0.1 * range_eps) or high_ratio > 0.6
+
+            # 灰度反转检测：边缘背景显著更亮
+            slice_data = pixel_data
+            if slice_data.ndim > 2:
+                mid = slice_data.shape[-1] // 2
+                slice_data = slice_data[..., mid]
+            if slice_data.ndim == 2:
+                h, w = slice_data.shape
+                border = max(1, int(min(h, w) * 0.1))
+                border_mask = np.zeros((h, w), dtype=bool)
+                border_mask[:border, :] = True
+                border_mask[-border:, :] = True
+                border_mask[:, :border] = True
+                border_mask[:, -border:] = True
+                center_mask = ~border_mask
+                border_vals = slice_data[border_mask]
+                center_vals = slice_data[center_mask]
+                if border_vals.size > 0 and center_vals.size > 0:
+                    border_mean = float(np.mean(border_vals))
+                    center_mean = float(np.mean(center_vals))
+                    inverted_like = border_mean - center_mean > 0.1 * range_eps
+                else:
+                    inverted_like = False
+            else:
+                inverted_like = False
+
+            if dynamic_range < 20 or std < 5 or unique_ratio < 0.01:
+                return 1
+
+            if under_exposed or over_exposed or inverted_like:
+                return 1
+
+            return 0
+        except Exception:
+            return 1
+
+    def _assess_series_quality(self, dicom_files):
+        """对序列做QC，<=200全量，>200中间±3抽样"""
+        try:
+            total = len(dicom_files)
+            if total == 0:
+                return {
+                    'low_quality': 1,
+                    'low_quality_ratio': 1.0,
+                    'qc_mode': 'none',
+                    'qc_sample_indices': []
+                }
+
+            if total <= 200:
+                sample_indices = list(range(total))
+                qc_mode = 'full'
+            else:
+                mid = total // 2
+                sample_indices = [i for i in range(mid - 3, mid + 4) if 0 <= i < total]
+                qc_mode = 'sample'
+
+            low_count = 0
+            for idx in sample_indices:
+                try:
+                    dcm = pydicom.dcmread(dicom_files[idx], force=True)
+                    low_count += int(self._assess_image_quality(dcm))
+                except Exception:
+                    low_count += 1
+
+            ratio = low_count / max(1, len(sample_indices))
+            low_quality = 1 if ratio > 0.3 else 0
+
+            return {
+                'low_quality': low_quality,
+                'low_quality_ratio': ratio,
+                'qc_mode': qc_mode,
+                'qc_sample_indices': sample_indices
+            }
+        except Exception:
+            return {
+                'low_quality': 1,
+                'low_quality_ratio': 1.0,
+                'qc_mode': 'error',
+                'qc_sample_indices': []
+            }
+
 
     def _convert_with_python_libs(self, series_dir, series_name):
         """使用Python库转换DICOM到NIfTI"""
@@ -702,20 +887,11 @@ class DICOMDownloadClient:
                             continue
                         
                         pixel_data = dcm.pixel_array
-                        
-                        # 处理数据类型
-                        if pixel_data.dtype == np.uint16 and dcm.get('PixelRepresentation', 0) == 1:
-                            pixel_data = pixel_data.astype(np.int16)
-                        
-                        # 获取像素间距
-                        pixel_spacing = getattr(dcm, 'PixelSpacing', [1.0, 1.0])
-                        slice_thickness = getattr(dcm, 'SliceThickness', 1.0)
-                        
-                        # 创建仿射矩阵
-                        affine = np.eye(4)
-                        affine[0, 0] = float(pixel_spacing[1])
-                        affine[1, 1] = float(pixel_spacing[0])
-                        affine[2, 2] = float(slice_thickness)
+                        pixel_data = self._apply_rescale(pixel_data, dcm)
+                        pixel_data = self._apply_photometric(pixel_data, dcm)
+
+                        slice_thickness = float(getattr(dcm, 'SliceThickness', 1.0))
+                        affine = self._build_affine_from_dicom(dcm, slice_spacing=slice_thickness)
                         
                         # 如果是2D图像，需要添加一个维度
                         if len(pixel_data.shape) == 2:
@@ -771,13 +947,11 @@ class DICOMDownloadClient:
                         return {'success': False, 'error': 'No pixel data'}
                     
                     pixel_data = dcm.pixel_array
-                    pixel_spacing = getattr(dcm, 'PixelSpacing', [1.0, 1.0])
-                    slice_thickness = getattr(dcm, 'SliceThickness', 1.0)
-                    
-                    affine = np.eye(4)
-                    affine[0, 0] = float(pixel_spacing[1])
-                    affine[1, 1] = float(pixel_spacing[0])
-                    affine[2, 2] = float(slice_thickness)
+                    pixel_data = self._apply_rescale(pixel_data, dcm)
+                    pixel_data = self._apply_photometric(pixel_data, dcm)
+
+                    slice_thickness = float(getattr(dcm, 'SliceThickness', 1.0))
+                    affine = self._build_affine_from_dicom(dcm, slice_spacing=slice_thickness)
                     
                     nifti_img = nib.Nifti1Image(pixel_data, affine)
                     output_filename = f"{self._sanitize_folder_name(series_name)}.nii.gz"
@@ -806,12 +980,15 @@ class DICOMDownloadClient:
                     try:
                         dcm = pydicom.dcmread(filepath, force=True)
                         if hasattr(dcm, 'ImagePositionPatient'):
-                            z_pos = float(dcm.ImagePositionPatient[2])
+                            ipp = [float(v) for v in dcm.ImagePositionPatient]
+                            z_pos = ipp[2]
                         elif hasattr(dcm, 'SliceLocation'):
                             z_pos = float(dcm.SliceLocation)
+                            ipp = None
                         else:
                             z_pos = 0
-                        slice_info.append((z_pos, filepath, dcm))
+                            ipp = None
+                        slice_info.append((z_pos, filepath, dcm, ipp))
                     except:
                         continue
                 
@@ -821,26 +998,37 @@ class DICOMDownloadClient:
                 slice_info.sort(key=lambda x: x[0])
                 
                 slices = []
-                for _, _, dcm in slice_info:
+                positions = []
+                for _, _, dcm, ipp in slice_info:
                     if hasattr(dcm, 'pixel_array'):
-                        slices.append(dcm.pixel_array)
+                        pixel_data = dcm.pixel_array
+                        pixel_data = self._apply_rescale(pixel_data, dcm)
+                        pixel_data = self._apply_photometric(pixel_data, dcm)
+                        slices.append(pixel_data)
+                        if ipp is not None:
+                            positions.append(np.array(ipp, dtype=np.float64))
                 
                 if not slices:
                     return {'success': False, 'error': 'No pixel data found'}
                 
                 volume = np.stack(slices, axis=2)
-                
-                pixel_spacing = getattr(first_dcm, 'PixelSpacing', [1.0, 1.0])
-                
-                if len(slice_info) > 1:
-                    slice_thickness = abs(slice_info[1][0] - slice_info[0][0])
+
+                if len(positions) > 1:
+                    slice_spacing = float(np.linalg.norm(positions[1] - positions[0]))
+                elif len(slice_info) > 1:
+                    slice_spacing = abs(slice_info[1][0] - slice_info[0][0])
                 else:
-                    slice_thickness = getattr(first_dcm, 'SliceThickness', 1.0)
-                
-                affine = np.eye(4)
-                affine[0, 0] = float(pixel_spacing[1])
-                affine[1, 1] = float(pixel_spacing[0])
-                affine[2, 2] = float(slice_thickness)
+                    slice_spacing = float(getattr(first_dcm, 'SliceThickness', 1.0))
+
+                iop = getattr(first_dcm, 'ImageOrientationPatient', None)
+                if iop is not None:
+                    row_cosine = np.array([float(i) for i in iop[:3]], dtype=np.float64)
+                    col_cosine = np.array([float(i) for i in iop[3:6]], dtype=np.float64)
+                    slice_cosines = np.cross(row_cosine, col_cosine)
+                else:
+                    slice_cosines = None
+
+                affine = self._build_affine_from_dicom(first_dcm, slice_spacing=slice_spacing, slice_cosines=slice_cosines)
                 
                 nifti_img = nib.Nifti1Image(volume, affine)
                 output_filename = f"{self._sanitize_folder_name(series_name)}.nii.gz"
@@ -929,7 +1117,8 @@ class DICOMDownloadClient:
                                 'SeriesFolder': series_folder,
                                 'FileName': os.path.basename(dicom_file),
                                 'FileIndex': idx + 1,
-                                'TotalFilesInSeries': len(dicom_files)
+                                'TotalFilesInSeries': len(dicom_files),
+                                'Low_quality': self._assess_image_quality(dcm)
                             }
                             
                             # 获取对应模态的字段列表
@@ -970,7 +1159,8 @@ class DICOMDownloadClient:
                         'SeriesFolder': series_folder,
                         'SampleFileName': os.path.basename(sample_file),
                         'TotalFilesInSeries': len(dicom_files),
-                        'FilesReadForMetadata': 1  # 标记只读取了一个文件
+                        'FilesReadForMetadata': 1,  # 标记只读取了一个文件
+                        'Low_quality': self._assess_image_quality(dcm)
                     }
                     
                     # 获取对应模态的字段列表

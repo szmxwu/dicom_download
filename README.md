@@ -62,7 +62,7 @@ MRI normalization rules (keywords/thresholds/regex) are externalized in `mr_clea
    ```bash
    python app.py
    ```
-2. Open your browser and navigate to `http://localhost:5000`.
+2. Open your browser and navigate to `http://localhost:5005`.
 3. Use the interface to search for patients and start download/processing tasks.
 
 ### Output
