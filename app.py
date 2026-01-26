@@ -476,6 +476,43 @@ def get_task_status(task_id):
         'duration': (task.end_time or time.time()) - task.start_time
     })
 
+
+def _serialize_task_history(task: 'ProcessingTask') -> dict:
+    result = task.result or {}
+    duration = (task.end_time or time.time()) - task.start_time
+    summary = ''
+
+    if task.task_type == 'single':
+        summary = task.parameters.get('accession_number', '')
+    elif task.task_type == 'batch':
+        count = len(task.parameters.get('accession_numbers', []) or [])
+        summary = f"{count} studies"
+    elif task.task_type == 'upload':
+        summary = task.parameters.get('filename', '')
+
+    return {
+        'task_id': task.task_id,
+        'task_type': task.task_type,
+        'status': task.status,
+        'summary': summary,
+        'start_time': task.start_time,
+        'end_time': task.end_time,
+        'duration': duration,
+        'has_excel': bool(result.get('excel_file')),
+        'has_zip': bool(result.get('result_zip') or result.get('zip_file')),
+        'series_count': len(result.get('series_info', {}) or {}) if isinstance(result.get('series_info'), dict) else result.get('series_count', 0)
+    }
+
+
+@app.route('/api/tasks/history')
+def get_task_history():
+    """返回已完成任务的历史列表"""
+    completed_tasks = [t for t in processing_tasks.values() if t.status == 'completed']
+    completed_tasks.sort(key=lambda x: x.end_time or x.start_time, reverse=True)
+    return jsonify({
+        'tasks': [_serialize_task_history(task) for task in completed_tasks]
+    })
+
 @app.route('/api/task/<task_id>/cancel', methods=['POST'])
 def cancel_task(task_id):
     """取消任务"""

@@ -35,6 +35,7 @@ class DICOMProcessor {
                 'single_process': 'Single Process',
                 'batch_process': 'Batch Process',
                 'file_upload': 'File Upload',
+                'task_list': 'Task List',
                 'single_study_process': 'Single Study Process',
                 'accession_number': 'AccessionNumber',
                 'enter_accession_number': 'Please enter the AccessionNumber of the study to process',
@@ -60,6 +61,17 @@ class DICOMProcessor {
                 'process_log': 'Process Log:',
                 'waiting_process': 'Waiting for process to start...',
                 'process_result': 'Process Result',
+                'history_tasks': 'History Tasks',
+                'refresh': 'Refresh',
+                'task_id': 'Task ID',
+                'task_type': 'Type',
+                'task_summary': 'Summary',
+                'completed_time': 'Completed Time',
+                'duration': 'Duration',
+                'download': 'Download',
+                'download_excel': 'Excel',
+                'download_zip': 'ZIP',
+                'no_history_tasks': 'No completed tasks yet',
                 'process_options': 'Process Options',
                 'basic_settings': 'Basic Settings',
                 'auto_extract': 'Auto Extract',
@@ -131,6 +143,7 @@ class DICOMProcessor {
                 'single_process': '单个处理',
                 'batch_process': '批量处理',
                 'file_upload': '文件上传',
+                'task_list': '任务列表',
                 'single_study_process': '单个研究处理',
                 'accession_number': 'AccessionNumber',
                 'enter_accession_number': '请输入要处理的研究的AccessionNumber',
@@ -156,6 +169,17 @@ class DICOMProcessor {
                 'process_log': '处理日志:',
                 'waiting_process': '等待处理开始...',
                 'process_result': '处理结果',
+                'history_tasks': '历史任务',
+                'refresh': '刷新',
+                'task_id': '任务ID',
+                'task_type': '类型',
+                'task_summary': '摘要',
+                'completed_time': '完成时间',
+                'duration': '耗时',
+                'download': '下载',
+                'download_excel': 'Excel',
+                'download_zip': '文件包',
+                'no_history_tasks': '暂无已完成任务',
                 'process_options': '处理选项',
                 'basic_settings': '基本设置',
                 'auto_extract': '自动解压',
@@ -319,6 +343,17 @@ class DICOMProcessor {
             uploadArea.addEventListener('drop', this.handleFileDrop.bind(this));
         }
 
+        // 任务列表刷新
+        const historyRefresh = document.getElementById('historyRefresh');
+        if (historyRefresh) {
+            historyRefresh.addEventListener('click', () => this.loadTaskHistory());
+        }
+
+        const historyTab = document.getElementById('history-tab');
+        if (historyTab) {
+            historyTab.addEventListener('shown.bs.tab', () => this.loadTaskHistory());
+        }
+
         // 键盘快捷键
         document.addEventListener('keydown', this.handleKeydown.bind(this));
 
@@ -329,6 +364,83 @@ class DICOMProcessor {
                 e.returnValue = this.translations[this.currentLang]['confirm_leave'];
             }
         });
+    }
+
+    async loadTaskHistory() {
+        const tbody = document.getElementById('historyTableBody');
+        const emptyState = document.getElementById('historyEmpty');
+        if (!tbody || !emptyState) {
+            return;
+        }
+
+        try {
+            const response = await fetch('/api/tasks/history');
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.error || 'Failed to load history');
+            }
+            this.renderHistoryTasks(data.tasks || []);
+        } catch (error) {
+            console.error('获取历史任务失败:', error);
+            this.renderHistoryTasks([]);
+        }
+    }
+
+    renderHistoryTasks(tasks) {
+        const tbody = document.getElementById('historyTableBody');
+        const emptyState = document.getElementById('historyEmpty');
+        if (!tbody || !emptyState) {
+            return;
+        }
+
+        tbody.innerHTML = '';
+        if (!tasks || tasks.length === 0) {
+            emptyState.style.display = 'block';
+            return;
+        }
+
+        emptyState.style.display = 'none';
+        tasks.forEach(task => {
+            const endTime = task.end_time ? new Date(task.end_time * 1000) : null;
+            const endTimeText = endTime ? endTime.toLocaleString() : '-';
+            const durationText = task.duration ? `${Math.round(task.duration)}s` : '-';
+            const taskTypeLabel = this.getTaskTypeLabel(task.task_type);
+            const summary = task.summary ? this.escapeHtml(task.summary) : '-';
+
+            const downloadButtons = [];
+            if (task.has_excel) {
+                downloadButtons.push(
+                    `<a href="/api/download/${task.task_id}/excel" class="btn btn-outline-success btn-sm me-1">` +
+                    `<i class="fas fa-file-excel"></i> ${this.translations[this.currentLang]['download_excel']}</a>`
+                );
+            }
+            if (task.has_zip) {
+                downloadButtons.push(
+                    `<a href="/api/download/${task.task_id}/zip" class="btn btn-outline-primary btn-sm">` +
+                    `<i class="fas fa-file-archive"></i> ${this.translations[this.currentLang]['download_zip']}</a>`
+                );
+            }
+
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td><code>${this.escapeHtml(task.task_id)}</code></td>
+                <td>${taskTypeLabel}</td>
+                <td>${summary}</td>
+                <td>${this.escapeHtml(endTimeText)}</td>
+                <td>${durationText}</td>
+                <td>${downloadButtons.join(' ') || '-'}</td>
+            `;
+            tbody.appendChild(row);
+        });
+    }
+
+    getTaskTypeLabel(taskType) {
+        const map = {
+            'single': this.currentLang === 'en' ? 'Single' : '单个',
+            'batch': this.currentLang === 'en' ? 'Batch' : '批量',
+            'upload': this.currentLang === 'en' ? 'Upload' : '上传'
+        };
+        return map[taskType] || taskType || '-';
     }
 
     // 更新当前时间
@@ -351,8 +463,19 @@ class DICOMProcessor {
             const statusText = data.dicom_service_status === 'connected' 
                 ? (this.translations[this.currentLang]['system_normal'] || 'System Normal')
                 : (this.translations[this.currentLang]['system_abnormal'] || 'System Abnormal');
-            document.getElementById('serviceStatus').textContent = statusText;
-            
+
+            // 设置 serviceStatus 文本并根据连接状态调整文字颜色（正常：绿色，异常：红色）
+            const serviceStatusEl = document.getElementById('serviceStatus');
+            if (serviceStatusEl) {
+                serviceStatusEl.textContent = statusText;
+                console.log('DICOM服务状态:', data.dicom_service_status);
+                if (data.dicom_service_status === 'connected') {
+                    serviceStatusEl.style.color = 'green';
+                } else {
+                    serviceStatusEl.style.color = 'red';
+                }
+            }
+
             const statusElement = document.getElementById('systemStatus');
             if (data.status === 'running') {
                 statusElement.innerHTML = this.translations[this.currentLang]['system_normal_html'];
@@ -364,7 +487,11 @@ class DICOMProcessor {
             
         } catch (error) {
             console.error('获取系统状态失败:', error);
-            document.getElementById('serviceStatus').textContent = this.translations[this.currentLang]['connection_error'];
+            const serviceStatusEl = document.getElementById('serviceStatus');
+            if (serviceStatusEl) {
+                serviceStatusEl.textContent = this.translations[this.currentLang]['connection_error'];
+                serviceStatusEl.style.color = 'red';
+            }
         }
     }
 

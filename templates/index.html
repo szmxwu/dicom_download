@@ -64,6 +64,12 @@
                                     <i class="fas fa-upload"></i> <span data-i18n="file_upload">File Upload</span>
                                 </button>
                             </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="history-tab" data-bs-toggle="tab" 
+                                        data-bs-target="#history-pane" type="button" role="tab">
+                                    <i class="fas fa-list"></i> <span data-i18n="task_list">Task List</span>
+                                </button>
+                            </li>
                         </ul>
                     </div>
                     
@@ -155,6 +161,36 @@
                                             <i class="fas fa-play"></i> <span data-i18n="start_process">Start Process</span>
                                         </button>
                                     </div>
+                                </div>
+                            </div>
+
+                            <!-- 任务列表 -->
+                            <div class="tab-pane fade" id="history-pane" role="tabpanel">
+                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                    <h5 class="mb-0">
+                                        <i class="fas fa-history text-primary"></i> <span data-i18n="history_tasks">History Tasks</span>
+                                    </h5>
+                                    <button type="button" class="btn btn-outline-primary btn-sm" id="historyRefresh">
+                                        <i class="fas fa-sync"></i> <span data-i18n="refresh">Refresh</span>
+                                    </button>
+                                </div>
+                                <div class="table-responsive">
+                                    <table class="table table-sm table-striped align-middle">
+                                        <thead>
+                                            <tr>
+                                                <th data-i18n="task_id">Task ID</th>
+                                                <th data-i18n="task_type">Type</th>
+                                                <th data-i18n="task_summary">Summary</th>
+                                                <th data-i18n="completed_time">Completed Time</th>
+                                                <th data-i18n="duration">Duration</th>
+                                                <th data-i18n="download">Download</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="historyTableBody"></tbody>
+                                    </table>
+                                </div>
+                                <div class="text-muted text-center py-4" id="historyEmpty" style="display: none;">
+                                    <span data-i18n="no_history_tasks">No completed tasks yet</span>
                                 </div>
                             </div>
                         </div>

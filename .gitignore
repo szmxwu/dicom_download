@@ -187,3 +187,4 @@ radiology_classifier*
 *.db*
 output/*
 *.txt
+.env
