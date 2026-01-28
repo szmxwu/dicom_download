@@ -101,11 +101,11 @@ def download_and_extract(task_id, output_dir, accession=None):
         # 创建目标目录
         os.makedirs(final_dir, exist_ok=True)
 
-        # 将所有 nii / nii.gz 文件从临时目录移动到 final_dir（平铺）
+        # 将所有 nii / nii.gz / xlsx 文件从临时目录移动到 final_dir（平铺）
         moved_any = False
         for root, dirs, files in os.walk(tmp_dir):
             for fname in files:
-                if fname.lower().endswith('.nii') or fname.lower().endswith('.nii.gz'):
+                if fname.lower().endswith('.nii') or fname.lower().endswith('.nii.gz') or fname.lower().endswith('.xlsx'):
                     src = os.path.join(root, fname)
                     dest = os.path.join(final_dir, fname)
 

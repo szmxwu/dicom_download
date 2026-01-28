@@ -1056,12 +1056,13 @@ class DICOMDownloadClient:
             return {'success': False, 'error': str(e)}
     
     def extract_dicom_metadata(self, organized_dir, output_excel=None):
-        """提取DICOM元数据并保存为Excel文件"""
+        """提取DICOM元数据并保存为Excel文件。
+
+        默认把 Excel 放在 organized_dir 的上级目录（每个检查子目录）。
+        """
         if output_excel is None:
             timestamp = time.strftime('%Y%m%d_%H%M%S')
-            metadata_dir = os.path.join(os.path.dirname(organized_dir), "metadata")
-            os.makedirs(metadata_dir, exist_ok=True)
-            output_excel = os.path.join(metadata_dir, f"dicom_metadata_{timestamp}.xlsx")
+            output_excel = os.path.join(os.path.dirname(organized_dir), f"dicom_metadata_{timestamp}.xlsx")
         
         print(f"📊 Extracting DICOM metadata...")
         
@@ -1354,7 +1355,9 @@ class DICOMDownloadClient:
             if auto_metadata:
                 # 步骤3: 提取元数据
                 print(f"\n📊 Step 3: Extract DICOM metadata")
-                excel_file = self.extract_dicom_metadata(organized_dir)
+                excel_name = f"dicom_metadata_{accession_number}.xlsx"
+                excel_path = os.path.join(os.path.dirname(organized_dir), excel_name)
+                excel_file = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
                 if excel_file:
                     results['excel_file'] = excel_file
                     results['success'] = True

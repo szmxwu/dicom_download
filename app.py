@@ -770,7 +770,11 @@ def process_single_task(task):
                 # 创建结果ZIP文件
                 if results.get('organized_dir'):
                     task.add_log('Creating result ZIP...')
-                    zip_path = create_result_zip(results['organized_dir'], task.task_id)
+                    zip_path = create_result_zip(
+                        results['organized_dir'],
+                        task.task_id,
+                        extra_files=[results.get('excel_file')]
+                    )
                     results['result_zip'] = zip_path
                     task.add_log('Result ZIP created')
                 
@@ -996,8 +1000,11 @@ def process_upload_task(task):
         task.error = str(e)
         task.end_time = time.time()
 
-def create_result_zip(source_dir, task_id):
-    """创建结果ZIP文件"""
+def create_result_zip(source_dir, task_id, extra_files=None):
+    """创建结果ZIP文件。
+
+    extra_files: 额外需要打包的文件路径列表（会放在 ZIP 根目录）。
+    """
     zip_path = os.path.join(app.config['RESULT_FOLDER'], f"result_{task_id}.zip")
     
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -1006,6 +1013,21 @@ def create_result_zip(source_dir, task_id):
                 file_path = os.path.join(root, file)
                 arc_name = os.path.relpath(file_path, source_dir)
                 zipf.write(file_path, arc_name)
+
+        if extra_files:
+            for extra_path in extra_files:
+                if not extra_path or not os.path.exists(extra_path):
+                    continue
+                # 如果已经在 source_dir 内，跳过（避免重复）
+                try:
+                    base_dir = os.path.abspath(source_dir)
+                    extra_abs = os.path.abspath(extra_path)
+                    if os.path.commonpath([base_dir, extra_abs]) == base_dir:
+                        continue
+                except Exception:
+                    pass
+                arc_name = os.path.basename(extra_path)
+                zipf.write(extra_path, arc_name)
     
     return zip_path
 
