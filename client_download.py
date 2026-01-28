@@ -75,6 +75,9 @@ def download_and_extract(task_id, output_dir, accession=None):
     download_url = API_DOWNLOAD(task_id)
     target_zip = os.path.join(output_dir, f"result_{task_id}.zip")
 
+    # 确保输出目录存在（Windows 下需要先创建，否则临时目录创建会失败）
+    os.makedirs(output_dir, exist_ok=True)
+
     # 使用临时目录解压，然后将 nii 文件移动到最终目录（避免嵌套一层）
     tmp_dir = tempfile.mkdtemp(prefix=f"tmp_extract_{task_id}_", dir=output_dir)
     final_dir_name = str(accession) if accession else str(task_id)
@@ -83,8 +86,6 @@ def download_and_extract(task_id, output_dir, accession=None):
     print(f"[*] 正在下载结果到: {target_zip}")
 
     try:
-        os.makedirs(output_dir, exist_ok=True)
-
         with requests.get(download_url, stream=True) as r:
             r.raise_for_status()
             with open(target_zip, 'wb') as f:
