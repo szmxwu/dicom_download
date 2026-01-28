@@ -15,6 +15,7 @@ import shutil
 from tqdm import tqdm
 import pandas as pd
 import json
+from datetime import datetime, timedelta
 import tempfile
 
 SERVER_URL = "http://172.17.250.136:5005"
@@ -223,22 +224,29 @@ PROGRESS_FILENAME = ".download_progress.json"
 def load_progress(output_dir):
     path = os.path.join(output_dir, PROGRESS_FILENAME)
     if not os.path.exists(path):
-        return set()
+        return set(), {}
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             completed = data.get('completed', [])
-            return set(completed)
+            timings = data.get('timings', {})
+            # ensure timings are floats
+            timings = {str(k): float(v) for k, v in timings.items()}
+            return set(completed), timings
     except Exception:
-        return set()
+        return set(), {}
 
 
-def save_progress(output_dir, completed_set):
+def save_progress(output_dir, completed_set, timings_dict=None):
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, PROGRESS_FILENAME)
     try:
+        payload = {'completed': sorted(list(completed_set))}
+        if timings_dict:
+            # convert timings to simple serializable map
+            payload['timings'] = {str(k): float(v) for k, v in timings_dict.items()}
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump({'completed': sorted(list(completed_set))}, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[!] 无法保存进度: {e}")
 
@@ -248,26 +256,39 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti'):
 
     进度记录保存在 output_dir/.download_progress.json，程序在每次成功下载后更新该文件。
     """
-    completed = load_progress(output_dir)
+    completed, timings = load_progress(output_dir)
+    total = len(acc_list)
+    # timings: dict accession->seconds (float)
 
     for accession in tqdm(acc_list):
         if str(accession) in completed:
             tqdm.write(f"\n--- 跳过（已完成） AccessionNumber: {accession} ---")
             continue
-
         tqdm.write(f"\n=== 处理 AccessionNumber: {accession} ===")
         main_args = argparse.Namespace(
             accession=str(accession),
             output_dir=output_dir,
             format=fmt
         )
+        # 计时并执行
+        start_t = time.time()
         ok = main(main_args)
+        elapsed = time.time() - start_t
 
         if ok:
             # 仅在成功下载并解压后标记为完成
             completed.add(str(accession))
-            save_progress(output_dir, completed)
-            tqdm.write(f"[+] 标记为已完成: {accession}")
+            timings[str(accession)] = elapsed
+            # 计算平均速度（秒/acc）基于所有已知 timings
+            all_times = list(timings.values())
+            avg_sec = sum(all_times) / len(all_times) if all_times else elapsed
+            remaining = total - len(completed)
+            remaining_sec = avg_sec * remaining
+            eta = datetime.now() + timedelta(seconds=remaining_sec)
+
+            save_progress(output_dir, completed, timings)
+            tqdm.write(f"[+] 标记为已完成: {accession} (耗时 {elapsed:.2f} s)")
+            tqdm.write(f"    平均: {avg_sec:.2f} s/accession；剩余: {remaining}，预计完成: {eta.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
             tqdm.write(f"[!] 处理失败，将在下次继续尝试: {accession}")
 
