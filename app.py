@@ -760,7 +760,8 @@ def process_single_task(task):
                 auto_metadata=options.get('auto_metadata', True),
                 keep_zip=options.get('keep_zip', True),
                 keep_extracted=options.get('keep_extracted', False),
-                output_format=options.get('output_format', 'nifti')
+                output_format=options.get('output_format', 'nifti'),
+                parallel_pipeline=True
             )
             
             if results and results.get('success'):
@@ -874,7 +875,8 @@ def process_batch_task(task):
                     auto_extract=options.get('auto_extract', True),
                     auto_organize=options.get('auto_organize', True),
                     auto_metadata=options.get('auto_metadata', True),
-                    output_format=options.get('output_format', 'nifti')
+                    output_format=options.get('output_format', 'nifti'),
+                    parallel_pipeline=True
                 )
                 results.append(result)
                 task.add_log(f'{accno} Process completed')

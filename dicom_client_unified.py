@@ -9,6 +9,8 @@ import os
 import json
 import time
 import shutil
+import threading
+from queue import Queue
 from pathlib import Path
 import pandas as pd
 import pydicom
@@ -237,7 +239,7 @@ class DICOMDownloadClient:
         
         return series_metadata
     
-    def download_study(self, accession_number, output_dir=".", custom_folder_name=None):
+    def download_study(self, accession_number, output_dir=".", custom_folder_name=None, on_series_downloaded=None):
         """Download Study data (directly from PACS, no ZIP generation)"""
         print(f"🔍 Downloading AccessionNumber: {accession_number}")
         
@@ -332,6 +334,13 @@ class DICOMDownloadClient:
                         if status and status.Status == 0x0000:
                             pass
                     
+                    # 通知外部：该Series下载完成
+                    if callable(on_series_downloaded):
+                        try:
+                            on_series_downloaded(series_dir, series)
+                        except Exception as e:
+                            print(f"⚠️  Series callback failed: {e}")
+
                     time.sleep(0.5)  # 短暂延迟
                 
             finally:
@@ -440,6 +449,43 @@ class DICOMDownloadClient:
                 info['path'] = dst_path
         
         return organized_dir, series_info
+
+    def _process_single_series(self, series_path, series_folder, organized_dir, output_format='nifti'):
+        """处理单个Series目录：统计、转换并移动到 organized_dir。"""
+        if not os.path.isdir(series_path):
+            return None
+
+        # 统计 DICOM 文件
+        dicom_files = []
+        for file in os.listdir(series_path):
+            filepath = os.path.join(series_path, file)
+            if os.path.isfile(filepath) and self._is_dicom_file(filepath):
+                dicom_files.append(filepath)
+
+        if not dicom_files:
+            return None
+
+        # 执行转换
+        if output_format == 'nifti':
+            self.convert_dicom_to_nifti(series_path, series_folder)
+        elif output_format == 'npz':
+            self._convert_to_npz(series_path, series_folder)
+
+        # 移动到 organized 目录
+        os.makedirs(organized_dir, exist_ok=True)
+        dst_path = os.path.join(organized_dir, series_folder)
+        if series_path != dst_path:
+            try:
+                shutil.move(series_path, dst_path)
+            except Exception:
+                # 如果移动失败（比如文件被占用），保留原路径
+                dst_path = series_path
+
+        return {
+            'path': dst_path,
+            'file_count': len(dicom_files),
+            'files': dicom_files
+        }
     
     def convert_dicom_to_nifti(self, series_dir, series_name):
         """将DICOM序列转换为NIfTI格式"""
@@ -1317,7 +1363,8 @@ class DICOMDownloadClient:
     
     def process_complete_workflow(self, accession_number, base_output_dir="./downloads",
                                 auto_extract=True, auto_organize=True, auto_metadata=True,
-                                keep_zip=True, keep_extracted=False, output_format='nifti'):
+                                keep_zip=True, keep_extracted=False, output_format='nifti',
+                                parallel_pipeline=True):
         """完整的工作流程：下载 -> 整理 -> 转换 -> 提取元数据"""
         print(f"\n{'='*80}")
         print(f"🚀 Starting full DICOM processing workflow")
@@ -1329,10 +1376,71 @@ class DICOMDownloadClient:
         
         # 步骤1: 下载DICOM文件
         print(f"\n📥 Step 1: Download DICOM files")
-        download_dir = self.download_study(accession_number, base_output_dir)
-        if not download_dir:
-            print("❌ Download failed, workflow terminated")
-            return None
+
+        download_dir_holder = {'path': None}
+        series_queue = Queue()
+        series_info = {}
+        series_lock = threading.Lock()
+        download_done = threading.Event()
+
+        def _on_series_downloaded(series_dir, series_meta):
+            series_folder = os.path.basename(series_dir)
+            series_queue.put((series_dir, series_folder))
+
+        def _download_worker():
+            try:
+                download_path = self.download_study(
+                    accession_number,
+                    base_output_dir,
+                    on_series_downloaded=_on_series_downloaded
+                )
+                download_dir_holder['path'] = download_path
+            finally:
+                download_done.set()
+
+        def _organize_worker(organized_dir_local, fmt):
+            while True:
+                item = series_queue.get()
+                if item is None:
+                    series_queue.task_done()
+                    break
+                series_dir, series_folder = item
+                try:
+                    info = self._process_single_series(series_dir, series_folder, organized_dir_local, fmt)
+                    if info:
+                        with series_lock:
+                            series_info[series_folder] = info
+                except Exception as e:
+                    print(f"⚠️  Series organize failed: {series_folder}: {e}")
+                finally:
+                    series_queue.task_done()
+
+        if parallel_pipeline and auto_organize:
+            organized_dir = os.path.join(base_output_dir, f"{accession_number}_organized")
+            os.makedirs(organized_dir, exist_ok=True)
+
+            download_thread = threading.Thread(target=_download_worker, daemon=True)
+            organize_thread = threading.Thread(target=_organize_worker, args=(organized_dir, output_format), daemon=True)
+
+            download_thread.start()
+            organize_thread.start()
+
+            # 等待下载完成
+            download_thread.join()
+            # 通知整理线程退出
+            series_queue.put(None)
+            series_queue.join()
+            organize_thread.join()
+
+            download_dir = download_dir_holder['path']
+            if not download_dir:
+                print("❌ Download failed, workflow terminated")
+                return None
+        else:
+            download_dir = self.download_study(accession_number, base_output_dir)
+            if not download_dir:
+                print("❌ Download failed, workflow terminated")
+                return None
         
         results = {
             'accession_number': accession_number,
@@ -1344,20 +1452,35 @@ class DICOMDownloadClient:
         if auto_organize:
             # 步骤2: 整理DICOM文件
             print(f"\n📁 Step 2: Organize DICOM files by series (format: {output_format})")
-            organized_dir, series_info = self.organize_dicom_files(download_dir, output_format=output_format)
-            if not organized_dir:
-                print("❌ File organization failed, workflow terminated")
-                return results
-            
-            results['organized_dir'] = organized_dir
-            results['series_info'] = series_info
-            
+            if parallel_pipeline:
+                # 使用流水线整理结果
+                organized_dir = os.path.join(base_output_dir, f"{accession_number}_organized")
+                results['organized_dir'] = organized_dir
+                results['series_info'] = series_info
+            else:
+                organized_dir, series_info = self.organize_dicom_files(download_dir, output_format=output_format)
+                if not organized_dir:
+                    print("❌ File organization failed, workflow terminated")
+                    return results
+                results['organized_dir'] = organized_dir
+                results['series_info'] = series_info
+
             if auto_metadata:
-                # 步骤3: 提取元数据
+                # 步骤3: 提取元数据 (独立线程)
                 print(f"\n📊 Step 3: Extract DICOM metadata")
                 excel_name = f"dicom_metadata_{accession_number}.xlsx"
                 excel_path = os.path.join(os.path.dirname(organized_dir), excel_name)
-                excel_file = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
+
+                excel_holder = {'path': None}
+
+                def _metadata_worker():
+                    excel_holder['path'] = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
+
+                metadata_thread = threading.Thread(target=_metadata_worker, daemon=True)
+                metadata_thread.start()
+                metadata_thread.join()
+
+                excel_file = excel_holder['path']
                 if excel_file:
                     results['excel_file'] = excel_file
                     results['success'] = True
