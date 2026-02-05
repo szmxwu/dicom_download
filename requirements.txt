@@ -30,6 +30,7 @@ Werkzeug>=2.3.0
 # NIfTI文件处理 (DICOM转换)
 nibabel>=5.1.0
 numpy>=1.21.0
+pillow>=10.0.0
 
 # 生产环境部署（可选）
 # gunicorn>=21.0.0

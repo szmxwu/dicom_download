@@ -18,6 +18,7 @@ import numpy as np
 from collections import defaultdict
 import re
 import nibabel as nib
+from PIL import Image
 from datetime import datetime
 import sys
 import logging
@@ -491,15 +492,20 @@ class DICOMDownloadClient:
         """将DICOM序列转换为NIfTI格式"""
         try:
             print(f"   🔄 Converting {series_name} to NIfTI...")
+
+            sample_dcm, modality = self._get_series_sample_dicom(series_dir)
             
             # 尝试使用dcm2niix
             nifti_result = self._convert_with_dcm2niix(series_dir, series_name)
             if nifti_result and nifti_result.get('success'):
+                self._generate_series_preview(series_dir, series_name, nifti_result, sample_dcm, modality)
                 return nifti_result
             
             # 使用Python库转换
             print(f"   ⚠️  dcm2niix not available, trying Python libraries...")
             nifti_result = self._convert_with_python_libs(series_dir, series_name)
+            if nifti_result and nifti_result.get('success'):
+                self._generate_series_preview(series_dir, series_name, nifti_result, sample_dcm, modality)
             return nifti_result
             
         except Exception as e:
@@ -511,19 +517,7 @@ class DICOMDownloadClient:
         try:
             print(f"   🔄 Converting {series_name} to NPZ (Normalized)...")
 
-            # Step 0: 序列QC (<=200全量，>200抽样)
-            dicom_files = []
-            for file in os.listdir(series_dir):
-                filepath = os.path.join(series_dir, file)
-                if os.path.isfile(filepath) and self._is_dicom_file(filepath):
-                    dicom_files.append(filepath)
-            dicom_files.sort()
-            qc_summary = self._assess_series_quality(dicom_files)
-            print(
-                f"   🧪 QC({qc_summary['qc_mode']}): "
-                f"low_ratio={qc_summary['low_quality_ratio']:.2f}, "
-                f"low_quality={qc_summary['low_quality']}"
-            )
+            sample_dcm, modality = self._get_series_sample_dicom(series_dir)
             
             # Step 1: 先生成 NIfTI 作为中间文件，以便利用其成熟的方向处理逻辑
             nifti_res = self._convert_with_dcm2niix(series_dir, series_name)
@@ -556,6 +550,30 @@ class DICOMDownloadClient:
                 output_files.append(npz_file)
                 if os.path.exists(nii_path): os.remove(nii_path)
                 
+            qc_summary = self._assess_series_quality_converted(
+                [os.path.join(series_dir, f) for f in output_files]
+            )
+            print(
+                f"   🧪 QC({qc_summary['qc_mode']}): "
+                f"low_ratio={qc_summary['low_quality_ratio']:.2f}, "
+                f"low_quality={qc_summary['low_quality']}"
+            )
+
+            try:
+                self._generate_series_preview(
+                    series_dir,
+                    series_name,
+                    {
+                        'success': True,
+                        'conversion_mode': 'individual' if len(output_files) > 1 else 'series',
+                        'output_files': output_files
+                    },
+                    sample_dcm,
+                    modality
+                )
+            except Exception as e:
+                print(f"   ⚠️  Preview generation failed: {e}")
+
             return {
                 'success': True,
                 'method': 'npz_normalized',
@@ -591,6 +609,225 @@ class DICOMDownloadClient:
         
         # 压缩保存
         np.savez_compressed(npz_path, data=data.astype(np.float32))
+
+    def _get_series_sample_dicom(self, series_dir):
+        """读取序列中的样本DICOM用于标签信息"""
+        try:
+            dicom_files = []
+            for file in os.listdir(series_dir):
+                filepath = os.path.join(series_dir, file)
+                if os.path.isfile(filepath) and self._is_dicom_file(filepath):
+                    dicom_files.append(filepath)
+            if not dicom_files:
+                return None, ''
+            dicom_files.sort()
+            dcm = pydicom.dcmread(dicom_files[0], force=True)
+            modality = getattr(dcm, 'Modality', '')
+            return dcm, modality
+        except Exception:
+            return None, ''
+
+    def _get_window_params(self, dcm):
+        """获取窗宽窗位"""
+        try:
+            if dcm is None:
+                return None, None
+            wc = getattr(dcm, 'WindowCenter', None)
+            ww = getattr(dcm, 'WindowWidth', None)
+            if wc is None or ww is None:
+                return None, None
+
+            if hasattr(wc, '__len__') and not isinstance(wc, str):
+                wc = float(wc[0])
+            else:
+                wc = float(wc)
+
+            if hasattr(ww, '__len__') and not isinstance(ww, str):
+                ww = float(ww[0])
+            else:
+                ww = float(ww)
+
+            if ww <= 1e-6:
+                return None, None
+
+            return wc, ww
+        except Exception:
+            return None, None
+
+    def _apply_windowing(self, image_2d, dcm):
+        """应用窗宽窗位并归一化到0-255"""
+        img = image_2d.astype(np.float32)
+        wc, ww = self._get_window_params(dcm)
+        if wc is not None and ww is not None:
+            low = wc - ww / 2.0
+            high = wc + ww / 2.0
+        else:
+            low, high = np.percentile(img[np.isfinite(img)], [1, 99])
+
+        if high <= low:
+            high = low + 1.0
+
+        img = np.clip(img, low, high)
+        img = (img - low) / (high - low)
+        img = (img * 255.0).astype(np.uint8)
+
+        # 处理灰度反转
+        try:
+            if dcm is not None:
+                photometric = str(getattr(dcm, 'PhotometricInterpretation', '')).upper()
+                if photometric == 'MONOCHROME1':
+                    img = 255 - img
+        except Exception:
+            pass
+
+        return img
+
+    def _resize_with_aspect(self, img, aspect_ratio):
+        """根据像素间距调整纵横比"""
+        try:
+            if aspect_ratio is None or aspect_ratio <= 0:
+                return img
+            height, width = img.shape[:2]
+            target_height = max(1, int(round(height * aspect_ratio)))
+            if target_height == height:
+                return img
+            pil_img = Image.fromarray(img)
+            pil_img = pil_img.resize((width, target_height), resample=Image.BILINEAR)
+            return np.array(pil_img)
+        except Exception:
+            return img
+
+    def _normalize_2d_preview(self, img, target_size=896):
+        """2D图像标准化到固定大小的方形画布"""
+        try:
+            if img is None:
+                return img
+
+            h, w = img.shape[:2]
+            if h <= 0 or w <= 0:
+                return img
+
+            scale = float(target_size) / max(h, w)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+
+            pil_img = Image.fromarray(img)
+            pil_img = pil_img.resize((new_w, new_h), resample=Image.BILINEAR)
+            resized = np.array(pil_img)
+
+            canvas = np.zeros((target_size, target_size), dtype=np.uint8)
+            top = max(0, (target_size - new_h) // 2)
+            left = max(0, (target_size - new_w) // 2)
+            canvas[top:top + new_h, left:left + new_w] = resized
+            return canvas
+        except Exception:
+            return img
+
+    def _generate_series_preview(self, series_dir, series_name, conversion_result, sample_dcm, modality):
+        """为序列生成PNG预览图"""
+        try:
+            if not (conversion_result and conversion_result.get('success')):
+                return None
+
+            output_files = []
+            if conversion_result.get('conversion_mode') == 'individual':
+                output_files = conversion_result.get('output_files', [])
+            else:
+                output_file = conversion_result.get('output_file')
+                if output_file:
+                    output_files = [output_file]
+
+            if not output_files:
+                output_files = conversion_result.get('output_files', [])
+
+            if not output_files:
+                return None
+
+            output_files = [os.path.join(series_dir, f) for f in output_files]
+            output_files = [f for f in output_files if os.path.exists(f)]
+            if not output_files:
+                return None
+
+            modality = (modality or '').upper()
+
+            # 选择用于预览的文件
+            if modality in ['DR', 'MG', 'DX'] or len(output_files) > 1:
+                preview_file = output_files[len(output_files) // 2]
+                is_3d = False
+            else:
+                preview_file = output_files[0]
+                is_3d = True
+
+            # 读取转换后的数据
+            if preview_file.endswith('.npz'):
+                with np.load(preview_file) as npz:
+                    if 'data' in npz.files:
+                        data = npz['data']
+                    elif npz.files:
+                        data = npz[npz.files[0]]
+                    else:
+                        return None
+
+                if data.ndim == 3 and is_3d:
+                    # NPZ: [Z, Y, X], coronal -> 固定Y
+                    mid_y = data.shape[1] // 2
+                    image_2d = data[:, mid_y, :]
+                    image_2d = image_2d.astype(np.float32)
+                    # data[0] 为头侧，imshow默认顶部为第0行，无需再翻转
+                else:
+                    image_2d = data if data.ndim == 2 else data[:, :, 0]
+
+            elif preview_file.endswith(('.nii', '.nii.gz')):
+                img = nib.load(preview_file)
+                img_canonical = nib.as_closest_canonical(img)
+                data = img_canonical.get_fdata()
+
+                if data.ndim == 3 and is_3d:
+                    # NIfTI: [X, Y, Z], coronal -> 固定Y, 映射为 [Z, X]
+                    mid_y = data.shape[1] // 2
+                    slice_xz = data[:, mid_y, :]
+                    image_2d = np.transpose(slice_xz, (1, 0))
+                    # 使Z+（Superior）在顶部
+                    image_2d = image_2d[::-1, :]
+                else:
+                    image_2d = data if data.ndim == 2 else data[:, :, 0]
+            else:
+                return None
+
+            # 窗宽窗位
+            image_2d = self._apply_windowing(image_2d, sample_dcm)
+
+            # 像素间距/层厚决定纵横比
+            aspect_ratio = None
+            try:
+                if sample_dcm is not None:
+                    pixel_spacing = getattr(sample_dcm, 'PixelSpacing', None)
+                    spacing_between = getattr(sample_dcm, 'SpacingBetweenSlices', None)
+                    slice_thickness = getattr(sample_dcm, 'SliceThickness', None)
+                    slice_spacing = float(spacing_between or slice_thickness or 1.0)
+                    if pixel_spacing and len(pixel_spacing) >= 2:
+                        pixel_spacing = [float(pixel_spacing[0]), float(pixel_spacing[1])]
+                        if is_3d:
+                            # coronal: vertical=Z, horizontal=X
+                            aspect_ratio = slice_spacing / max(pixel_spacing[1], 1e-6)
+                        else:
+                            # 2D: vertical=Y, horizontal=X
+                            aspect_ratio = pixel_spacing[0] / max(pixel_spacing[1], 1e-6)
+            except Exception:
+                aspect_ratio = None
+
+            image_2d = self._resize_with_aspect(image_2d, aspect_ratio)
+
+            if not is_3d:
+                image_2d = self._normalize_2d_preview(image_2d, target_size=896)
+
+            preview_name = f"{self._sanitize_folder_name(series_name)}_preview.png"
+            preview_path = os.path.join(series_dir, preview_name)
+
+            Image.fromarray(image_2d).save(preview_path)
+            return preview_path
+        except Exception:
+            return None
     
     def _convert_with_dcm2niix(self, series_dir, series_name):
         """使用dcm2niix工具转换"""
@@ -791,7 +1028,17 @@ class DICOMDownloadClient:
             pixel_data = dcm.pixel_array.astype(np.float32)
             pixel_data = self._apply_rescale(pixel_data, dcm)
             pixel_data = self._apply_photometric(pixel_data, dcm)
+            return self._assess_image_quality_from_array(pixel_data)
+        except Exception:
+            return 1
 
+    def _assess_image_quality_from_array(self, pixel_data):
+        """基于直方图/对比度的简单质检，返回0/1（输入为数组）"""
+        try:
+            if pixel_data is None:
+                return 1
+
+            pixel_data = np.asarray(pixel_data, dtype=np.float32)
             flat = pixel_data[np.isfinite(pixel_data)].ravel()
             if flat.size == 0:
                 return 1
@@ -854,6 +1101,86 @@ class DICOMDownloadClient:
             return 0
         except Exception:
             return 1
+
+    def _assess_converted_file_quality(self, filepath):
+        """基于转换后的NPZ/NIfTI文件做质检，返回0/1"""
+        try:
+            if filepath.endswith('.npz'):
+                with np.load(filepath) as npz:
+                    if 'data' in npz.files:
+                        data = npz['data']
+                    elif npz.files:
+                        data = npz[npz.files[0]]
+                    else:
+                        return 1
+            elif filepath.endswith(('.nii', '.nii.gz')):
+                img = nib.load(filepath)
+                data = img.get_fdata()
+            else:
+                return 1
+
+            return self._assess_image_quality_from_array(data)
+        except Exception:
+            return 1
+
+    def _assess_series_quality_converted(self, converted_files):
+        """对转换后的序列做QC，<=200全量，>200中间±3抽样"""
+        try:
+            total = len(converted_files)
+            if total == 0:
+                return {
+                    'low_quality': 1,
+                    'low_quality_ratio': 1.0,
+                    'qc_mode': 'none',
+                    'qc_sample_indices': []
+                }
+
+            if total <= 200:
+                sample_indices = list(range(total))
+                qc_mode = 'full'
+            else:
+                mid = total // 2
+                sample_indices = [i for i in range(mid - 3, mid + 4) if 0 <= i < total]
+                qc_mode = 'sample'
+
+            low_count = 0
+            for idx in sample_indices:
+                try:
+                    low_count += int(self._assess_converted_file_quality(converted_files[idx]))
+                except Exception:
+                    low_count += 1
+
+            ratio = low_count / max(1, len(sample_indices))
+            low_quality = 1 if ratio > 0.3 else 0
+
+            return {
+                'low_quality': low_quality,
+                'low_quality_ratio': ratio,
+                'qc_mode': qc_mode,
+                'qc_sample_indices': sample_indices
+            }
+        except Exception:
+            return {
+                'low_quality': 1,
+                'low_quality_ratio': 1.0,
+                'qc_mode': 'error',
+                'qc_sample_indices': []
+            }
+
+    def _get_converted_files(self, series_path):
+        """获取转换后的NPZ/NIfTI文件列表，优先NPZ"""
+        try:
+            npz_files = sorted([f for f in os.listdir(series_path) if f.endswith('.npz')])
+            if npz_files:
+                return [os.path.join(series_path, f) for f in npz_files], 'npz'
+
+            nifti_files = sorted([f for f in os.listdir(series_path) if f.endswith(('.nii.gz', '.nii'))])
+            if nifti_files:
+                return [os.path.join(series_path, f) for f in nifti_files], 'nifti'
+
+            return [], None
+        except Exception:
+            return [], None
 
     def _assess_series_quality(self, dicom_files):
         """对序列做QC，<=200全量，>200中间±3抽样"""
@@ -1122,6 +1449,8 @@ class DICOMDownloadClient:
                 continue
             
             print(f"📂 Processing series: {series_folder}")
+
+            converted_files, converted_type = self._get_converted_files(series_path)
             
             # 获取DICOM文件（或查找剩余的.dcm文件）
             dicom_files = []
@@ -1154,6 +1483,8 @@ class DICOMDownloadClient:
                 
                 if need_read_all:
                     print(f"   ℹ️  Detected {modality} modality; will read all {len(dicom_files)} DICOM files")
+
+                    converted_quality = [self._assess_converted_file_quality(p) for p in converted_files]
                     
                     # 遍历所有DICOM文件
                     for idx, dicom_file in enumerate(dicom_files):
@@ -1165,7 +1496,8 @@ class DICOMDownloadClient:
                                 'FileName': os.path.basename(dicom_file),
                                 'FileIndex': idx + 1,
                                 'TotalFilesInSeries': len(dicom_files),
-                                'Low_quality': self._assess_image_quality(dcm)
+                                'Low_quality': converted_quality[idx]
+                                if idx < len(converted_quality) else 1
                             }
                             
                             # 获取对应模态的字段列表
@@ -1207,7 +1539,7 @@ class DICOMDownloadClient:
                         'SampleFileName': os.path.basename(sample_file),
                         'TotalFilesInSeries': len(dicom_files),
                         'FilesReadForMetadata': 1,  # 标记只读取了一个文件
-                        'Low_quality': self._assess_image_quality(dcm)
+                        'Low_quality': self._assess_series_quality_converted(converted_files).get('low_quality', 1)
                     }
                     
                     # 获取对应模态的字段列表
