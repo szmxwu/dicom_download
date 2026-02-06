@@ -20,7 +20,6 @@ import time
 import uuid
 import threading
 from pathlib import Path
-import zipfile
 import shutil
 import sys
 import logging
@@ -32,6 +31,7 @@ import secrets
 
 # 导入我们的DICOM处理客户端
 from dicom_client_unified import DICOMDownloadClient
+from result_packaging import create_result_zip
 
 def get_base_path():
     """获取程序运行时的根目录路径，兼容 PyInstaller 打包"""
@@ -774,6 +774,7 @@ def process_single_task(task):
                     zip_path = create_result_zip(
                         results['organized_dir'],
                         task.task_id,
+                        app.config['RESULT_FOLDER'],
                         extra_files=[results.get('excel_file')]
                     )
                     results['result_zip'] = zip_path
@@ -890,7 +891,11 @@ def process_batch_task(task):
         
         # 合并结果
         batch_result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id)
-        zip_path = create_result_zip(batch_result_dir, f"batch_{task.task_id}")
+        zip_path = create_result_zip(
+            batch_result_dir,
+            f"batch_{task.task_id}",
+            app.config['RESULT_FOLDER']
+        )
         
         task.result = {
             'batch_results': results,
@@ -938,63 +943,43 @@ def process_upload_task(task):
         os.makedirs(result_dir, exist_ok=True)
         
         task.steps = ['Extract Files', 'Organize Files', 'NIfTI Conversion', 'Extract Metadata']
-        
-        # 解压文件
-        task.update_status('running', 20, 'Extracting files')
-        task.add_log("Extracting uploaded ZIP file...")
-        extract_dir = local_client.extract_zip(filepath, os.path.join(result_dir, 'extracted'))
-        
-        # 初始化变量，确保在结果字典中可用
-        organized_dir = extract_dir
-        series_info = {}
-        excel_file = None
-        
-        if extract_dir:
-            task.add_log('File extraction completed')
-            
-            if options.get('auto_organize', True):
-                # 整理文件
-                task.update_status('running', 50, 'Organizing files')
-                task.add_log("Organizing DICOM files by series...")
-                organized_dir, series_info = local_client.organize_dicom_files(
-                    extract_dir, 
-                    output_format=options.get('output_format', 'nifti')
-                )
-                task.add_log(f'File organization completed, found {len(series_info)} series')
-                
-                if options.get('auto_metadata', True):
-                    # 提取元数据
-                    task.update_status('running', 80, 'Extracting metadata')
-                    task.add_log("Extracting DICOM metadata...")
-                    excel_file = local_client.extract_dicom_metadata(organized_dir)
-                    task.add_log('Metadata extraction completed')
-            else:
-                # organized_dir, series_info, excel_file 已在上面初始化
-                pass
-            
+
+        # 处理上传流程
+        task.update_status('running', 20, 'Processing upload workflow')
+        task.add_log("Processing uploaded ZIP file...")
+        result = local_client.process_upload_workflow(filepath, result_dir, options)
+
+        if result.get('success'):
+            organized_dir = result.get('organized_dir')
+            series_info = result.get('series_info', {})
+            excel_file = result.get('excel_file')
+
             task.update_status('running', 95, 'Creating result files')
             task.add_log("Creating result files...")
-            zip_path = create_result_zip(result_dir, task.task_id)
-            
+            zip_path = create_result_zip(
+                result_dir,
+                task.task_id,
+                app.config['RESULT_FOLDER']
+            )
+
             task.result = {
-                'extract_dir': extract_dir,
+                'extract_dir': result.get('extract_dir'),
                 'organized_dir': organized_dir,
                 'excel_file': excel_file,
                 'result_zip': zip_path,
                 'series_count': len(series_info)
             }
-            
+
             task.update_status('completed', 100, 'Upload process completed')
             task.add_log('Upload process completed')
             task.end_time = time.time()
-            
+
             # 上传文件处理完成后检查并清理结果目录
             check_and_cleanup_results()
-            
         else:
-            task.add_log('File extraction failed', 'error')
+            task.add_log('Upload processing failed', 'error')
             task.update_status('failed')
-            task.error = 'Failed to extract uploaded file'
+            task.error = result.get('error') or 'Failed to process uploaded file'
             
     except Exception as e:
         task.add_log(f'Upload process error: {str(e)}', 'error')
@@ -1002,36 +987,6 @@ def process_upload_task(task):
         task.error = str(e)
         task.end_time = time.time()
 
-def create_result_zip(source_dir, task_id, extra_files=None):
-    """创建结果ZIP文件。
-
-    extra_files: 额外需要打包的文件路径列表（会放在 ZIP 根目录）。
-    """
-    zip_path = os.path.join(app.config['RESULT_FOLDER'], f"result_{task_id}.zip")
-    
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, dirs, files in os.walk(source_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arc_name = os.path.relpath(file_path, source_dir)
-                zipf.write(file_path, arc_name)
-
-        if extra_files:
-            for extra_path in extra_files:
-                if not extra_path or not os.path.exists(extra_path):
-                    continue
-                # 如果已经在 source_dir 内，跳过（避免重复）
-                try:
-                    base_dir = os.path.abspath(source_dir)
-                    extra_abs = os.path.abspath(extra_path)
-                    if os.path.commonpath([base_dir, extra_abs]) == base_dir:
-                        continue
-                except Exception:
-                    pass
-                arc_name = os.path.basename(extra_path)
-                zipf.write(extra_path, arc_name)
-    
-    return zip_path
 
 # WebSocket事件处理
 @socketio.on('connect')
