@@ -359,7 +359,7 @@ class DICOMDownloadClient:
         return output_path if storage_state['files_received'] > 0 else None
     
     def extract_zip(self, zip_filepath, extract_dir=None):
-        """保持接口兼容性，直接返回路径（因为不再有ZIP文件）"""
+        """解压zip_filepath到指定目录（兼容接口，实际直接返回原路径）"""
         return zip_filepath
     
     def _is_dicom_file(self, filepath):
@@ -609,6 +609,101 @@ class DICOMDownloadClient:
         
         # 压缩保存
         np.savez_compressed(npz_path, data=data.astype(np.float32))
+
+    def _cache_metadata_for_series(self, series_dir, series_name, dicom_files, modality):
+        """缓存DICOM元数据，避免删除后无法提取标签"""
+        try:
+            if not dicom_files:
+                return
+
+            read_all = modality in ['DR', 'MG', 'DX']
+            records = self._collect_metadata_from_dicoms(
+                dicom_files=dicom_files,
+                series_folder=series_name,
+                modality=modality,
+                read_all=read_all
+            )
+            if not records:
+                return
+
+            cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
+            payload = {
+                "modality": modality,
+                "records": records
+            }
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            return
+
+    def _collect_metadata_from_dicoms(self, dicom_files, series_folder, modality, read_all):
+        """从DICOM文件提取元数据（不含质控字段）"""
+        records = []
+        try:
+            if not dicom_files:
+                return records
+
+            current_keywords = self.get_keywords(modality)
+
+            if read_all:
+                for idx, dicom_file in enumerate(dicom_files):
+                    try:
+                        dcm = pydicom.dcmread(dicom_file, force=True)
+                        metadata = {
+                            'SeriesFolder': series_folder,
+                            'FileName': os.path.basename(dicom_file),
+                            'FileIndex': idx + 1,
+                            'TotalFilesInSeries': len(dicom_files)
+                        }
+                        for keyword in current_keywords:
+                            try:
+                                value = getattr(dcm, keyword, None)
+                                if value is not None:
+                                    if hasattr(value, '__len__') and not isinstance(value, str):
+                                        if len(value) == 1:
+                                            value = value[0]
+                                        else:
+                                            value = str(value)
+                                    elif hasattr(value, 'value'):
+                                        value = value.value
+                                    metadata[keyword] = str(value)
+                                else:
+                                    metadata[keyword] = ""
+                            except Exception:
+                                metadata[keyword] = ""
+                        records.append(metadata)
+                    except Exception:
+                        continue
+            else:
+                sample_file = dicom_files[0]
+                dcm = pydicom.dcmread(sample_file, force=True)
+                metadata = {
+                    'SeriesFolder': series_folder,
+                    'SampleFileName': os.path.basename(sample_file),
+                    'TotalFilesInSeries': len(dicom_files),
+                    'FilesReadForMetadata': 1
+                }
+                for keyword in current_keywords:
+                    try:
+                        value = getattr(dcm, keyword, None)
+                        if value is not None:
+                            if hasattr(value, '__len__') and not isinstance(value, str):
+                                if len(value) == 1:
+                                    value = value[0]
+                                else:
+                                    value = str(value)
+                            elif hasattr(value, 'value'):
+                                value = value.value
+                            metadata[keyword] = str(value)
+                        else:
+                            metadata[keyword] = ""
+                    except Exception:
+                        metadata[keyword] = ""
+                records.append(metadata)
+        except Exception:
+            return []
+
+        return records
 
     def _get_series_sample_dicom(self, series_dir):
         """读取序列中的样本DICOM用于标签信息"""
@@ -909,6 +1004,8 @@ class DICOMDownloadClient:
                 
                 if success_count > 0:
                     print(f"   ✅ dcm2niix conversion succeeded: {success_count}/{len(dicom_files)} files")
+
+                    self._cache_metadata_for_series(series_dir, series_name, dicom_files, modality)
                     
                     # 删除原始DICOM文件
                     for dcm_file in dicom_files:
@@ -948,6 +1045,8 @@ class DICOMDownloadClient:
                     nifti_files = [f for f in os.listdir(series_dir) if f.endswith(('.nii.gz', '.nii'))]
                     if nifti_files:
                         print(f"   ✅ dcm2niix conversion succeeded: {nifti_files[0]}")
+
+                        self._cache_metadata_for_series(series_dir, series_name, dicom_files, modality)
                         
                         # 删除原始DICOM文件
                         for file in os.listdir(series_dir):
@@ -1291,6 +1390,7 @@ class DICOMDownloadClient:
                 
                 if success_count > 0:
                     # 删除原始DICOM文件
+                    self._cache_metadata_for_series(series_dir, series_name, dicom_files, modality)
                     for dcm_file in dicom_files:
                         try:
                             os.remove(dcm_file)
@@ -1332,6 +1432,7 @@ class DICOMDownloadClient:
                     nib.save(nifti_img, output_path)
                     
                     # 删除原始DICOM文件
+                    self._cache_metadata_for_series(series_dir, series_name, dicom_files, modality)
                     for file in dicom_files:
                         try:
                             os.remove(file)
@@ -1409,6 +1510,7 @@ class DICOMDownloadClient:
                 nib.save(nifti_img, output_path)
                 
                 # 删除原始DICOM文件
+                self._cache_metadata_for_series(series_dir, series_name, dicom_files, modality)
                 for file in dicom_files:
                     try:
                         os.remove(file)
@@ -1461,6 +1563,29 @@ class DICOMDownloadClient:
             
             # 如果没有DICOM文件，尝试查找NIfTI文件以获取基本信息
             if not dicom_files:
+                cache_path = os.path.join(series_path, "dicom_metadata_cache.json")
+                if os.path.exists(cache_path):
+                    try:
+                        with open(cache_path, 'r', encoding='utf-8') as f:
+                            cache = json.load(f)
+                        cached_records = cache.get('records', [])
+                        cached_modality = str(cache.get('modality', '')).upper()
+                        read_all = cached_modality in ['DR', 'MG', 'DX']
+
+                        if read_all:
+                            converted_quality = [self._assess_converted_file_quality(p) for p in converted_files]
+                            for idx, record in enumerate(cached_records):
+                                record['Low_quality'] = converted_quality[idx] if idx < len(converted_quality) else 1
+                                all_metadata.append(record)
+                        else:
+                            series_quality = self._assess_series_quality_converted(converted_files).get('low_quality', 1)
+                            if cached_records:
+                                cached_records[0]['Low_quality'] = series_quality
+                                all_metadata.append(cached_records[0])
+                        continue
+                    except Exception:
+                        pass
+
                 nifti_files = [f for f in os.listdir(series_path) if f.endswith(('.nii.gz', '.nii'))]
                 if nifti_files:
                     metadata = {
@@ -1484,86 +1609,33 @@ class DICOMDownloadClient:
                 if need_read_all:
                     print(f"   ℹ️  Detected {modality} modality; will read all {len(dicom_files)} DICOM files")
 
+                    records = self._collect_metadata_from_dicoms(
+                        dicom_files=dicom_files,
+                        series_folder=series_folder,
+                        modality=modality,
+                        read_all=True
+                    )
                     converted_quality = [self._assess_converted_file_quality(p) for p in converted_files]
-                    
-                    # 遍历所有DICOM文件
-                    for idx, dicom_file in enumerate(dicom_files):
-                        try:
-                            dcm = pydicom.dcmread(dicom_file, force=True)
-                            
-                            metadata = {
-                                'SeriesFolder': series_folder,
-                                'FileName': os.path.basename(dicom_file),
-                                'FileIndex': idx + 1,
-                                'TotalFilesInSeries': len(dicom_files),
-                                'Low_quality': converted_quality[idx]
-                                if idx < len(converted_quality) else 1
-                            }
-                            
-                            # 获取对应模态的字段列表
-                            current_keywords = self.get_keywords(modality)
-                            
-                            # 提取关键字段
-                            for keyword in current_keywords:
-                                try:
-                                    value = getattr(dcm, keyword, None)
-                                    if value is not None:
-                                        if hasattr(value, '__len__') and not isinstance(value, str):
-                                            if len(value) == 1:
-                                                value = value[0]
-                                            else:
-                                                value = str(value)
-                                        elif hasattr(value, 'value'):
-                                            value = value.value
-                                        metadata[keyword] = str(value)
-                                    else:
-                                        metadata[keyword] = ""
-                                except:
-                                    metadata[keyword] = ""
-                            
-                            all_metadata.append(metadata)
-                            
-                            # 每处理10个文件输出一次进度
-                            if (idx + 1) % 10 == 0:
-                                print(f"      Processed {idx + 1}/{len(dicom_files)} files...")
-                            
-                        except Exception as e:
-                            print(f"     ⚠️  Failed reading file {os.path.basename(dicom_file)}: {e}")
-                            continue
+
+                    for idx, record in enumerate(records):
+                        record['Low_quality'] = converted_quality[idx] if idx < len(converted_quality) else 1
+                        all_metadata.append(record)
+
+                        if (idx + 1) % 10 == 0:
+                            print(f"      Processed {idx + 1}/{len(records)} files...")
                 else:
                     # Original logic: read only representative file
                     print(f"   ℹ️  {modality} modality; reading representative file only")
-                    
-                    metadata = {
-                        'SeriesFolder': series_folder,
-                        'SampleFileName': os.path.basename(sample_file),
-                        'TotalFilesInSeries': len(dicom_files),
-                        'FilesReadForMetadata': 1,  # 标记只读取了一个文件
-                        'Low_quality': self._assess_series_quality_converted(converted_files).get('low_quality', 1)
-                    }
-                    
-                    # 获取对应模态的字段列表
-                    current_keywords = self.get_keywords(modality)
-                    
-                    # 提取关键字段
-                    for keyword in current_keywords:
-                        try:
-                            value = getattr(dcm, keyword, None)
-                            if value is not None:
-                                if hasattr(value, '__len__') and not isinstance(value, str):
-                                    if len(value) == 1:
-                                        value = value[0]
-                                    else:
-                                        value = str(value)
-                                elif hasattr(value, 'value'):
-                                    value = value.value
-                                metadata[keyword] = str(value)
-                            else:
-                                metadata[keyword] = ""
-                        except:
-                            metadata[keyword] = ""
-                    
-                    all_metadata.append(metadata)
+
+                    records = self._collect_metadata_from_dicoms(
+                        dicom_files=dicom_files,
+                        series_folder=series_folder,
+                        modality=modality,
+                        read_all=False
+                    )
+                    if records:
+                        records[0]['Low_quality'] = self._assess_series_quality_converted(converted_files).get('low_quality', 1)
+                        all_metadata.append(records[0])
                     
             except Exception as e:
                 print(f"     ❌ Failed processing series: {e}")
