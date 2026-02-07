@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 """
-DICOM Processing System - Client Side Test Script
-Usage: python test.py <AccessionNumber> [--output_dir ./downloads] [--format nifti|npz]
+命令行下载客户端模块
+
+提供通过 HTTP API 与 DICOM 服务器通信的命令行工具，
+支持断点续传和批量下载功能。
 """
 
 import requests
@@ -18,7 +20,10 @@ import json
 from datetime import datetime, timedelta
 import tempfile
 
-SERVER_URL = "http://172.17.250.136:5005"
+# 可以通过环境变量 SERVER_URL 覆盖默认地址，例如：
+# export SERVER_URL="http://192.0.0.222:5005"
+SERVER_URL = os.environ.get("SERVER_URL", "http://192.0.0.222:5005")
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "60"))  # 默认60秒超时
 API_SINGLE = f"{SERVER_URL}/api/process/single"
 API_STATUS = lambda task_id: f"{SERVER_URL}/api/task/{task_id}/status"
 API_DOWNLOAD = lambda task_id: f"{SERVER_URL}/api/download/{task_id}/zip"
@@ -30,7 +35,7 @@ def poll_task_status(task_id):
     
     while True:
         try:
-            response = requests.get(API_STATUS(task_id))
+            response = requests.get(API_STATUS(task_id), timeout=30)
             if response.status_code != 200:
                 print(f"[!] 获取状态失败: {response.text}")
                 return False, None
@@ -87,7 +92,7 @@ def download_and_extract(task_id, output_dir, accession=None):
     print(f"[*] 正在下载结果到: {target_zip}")
 
     try:
-        with requests.get(download_url, stream=True) as r:
+        with requests.get(download_url, stream=True, timeout=(30, 300)) as r:  # 连接超时30秒，读取超时5分钟
             r.raise_for_status()
             with open(target_zip, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
@@ -200,27 +205,53 @@ def main(cli_args=None):
         }
     }
 
-    try:
-        response = requests.post(API_SINGLE, json=payload)
-        if response.status_code != 200:
-            print(f"[!] 提交任务失败 ({response.status_code}): {response.text}")
+    # 提交任务，带重试机制
+    max_retries = 3
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"[*] 正在提交任务 (尝试 {attempt + 1}/{max_retries})...")
+            response = requests.post(API_SINGLE, json=payload, timeout=REQUEST_TIMEOUT)
+            if response.status_code != 200:
+                print(f"[!] 提交任务失败 ({response.status_code}): {response.text}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                return False
+
+            task_id = response.json().get('task_id')
+            print(f"[+] 任务已启动，ID: {task_id}")
+            break
+        except requests.exceptions.ConnectionError as e:
+            print(f"[!] 连接失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"[*] 等待 {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
+            else:
+                print(f"[!] 已达到最大重试次数，放弃提交")
+                return False
+        except requests.exceptions.Timeout as e:
+            print(f"[!] 请求超时 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                return False
+        except Exception as e:
+            print(f"[!] 通信失败: {e}")
             return False
+    else:
+        # 循环正常结束但没有 break（理论上不会执行到这里）
+        return False
 
-        task_id = response.json().get('task_id')
-        print(f"[+] 任务已启动，ID: {task_id}")
+    # 步骤2: 轮询状态
+    success, result = poll_task_status(task_id)
 
-        # 步骤2: 轮询状态
-        success, result = poll_task_status(task_id)
-
-        if success:
-            # 步骤3: 下载（将 accession 传入以便按 AccessionNumber 命名目录）
-            ok = download_and_extract(task_id, args.output_dir, accession=args.accession)
-            return bool(ok)
-        else:
-            return False
-
-    except Exception as e:
-        print(f"[!] 通信失败: {e}")
+    if success:
+        # 步骤3: 下载（将 accession 传入以便按 AccessionNumber 命名目录）
+        ok = download_and_extract(task_id, args.output_dir, accession=args.accession)
+        return bool(ok)
+    else:
         return False
 
 PROGRESS_FILENAME = ".download_progress.json"

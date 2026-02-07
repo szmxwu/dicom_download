@@ -1,11 +1,27 @@
 # -*- coding: utf-8 -*-
-"""Quality control helpers."""
+"""
+图像质量控制模块
+
+提供 DICOM 和转换后图像（NIfTI/NPZ）的质量评估功能，
+包括过曝、欠曝、对比度检查等。
+"""
 
 import numpy as np
 import nibabel as nib
+from typing import Dict, List, Any
 
 
-def _apply_rescale(pixel_data, dcm):
+def _apply_rescale(pixel_data: np.ndarray, dcm) -> np.ndarray:
+    """
+    应用像素值重缩放变换
+
+    Args:
+        pixel_data: 原始像素数据
+        dcm: pydicom Dataset 对象
+
+    Returns:
+        np.ndarray: 重缩放后的像素数据
+    """
     try:
         slope = float(getattr(dcm, 'RescaleSlope', 1.0))
         intercept = float(getattr(dcm, 'RescaleIntercept', 0.0))
@@ -14,7 +30,17 @@ def _apply_rescale(pixel_data, dcm):
         return pixel_data.astype(np.float32)
 
 
-def _apply_photometric(pixel_data, dcm):
+def _apply_photometric(pixel_data: np.ndarray, dcm) -> np.ndarray:
+    """
+    应用光度学变换（处理 MONOCHROME1 反色）
+
+    Args:
+        pixel_data: 原始像素数据
+        dcm: pydicom Dataset 对象
+
+    Returns:
+        np.ndarray: 变换后的像素数据
+    """
     try:
         photometric = str(getattr(dcm, 'PhotometricInterpretation', '')).upper()
         if photometric == 'MONOCHROME1':
@@ -25,7 +51,16 @@ def _apply_photometric(pixel_data, dcm):
     return pixel_data
 
 
-def assess_image_quality(dcm):
+def assess_image_quality(dcm) -> int:
+    """
+    评估 DICOM 图像质量
+
+    Args:
+        dcm: pydicom Dataset 对象
+
+    Returns:
+        int: 质量评估结果 (0=正常, 1=低质量)
+    """
     try:
         if not hasattr(dcm, 'pixel_array'):
             return 1
@@ -38,7 +73,23 @@ def assess_image_quality(dcm):
         return 1
 
 
-def assess_image_quality_from_array(pixel_data):
+def assess_image_quality_from_array(pixel_data: np.ndarray) -> int:
+    """
+    从像素数组评估图像质量
+
+    评估指标包括：
+    - 动态范围：像素值的分布范围
+    - 标准差：像素值的离散程度
+    - 唯一值比例：图像复杂度
+    - 过曝/欠曝检测
+    - 边缘反转检测
+
+    Args:
+        pixel_data: 像素数据数组
+
+    Returns:
+        int: 质量评估结果 (0=正常, 1=低质量)
+    """
     try:
         if pixel_data is None:
             return 1
@@ -48,6 +99,7 @@ def assess_image_quality_from_array(pixel_data):
         if flat.size == 0:
             return 1
 
+        # 大数据集时进行采样以提高性能
         if flat.size > 200000:
             flat = flat[:: max(1, flat.size // 200000)]
 
@@ -62,6 +114,7 @@ def assess_image_quality_from_array(pixel_data):
         range_eps = max(dynamic_range, 1e-6)
         mean_val = float(np.mean(flat))
 
+        # 检测过曝和欠曝
         low_thresh = p2 + 0.01 * range_eps
         high_thresh = p98 - 0.01 * range_eps
         low_ratio = float(np.mean(flat <= low_thresh))
@@ -70,6 +123,7 @@ def assess_image_quality_from_array(pixel_data):
         under_exposed = mean_val < (p2 + 0.1 * range_eps) or low_ratio > 0.6
         over_exposed = mean_val > (p98 - 0.1 * range_eps) or high_ratio > 0.6
 
+        # 边缘反转检测（检查边框与中心的差异）
         slice_data = pixel_data
         if slice_data.ndim > 2:
             mid = slice_data.shape[-1] // 2
@@ -94,6 +148,7 @@ def assess_image_quality_from_array(pixel_data):
         else:
             inverted_like = False
 
+        # 质量判定规则
         if dynamic_range < 20 or std < 5 or unique_ratio < 0.01:
             return 1
 
@@ -105,7 +160,16 @@ def assess_image_quality_from_array(pixel_data):
         return 1
 
 
-def assess_converted_file_quality(filepath):
+def assess_converted_file_quality(filepath: str) -> int:
+    """
+    评估转换后文件（NIfTI/NPZ）的质量
+
+    Args:
+        filepath: 文件路径
+
+    Returns:
+        int: 质量评估结果 (0=正常, 1=低质量)
+    """
     try:
         if filepath.endswith('.npz'):
             with np.load(filepath) as npz:
@@ -126,7 +190,20 @@ def assess_converted_file_quality(filepath):
         return 1
 
 
-def assess_series_quality_converted(converted_files):
+def assess_series_quality_converted(converted_files: List[str]) -> Dict[str, Any]:
+    """
+    评估转换后序列的质量
+
+    Args:
+        converted_files: 转换后的文件路径列表
+
+    Returns:
+        Dict: 包含以下字段的字典：
+            - low_quality: 是否低质量 (0/1)
+            - low_quality_ratio: 低质量文件比例
+            - qc_mode: 质检模式 ('full'/'sample'/'none'/'error')
+            - qc_sample_indices: 抽样检查的索引列表
+    """
     try:
         total = len(converted_files)
         if total == 0:
@@ -137,6 +214,7 @@ def assess_series_quality_converted(converted_files):
                 'qc_sample_indices': []
             }
 
+        # 根据文件数量决定质检模式
         if total <= 200:
             sample_indices = list(range(total))
             qc_mode = 'full'
@@ -170,7 +248,17 @@ def assess_series_quality_converted(converted_files):
         }
 
 
-def assess_series_quality(dicom_files, dcmread):
+def assess_series_quality(dicom_files: List[str], dcmread) -> Dict[str, Any]:
+    """
+    评估 DICOM 序列的质量
+
+    Args:
+        dicom_files: DICOM 文件路径列表
+        dcmread: pydicom.dcmread 函数
+
+    Returns:
+        Dict: 质量评估结果字典
+    """
     try:
         total = len(dicom_files)
         if total == 0:

@@ -60,7 +60,7 @@ MRI normalization rules (keywords/thresholds/regex) are externalized in `mr_clea
 
 1. Start the web application:
    ```bash
-   python app.py
+   python -m src.web.app
    ```
 2. Open your browser and navigate to `http://localhost:5005`.
 3. Use the interface to search for patients and start download/processing tasks.
@@ -71,9 +71,51 @@ MRI normalization rules (keywords/thresholds/regex) are externalized in `mr_clea
 
 ## Project Structure
 
-- `app.py`: Main Flask web application.
-- `dicom_client_unified.py`: Core DICOM handling logic.
-- `MR_clean.py`: MR metadata normalization and sequence classification.
+### New Source Layout (Refactored)
+
+The codebase has been reorganized into a `src/` directory structure for better maintainability:
+
+```
+src/
+├── __init__.py              # Package initialization
+├── models.py                # Data models (ClientConfig, SeriesInfo, WorkflowResult)
+├── core/                    # Core DICOM processing modules
+│   ├── organize.py          # DICOM file organization
+│   ├── convert.py           # DICOM to NIfTI/NPZ conversion
+│   ├── metadata.py          # Metadata extraction
+│   ├── qc.py                # Quality control
+│   ├── preview.py           # Preview image generation
+│   └── mr_clean.py          # MR data cleaning and classification
+├── client/                  # DICOM client modules
+│   └── unified.py           # DICOMDownloadClient (main entry)
+├── web/                     # Web application
+│   └── app.py               # Flask web application
+├── cli/                     # Command-line tools
+│   └── download.py          # CLI download client
+└── utils/                   # Utility modules
+    └── packaging.py         # Result packaging (ZIP)
+```
+
+### Backward Compatibility
+
+The original files in the root directory are kept as compatibility wrappers. They will import from the new `src/` locations and emit a `DeprecationWarning`. 
+
+**Note**: While existing code importing from the root directory will continue to work, it is recommended to update imports to use the new `src.*` paths:
+
+```python
+# Old (deprecated)
+from src.client.unified import DICOMDownloadClient
+
+# New (recommended)
+from src.client.unified import DICOMDownloadClient
+```
+
+### Legacy Project Structure (Root Directory)
+
+- `app.py`: Compatibility wrapper for Flask web application.
+- `dicom_client_unified.py`: Compatibility wrapper for core DICOM handling.
+- `MR_clean.py`: Compatibility wrapper for MR metadata normalization.
+- `test.py`: Upload workflow test runner.
 - `dicom_tags/`: Configuration files for metadata extraction.
 - `templates/`: HTML templates for the web UI.
 - `static/`: Static assets (CSS, JS).
@@ -88,7 +130,7 @@ This project now supports exporting image data as either NIfTI (`.nii` / `.nii.g
 - Programmatic / CLI: when calling the processing workflow from Python, pass the `output_format` parameter to `process_complete_workflow`:
 
 ```python
-from dicom_client_unified import DICOMDownloadClient
+from src.client.unified import DICOMDownloadClient
 
 client = DICOMDownloadClient()
 client.process_complete_workflow(

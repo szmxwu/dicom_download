@@ -58,7 +58,7 @@ MRI 治理的规则（关键词/阈值/正则等）已抽离到 `mr_clean_config
 
 1. 启动 Web 应用：
    ```bash
-   python app.py
+   python -m src.web.app.py
    ```
 2. 打开浏览器访问 `http://localhost:5005`。
 3. 使用界面查询患者并开始下载/处理任务。
@@ -69,9 +69,48 @@ MRI 治理的规则（关键词/阈值/正则等）已抽离到 `mr_clean_config
 
 ## 项目结构
 
-- `app.py`: Flask Web 应用程序入口。
-- `dicom_client_unified.py`: 核心 DICOM 处理逻辑。
-- `MR_clean.py`: MR 元数据治理与序列分类逻辑。
+### 新的源码布局（已重构）
+
+代码库已重新组织为 `src/` 目录结构，以提高可维护性：
+
+```
+src/
+├── __init__.py              # 包初始化
+├── models.py                # 数据模型 (ClientConfig, SeriesInfo, WorkflowResult)
+├── core/                    # 核心 DICOM 处理模块
+│   ├── organize.py          # DICOM 文件组织
+│   ├── convert.py           # DICOM 转 NIfTI/NPZ 转换
+│   ├── metadata.py          # 元数据提取
+│   ├── qc.py                # 质量控制
+│   ├── preview.py           # 预览图生成
+│   └── mr_clean.py          # MR 数据清洗和分类
+├── client/                  # DICOM 客户端模块
+│   └── unified.py           # DICOMDownloadClient（主入口）
+├── web/                     # Web 应用程序
+│   └── app.py               # Flask Web 应用
+├── cli/                     # 命令行工具
+│   └── download.py          # CLI 下载客户端
+└── utils/                   # 工具模块
+    └── packaging.py         # 结果打包 (ZIP)
+```
+
+### 向后兼容性
+
+
+**注意**：建议更新导入语句以使用新的 `src.*` 路径：
+
+```python
+
+
+from src.client.unified import DICOMDownloadClient
+```
+
+### 传统项目结构（根目录）
+
+- `app.py`: Flask Web 应用的兼容性包装器。
+- `dicom_client_unified.py`: 核心 DICOM 处理的兼容性包装器。
+- `MR_clean.py`: MR 元数据治理的兼容性包装器。
+- `test.py`: 上传工作流测试运行器。
 - `dicom_tags/`: 元数据提取配置文件目录。
 - `templates/`: Web 界面 HTML 模板。
 - `static/`: 静态资源 (CSS, JS)。
@@ -86,7 +125,7 @@ MRI 治理的规则（关键词/阈值/正则等）已抽离到 `mr_clean_config
 - 编程/脚本调用：在 Python 中调用处理流程时，可通过 `output_format` 参数控制输出：
 
 ```python
-from dicom_client_unified import DICOMDownloadClient
+from src.client.unified import DICOMDownloadClient
 
 client = DICOMDownloadClient()
 client.process_complete_workflow(

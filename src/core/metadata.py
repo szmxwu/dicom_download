@@ -1,5 +1,27 @@
 # -*- coding: utf-8 -*-
-"""DICOM metadata extraction helpers."""
+"""
+DICOM 元数据提取模块。
+
+该模块提供从 DICOM 医学影像文件中提取元数据并导出为 Excel 的功能。
+主要功能包括：
+- 遍历序列目录，提取 DICOM 标签信息
+- 支持不同模态（CT、MR、DR、MG、DX 等）的特定关键字提取
+- 处理缓存机制，避免重复读取 DICOM 文件
+- 将提取的元数据导出为结构化的 Excel 文件（包含汇总表和详细表）
+- 集成 MR 数据清洗结果到 Excel 报告
+
+典型用法：
+    from src.core.metadata import extract_dicom_metadata
+    
+    excel_path = extract_dicom_metadata(
+        organized_dir="/path/to/organized",
+        output_excel="/path/to/output.xlsx",
+        get_keywords=lambda mod: ["PatientID", "StudyDate", ...],
+        ...
+    )
+"""
+
+from __future__ import annotations
 
 import json
 import os
@@ -19,9 +41,24 @@ def extract_dicom_metadata(
     assess_series_quality_converted: Callable[[List[str]], Dict],
     append_mr_cleaned_sheet: Callable[[pd.DataFrame, str], None],
 ) -> Optional[str]:
-    """Extract DICOM metadata and write Excel.
+    """
+    从已整理的 DICOM 目录中提取元数据并生成 Excel 报告。
 
-    Returns Excel path or None on failure.
+    遍历 organized_dir 下的所有序列文件夹，读取 DICOM 文件的元数据标签，
+    根据不同模态提取相应关键字，评估转换后文件的质量，并将结果导出为
+    Excel 文件（包含 DICOM_Metadata 和 Series_Summary 两个工作表）。
+
+    参数:
+        organized_dir: 已整理的 DICOM 目录路径，每个子文件夹代表一个序列
+        output_excel: 输出 Excel 文件路径，若为 None 则自动生成带时间戳的文件名
+        get_keywords: 回调函数，接收模态字符串（如 'CT', 'MR'），返回要提取的 DICOM 关键字列表
+        get_converted_files: 回调函数，接收序列路径，返回 (转换文件列表, 附加信息) 元组
+        assess_converted_file_quality: 回调函数，接收文件路径，返回质量评分（0=正常，1=低质量）
+        assess_series_quality_converted: 回调函数，接收文件路径列表，返回质量汇总字典
+        append_mr_cleaned_sheet: 回调函数，接收 DataFrame 和 Excel 路径，用于添加 MR 清洗结果
+
+    返回:
+        生成的 Excel 文件路径，提取失败则返回 None
     """
     if output_excel is None:
         timestamp = time.strftime('%Y%m%d_%H%M%S')
@@ -29,7 +66,7 @@ def extract_dicom_metadata(
 
     print("📊 Extracting DICOM metadata...")
 
-    all_metadata = []
+    all_metadata: List[Dict] = []
 
     for series_folder in os.listdir(organized_dir):
         series_path = os.path.join(organized_dir, series_folder)
@@ -40,7 +77,7 @@ def extract_dicom_metadata(
 
         converted_files, _ = get_converted_files(series_path)
 
-        dicom_files = []
+        dicom_files: List[str] = []
         for file in os.listdir(series_path):
             filepath = os.path.join(series_path, file)
             if file.endswith('.dcm') and os.path.isfile(filepath):
@@ -108,7 +145,7 @@ def extract_dicom_metadata(
 
             if need_read_all:
                 print(f"   ℹ️  Detected {modality} modality; will read all {len(dicom_files)} DICOM files")
-                records = []
+                records: List[Dict] = []
                 for idx, dicom_file in enumerate(dicom_files):
                     try:
                         dcm = pydicom.dcmread(dicom_file, force=True)
@@ -183,7 +220,7 @@ def extract_dicom_metadata(
     try:
         df = pd.DataFrame(all_metadata)
 
-        column_order = []
+        column_order: List[str] = []
         priority_columns = ['SeriesFolder', 'FileName', 'SampleFileName', 'FileIndex',
                             'TotalFilesInSeries', 'FilesReadForMetadata']
         for col in priority_columns:
@@ -191,7 +228,7 @@ def extract_dicom_metadata(
                 column_order.append(col)
 
         important_fields = ['PatientID', 'AccessionNumber', 'StudyDate', 'Modality',
-                            'SeriesNumber', 'SeriesDescription', 'InstanceNumber','Rows', 'Columns']
+                            'SeriesNumber', 'SeriesDescription', 'InstanceNumber', 'Rows', 'Columns']
         for field in important_fields:
             if field in df.columns and field not in column_order:
                 column_order.append(field)
@@ -205,7 +242,7 @@ def extract_dicom_metadata(
         with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='DICOM_Metadata', index=False)
 
-            summary_data = []
+            summary_data: List[Dict] = []
             for series_folder in df['SeriesFolder'].unique():
                 series_df = df[df['SeriesFolder'] == series_folder]
                 summary_row = {

@@ -1,50 +1,45 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 """
-统一版DICOM下载和处理客户端
-直接从PACS下载并处理DICOM文件，无需HTTP中间层和ZIP打包
+DICOM 客户端统一模块
+
+提供与 PACS 服务器通信、DICOM 下载、处理流程编排等功能。
+支持 PACS 查询下载流程和本地上传处理流程。
 """
 
 import os
 import json
 import time
-import shutil
 import threading
 import zipfile
 from queue import Queue
-from pathlib import Path
 import pandas as pd
 import pydicom
-import numpy as np
-from collections import defaultdict
 import re
-import nibabel as nib
-from PIL import Image
-from datetime import datetime
 import sys
 import logging
 from types import SimpleNamespace
-from dicom_metadata import extract_dicom_metadata as extract_dicom_metadata_impl
-from organize import organize_dicom_files as organize_dicom_files_impl
-from organize import process_single_series as process_single_series_impl
-from convert import convert_dicom_to_nifti as convert_dicom_to_nifti_impl
-from convert import convert_to_npz as convert_to_npz_impl
-from convert import normalize_and_save_npz as normalize_and_save_npz_impl
-from convert import convert_with_dcm2niix as convert_with_dcm2niix_impl
-from convert import convert_with_python_libs as convert_with_python_libs_impl
-from convert import apply_rescale as apply_rescale_impl
-from convert import apply_photometric as apply_photometric_impl
-from convert import build_affine_from_dicom as build_affine_from_dicom_impl
-from preview import get_window_params as get_window_params_impl
-from preview import apply_windowing as apply_windowing_impl
-from preview import resize_with_aspect as resize_with_aspect_impl
-from preview import normalize_2d_preview as normalize_2d_preview_impl
-from preview import generate_series_preview as generate_series_preview_impl
-from qc import assess_image_quality as assess_image_quality_impl
-from qc import assess_image_quality_from_array as assess_image_quality_from_array_impl
-from qc import assess_converted_file_quality as assess_converted_file_quality_impl
-from qc import assess_series_quality_converted as assess_series_quality_converted_impl
-from qc import assess_series_quality as assess_series_quality_impl
+from src.core.metadata import extract_dicom_metadata as extract_dicom_metadata_impl
+from src.core.organize import organize_dicom_files as organize_dicom_files_impl
+from src.core.organize import process_single_series as process_single_series_impl
+from src.core.convert import convert_dicom_to_nifti as convert_dicom_to_nifti_impl
+from src.core.convert import convert_to_npz as convert_to_npz_impl
+from src.core.convert import normalize_and_save_npz as normalize_and_save_npz_impl
+from src.core.convert import convert_with_dcm2niix as convert_with_dcm2niix_impl
+from src.core.convert import convert_with_python_libs as convert_with_python_libs_impl
+from src.core.convert import apply_rescale as apply_rescale_impl
+from src.core.convert import apply_photometric as apply_photometric_impl
+from src.core.convert import build_affine_from_dicom as build_affine_from_dicom_impl
+from src.core.preview import get_window_params as get_window_params_impl
+from src.core.preview import apply_windowing as apply_windowing_impl
+from src.core.preview import resize_with_aspect as resize_with_aspect_impl
+from src.core.preview import normalize_2d_preview as normalize_2d_preview_impl
+from src.core.preview import generate_series_preview as generate_series_preview_impl
+from src.core.qc import assess_image_quality as assess_image_quality_impl
+from src.core.qc import assess_image_quality_from_array as assess_image_quality_from_array_impl
+from src.core.qc import assess_converted_file_quality as assess_converted_file_quality_impl
+from src.core.qc import assess_series_quality_converted as assess_series_quality_converted_impl
+from src.core.qc import assess_series_quality as assess_series_quality_impl
 from pynetdicom import AE, evt, AllStoragePresentationContexts
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
@@ -91,6 +86,15 @@ class DICOMDownloadClient:
         self.role = os.getenv('DICOM_ROLE', 'admin')
         # optional progress callback to report MR_clean progress: function(message, stage)
         self.progress_callback = None
+        # optional download progress callback: function(current_series, total_series, series_name)
+        self.download_progress_callback = None
+        # disk watermarks (GB) for download throttling
+        try:
+            self._download_high_watermark_gb = float(os.getenv('DOWNLOAD_HIGH_WATERMARK_GB', '45'))
+            self._download_low_watermark_gb = float(os.getenv('DOWNLOAD_LOW_WATERMARK_GB', '40'))
+        except Exception:
+            self._download_high_watermark_gb = 45.0
+            self._download_low_watermark_gb = 40.0
     
     def _load_keywords(self, tags_dir="dicom_tags"):
         """加载不同模态的DICOM字段列表"""
@@ -158,6 +162,57 @@ class DICOMDownloadClient:
         self.username = username
         print(f"✅ Login successful: {username} (no actual authentication required)")
         return True
+
+    def _get_dir_size_gb(self, directory):
+        """计算目录大小（GB），用于磁盘水位判断。"""
+        total_size = 0
+        try:
+            for dirpath, dirnames, filenames in os.walk(directory):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.exists(filepath):
+                        try:
+                            total_size += os.path.getsize(filepath)
+                        except Exception:
+                            continue
+        except Exception:
+            return 0.0
+        return total_size / (1024 ** 3)
+
+    def _wait_for_disk_low(self, directory, sleep_sec=5):
+        """当目录大小超过高水位时阻塞，直到降到低水位以下。
+
+        该方法在下载循环中被调用以实现简单的回压，避免无限制拉取导致磁盘耗尽。
+        """
+        try:
+            high = float(os.getenv('DOWNLOAD_HIGH_WATERMARK_GB', str(self._download_high_watermark_gb)))
+            low = float(os.getenv('DOWNLOAD_LOW_WATERMARK_GB', str(self._download_low_watermark_gb)))
+        except Exception:
+            high = self._download_high_watermark_gb
+            low = self._download_low_watermark_gb
+
+        # 快速判断：如果目录不存在或大小小于高水位，立即返回
+        try:
+            current = self._get_dir_size_gb(directory)
+        except Exception:
+            return
+
+        while current >= high:
+            try:
+                logger.warning(f"Disk high watermark reached ({current:.2f}GB >= {high}GB). Pausing downloads...")
+            except Exception:
+                pass
+            time.sleep(sleep_sec)
+            try:
+                current = self._get_dir_size_gb(directory)
+            except Exception:
+                break
+            if current <= low:
+                try:
+                    logger.info(f"Disk usage dropped to {current:.2f}GB <= low watermark {low}GB, resuming")
+                except Exception:
+                    pass
+                break
     
     def logout(self):
         """保持接口兼容性的虚拟登出"""
@@ -342,11 +397,28 @@ class DICOMDownloadClient:
                     
                     print(f"📥 Downloading series {i+1}/{len(series_metadata)}: {series_num} - {series_desc}")
                     
+                    # 当磁盘空间达到高水位时，暂停下载以等待转换/清理
+                    try:
+                        # 使用 base output dir 作为磁盘检查目标（output_dir 参数）
+                        self._wait_for_disk_low(output_path)
+                    except Exception:
+                        pass
+
                     # 发送C-MOVE请求
                     move_ds = Dataset()
                     move_ds.QueryRetrieveLevel = 'SERIES'
                     move_ds.StudyInstanceUID = series['StudyInstanceUID']
                     move_ds.SeriesInstanceUID = series['SeriesInstanceUID']
+                    
+                    print(f"   Sending C-MOVE request for Series {series_num}...")
+                    
+                    # 报告下载进度
+                    if callable(self.download_progress_callback):
+                        try:
+                            progress_pct = 40 + int((i / len(series_metadata)) * 40)  # 40-80% 用于下载
+                            self.download_progress_callback(i + 1, len(series_metadata), series_desc, progress_pct)
+                        except Exception as cb_e:
+                            print(f"   Progress callback error: {cb_e}")
                     
                     responses = assoc.send_c_move(
                         move_ds,
@@ -354,18 +426,28 @@ class DICOMDownloadClient:
                         query_model=StudyRootQueryRetrieveInformationModelMove
                     )
                     
+                    # 跟踪C-MOVE响应状态
+                    move_status = None
                     for (status, identifier) in responses:
-                        if status and status.Status == 0x0000:
-                            pass
+                        if status:
+                            move_status = status.Status
+                            if status.Status == 0x0000:
+                                print(f"   Series {series_num} C-MOVE completed successfully")
+                            elif status.Status != 0xFF00:  # 0xFF00 是Pending状态
+                                print(f"   Series {series_num} C-MOVE status: 0x{status.Status:04X}")
+                    
+                    if move_status is None:
+                        print(f"   ⚠️  Series {series_num}: No C-MOVE response received (timeout or network issue)")
+                    
+                    time.sleep(0.5)  # 短暂延迟，让文件写入完成
                     
                     # 通知外部：该Series下载完成
+                    # 注意：回调必须在sleep之后调用，确保文件已完全写入磁盘
                     if callable(on_series_downloaded):
                         try:
                             on_series_downloaded(series_dir, series)
                         except Exception as e:
                             print(f"⚠️  Series callback failed: {e}")
-
-                    time.sleep(0.5)  # 短暂延迟
                 
             finally:
                 assoc.release()
@@ -416,6 +498,8 @@ class DICOMDownloadClient:
             'Rows',
             'Columns',
             'PixelSpacing',
+            'ImagerPixelSpacing',
+            'PatientOrientation',
             'SpacingBetweenSlices',
             'SliceThickness',
             'PhotometricInterpretation',
@@ -529,6 +613,8 @@ class DICOMDownloadClient:
     
     def _is_dicom_file(self, filepath):
         """判断是否为DICOM文件"""
+        if filepath.endswith("json") or filepath.endswith("csv") or filepath.endswith("txt"):
+            return False
         try:
             with open(filepath, 'rb') as f:
                 f.seek(128)
@@ -546,7 +632,7 @@ class DICOMDownloadClient:
         if not name:
             return "Unknown"
         
-        name = re.sub(r'[<>:"/\\|?*]', '_', str(name))
+        name = re.sub(r'[<>"/\\|?*]', '_', str(name))
         name = name.strip()
         
         if len(name) > 50:
@@ -855,7 +941,7 @@ class DICOMDownloadClient:
 
             print(f"\n🔬 MR_clean: processing {len(mr_df)} MR records...")
 
-            from MR_clean import process_mri_dataframe
+            from src.core.mr_clean import process_mri_dataframe
 
             # forward optional progress callback
             try:
@@ -929,7 +1015,14 @@ class DICOMDownloadClient:
         print(f"\n📥 Step 1: Download DICOM files")
 
         download_dir_holder = {'path': None}
-        series_queue = Queue()
+        # allow configuring pending-series limit to apply backpressure when conversion is slow
+        try:
+            max_pending = int(os.getenv('MAX_PENDING_SERIES', '4'))
+            if max_pending <= 0:
+                max_pending = 4
+        except Exception:
+            max_pending = 4
+        series_queue = Queue(maxsize=max_pending)
         series_info = {}
         series_lock = threading.Lock()
         download_done = threading.Event()
@@ -948,6 +1041,14 @@ class DICOMDownloadClient:
                 download_dir_holder['path'] = download_path
             finally:
                 download_done.set()
+
+        # organize worker: multiple workers supported to convert concurrently
+        try:
+            num_converters = int(os.getenv('NUM_CONVERTERS', '2'))
+            if num_converters <= 0:
+                num_converters = 2
+        except Exception:
+            num_converters = 2
 
         def _organize_worker(organized_dir_local, fmt):
             while True:
@@ -971,17 +1072,23 @@ class DICOMDownloadClient:
             os.makedirs(organized_dir, exist_ok=True)
 
             download_thread = threading.Thread(target=_download_worker, daemon=True)
-            organize_thread = threading.Thread(target=_organize_worker, args=(organized_dir, output_format), daemon=True)
+            # spawn multiple organizers
+            organizer_threads = []
+            for _ in range(num_converters):
+                t = threading.Thread(target=_organize_worker, args=(organized_dir, output_format), daemon=True)
+                t.start()
+                organizer_threads.append(t)
 
             download_thread.start()
-            organize_thread.start()
 
             # 等待下载完成
             download_thread.join()
-            # 通知整理线程退出
-            series_queue.put(None)
+            # 通知整理线程退出（放入与 worker 数相同的哨兵）
+            for _ in range(len(organizer_threads)):
+                series_queue.put(None)
             series_queue.join()
-            organize_thread.join()
+            for t in organizer_threads:
+                t.join()
 
             download_dir = download_dir_holder['path']
             if not download_dir:

@@ -1,14 +1,30 @@
 # -*- coding: utf-8 -*-
-"""Preview image helpers."""
+"""
+预览图生成模块
+
+提供 DICOM 和 NIfTI/NPZ 文件的预览图生成功能，
+支持窗宽窗位调整和纵横比校正。
+"""
 
 import os
 import re
+import json
 import numpy as np
 import nibabel as nib
 from PIL import Image
-import json
+from typing import Tuple, Optional, Callable
 
-def get_window_params(dcm):
+
+def get_window_params(dcm) -> Tuple[Optional[float], Optional[float]]:
+    """
+    获取窗宽窗位参数
+
+    Args:
+        dcm: pydicom Dataset 对象
+
+    Returns:
+        Tuple: (窗位 WindowCenter, 窗宽 WindowWidth)
+    """
     try:
         if dcm is None:
             return None, None
@@ -17,6 +33,7 @@ def get_window_params(dcm):
         if wc is None or ww is None:
             return None, None
 
+        # 处理多值情况
         if hasattr(wc, '__len__') and not isinstance(wc, str):
             wc = float(wc[0])
         else:
@@ -35,7 +52,17 @@ def get_window_params(dcm):
         return None, None
 
 
-def apply_windowing(image_2d, dcm):
+def apply_windowing(image_2d: np.ndarray, dcm) -> np.ndarray:
+    """
+    应用窗宽窗位变换
+
+    Args:
+        image_2d: 2D 图像数组
+        dcm: pydicom Dataset 对象（可选）
+
+    Returns:
+        np.ndarray: 8位灰度图像数组
+    """
     img = image_2d.astype(np.float32)
     wc, ww = get_window_params(dcm)
     if wc is not None and ww is not None:
@@ -51,6 +78,7 @@ def apply_windowing(image_2d, dcm):
     img = (img - low) / (high - low)
     img = (img * 255.0).astype(np.uint8)
 
+    # 处理 MONOCHROME1 反色
     try:
         if dcm is not None:
             photometric = str(getattr(dcm, 'PhotometricInterpretation', '')).upper()
@@ -62,7 +90,17 @@ def apply_windowing(image_2d, dcm):
     return img
 
 
-def resize_with_aspect(img, aspect_ratio):
+def resize_with_aspect(img: np.ndarray, aspect_ratio: Optional[float]) -> np.ndarray:
+    """
+    按纵横比调整图像大小
+
+    Args:
+        img: 输入图像数组
+        aspect_ratio: 目标纵横比
+
+    Returns:
+        np.ndarray: 调整后的图像
+    """
     try:
         if aspect_ratio is None or aspect_ratio <= 0:
             return img
@@ -77,7 +115,19 @@ def resize_with_aspect(img, aspect_ratio):
         return img
 
 
-def normalize_2d_preview(img, target_size=896):
+def normalize_2d_preview(img: np.ndarray, target_size: int = 896) -> np.ndarray:
+    """
+    标准化 2D 预览图尺寸
+
+    将图像缩放并居中放置到目标尺寸的画布上
+
+    Args:
+        img: 输入图像数组
+        target_size: 目标画布尺寸
+
+    Returns:
+        np.ndarray: 标准化后的图像
+    """
     try:
         if img is None:
             return img
@@ -94,6 +144,7 @@ def normalize_2d_preview(img, target_size=896):
         pil_img = pil_img.resize((new_w, new_h), resample=Image.BILINEAR)
         resized = np.array(pil_img)
 
+        # 创建画布并居中放置
         canvas = np.zeros((target_size, target_size), dtype=np.uint8)
         top = max(0, (target_size - new_h) // 2)
         left = max(0, (target_size - new_w) // 2)
@@ -103,11 +154,36 @@ def normalize_2d_preview(img, target_size=896):
         return img
 
 
-def generate_series_preview(series_dir, series_name, conversion_result, sample_dcm, modality, sanitize_folder_name):
+def generate_series_preview(
+    series_dir: str,
+    series_name: str,
+    conversion_result: dict,
+    sample_dcm,
+    modality: str,
+    sanitize_folder_name: Callable[[str], str]
+) -> Optional[str]:
+    """
+    生成序列预览图
+
+    从转换后的 NIfTI/NPZ 文件中提取中间切片，
+    应用窗宽窗位变换后生成 PNG 预览图。
+
+    Args:
+        series_dir: 序列目录路径
+        series_name: 序列名称
+        conversion_result: 转换结果字典
+        sample_dcm: 样本 DICOM 对象（用于获取窗宽窗位）
+        modality: 模态类型（MR/CT/DR等）
+        sanitize_folder_name: 文件夹名称清理函数
+
+    Returns:
+        Optional[str]: 预览图文件路径，失败时返回 None
+    """
     try:
         if not (conversion_result and conversion_result.get('success')):
             return None
 
+        # 获取输出文件列表
         output_files = []
         if conversion_result.get('conversion_mode') == 'individual':
             output_files = conversion_result.get('output_files', [])
@@ -122,6 +198,7 @@ def generate_series_preview(series_dir, series_name, conversion_result, sample_d
         if not output_files:
             return None
 
+        # 构建完整路径并过滤不存在文件
         output_files = [os.path.join(series_dir, f) for f in output_files]
         output_files = [f for f in output_files if os.path.exists(f)]
         if not output_files:
@@ -129,6 +206,7 @@ def generate_series_preview(series_dir, series_name, conversion_result, sample_d
 
         modality = (modality or '').upper()
 
+        # 根据模态选择预览策略
         if modality in ['DR', 'MG', 'DX'] or len(output_files) > 1:
             preview_idx = len(output_files) // 2
             preview_file = output_files[preview_idx]
@@ -138,6 +216,7 @@ def generate_series_preview(series_dir, series_name, conversion_result, sample_d
             preview_file = output_files[0]
             is_3d = True
 
+        # 加载图像数据
         if preview_file.endswith('.npz'):
             with np.load(preview_file) as npz:
                 if 'data' in npz.files:
@@ -149,7 +228,7 @@ def generate_series_preview(series_dir, series_name, conversion_result, sample_d
 
             if data.ndim == 3 and is_3d:
                 mid_y = data.shape[1] // 2
-                image_2d = data[:, mid_y, :]               
+                image_2d = data[:, mid_y, :]
                 image_2d = image_2d.astype(np.float32)
             else:
                 image_2d = data if data.ndim == 2 else data[0, :, :]
@@ -161,15 +240,16 @@ def generate_series_preview(series_dir, series_name, conversion_result, sample_d
 
             if data.ndim == 3 and is_3d:
                 mid_y = data.shape[1] // 2
-                slice_xz = data[:,mid_y, :]
+                slice_xz = data[:, mid_y, :]
                 image_2d = np.transpose(slice_xz, (1, 0))
-                image_2d = image_2d[::-1, :]
+                image_2d = image_2d[::-1, ::-1].astype(np.float32)
             else:
                 image_2d = data if data.ndim == 2 else data[:, :, 0]
+                image_2d=image_2d[::-1, :]
         else:
             return None
 
-        # 校正：2D 图像不能只依赖 sample_dcm，优先用每张图的元数据做 Rows/Columns 校验
+        # 尺寸校正：检查是否需要转置
         try:
             rows = None
             cols = None
@@ -177,14 +257,24 @@ def generate_series_preview(series_dir, series_name, conversion_result, sample_d
                 cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
                 if os.path.exists(cache_path):
                     try:
-                        
                         with open(cache_path, 'r', encoding='utf-8') as f:
                             cache = json.load(f)
                         records = cache.get('records') or []
+                        conversion_map = cache.get('conversion_map') or {}
                     except Exception:
                         records = []
+                        conversion_map = {}
 
-                    if records:
+                    if conversion_map:
+                        try:
+                            conv_entry = conversion_map.get(os.path.basename(preview_file))
+                            if isinstance(conv_entry, dict):
+                                rows = conv_entry.get('Rows')
+                                cols = conv_entry.get('Columns')
+                        except Exception:
+                            pass
+
+                    if records and (rows is None or cols is None):
                         basename = os.path.basename(preview_file)
                         match = re.search(r"_(\d{1,6})(?:\.nii(?:\.gz)?|\.npz)$", basename)
                         if match:
@@ -205,24 +295,29 @@ def generate_series_preview(series_dir, series_name, conversion_result, sample_d
                 rows = getattr(sample_dcm, 'Rows', None)
                 cols = getattr(sample_dcm, 'Columns', None)
 
+            # 如果尺寸颠倒，进行转置校正
             if rows and cols:
                 h, w = image_2d.shape[:2]
-                # 如果当前图像尺寸与 DICOM 的 Rows/Columns 正好颠倒，则转置修正
                 if h == int(cols) and w == int(rows):
                     image_2d = image_2d.T
                     image_2d = image_2d[::-1, :]
         except Exception:
             pass
 
+        # 应用窗宽窗位
         image_2d = apply_windowing(image_2d, sample_dcm)
 
+        # 计算纵横比
         aspect_ratio = None
         try:
             if sample_dcm is not None:
                 pixel_spacing = getattr(sample_dcm, 'PixelSpacing', None)
                 spacing_between = getattr(sample_dcm, 'SpacingBetweenSlices', None)
                 slice_thickness = getattr(sample_dcm, 'SliceThickness', None)
-                slice_spacing = float(slice_thickness + spacing_between  or 1.0)
+                if modality == 'MR':
+                    slice_spacing = max(spacing_between,slice_thickness)
+                else:
+                    slice_spacing = float(slice_thickness + spacing_between or 1.0)
                 if pixel_spacing and len(pixel_spacing) >= 2:
                     pixel_spacing = [float(pixel_spacing[0]), float(pixel_spacing[1])]
                     if is_3d:
@@ -232,11 +327,14 @@ def generate_series_preview(series_dir, series_name, conversion_result, sample_d
         except Exception:
             aspect_ratio = None
 
+        # 应用纵横比调整
         image_2d = resize_with_aspect(image_2d, aspect_ratio)
 
+        # 2D 图像标准化尺寸
         if not is_3d:
             image_2d = normalize_2d_preview(image_2d, target_size=896)
 
+        # 保存预览图
         preview_name = f"{sanitize_folder_name(series_name)}_preview.png"
         preview_path = os.path.join(series_dir, preview_name)
 

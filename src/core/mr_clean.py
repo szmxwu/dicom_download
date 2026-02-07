@@ -1,3 +1,16 @@
+# -*- coding: utf-8 -*-
+"""
+MRI 数据清洗与智能分类模块
+
+提供 MRI 序列的数据清洗、特征提取、序列分类和动态增强分析功能。
+
+主要功能：
+- 原子特征提取（方位、维度、脂肪抑制等）
+- 硬件特征标准化（场强、厂商、型号）
+- 序列智能分类（T1/T2/FLAIR/DWI 等）
+- 动态增强时相分析
+"""
+
 import pandas as pd
 import numpy as np
 import ast
@@ -9,11 +22,25 @@ from time import time
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 
 
-DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'mr_clean_config.json')
+# 默认配置文件路径（相对于项目根目录）
+DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+    'mr_clean_config.json'
+)
 
 
 def load_mr_clean_config(config_path: str | None = None) -> dict:
-    """加载 MR_clean 规则配置（关键词、阈值、正则等）。"""
+    """
+    加载 MR_clean 规则配置
+
+    从 JSON 文件加载规则配置，包括关键词、阈值、正则表达式等。
+
+    Args:
+        config_path: 配置文件路径，默认使用 mr_clean_config.json
+
+    Returns:
+        dict: 配置字典
+    """
     path = config_path or DEFAULT_CONFIG_PATH
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)

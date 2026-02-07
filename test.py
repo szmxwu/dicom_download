@@ -1,17 +1,26 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
-"""Upload workflow test runner.
+"""
+上传工作流测试运行器
 
-Iterates all ZIP files in uploads/ and runs both NIfTI and NPZ workflows.
-Result ZIPs are written to download/ for manual verification.
+遍历 uploads/ 目录中的所有 ZIP 文件，运行 NIfTI 和 NPZ 两种格式的工作流测试。
+结果 ZIP 文件将被写入 download/ 目录以供人工验证。
+
+此文件保留在根目录作为兼容性入口点，实际导入来自 src/ 目录。
 """
 
 import os
+import sys
 import time
 from typing import List, Tuple
 
-from dicom_client_unified import DICOMDownloadClient
-from result_packaging import create_result_zip
+# 添加项目根目录到路径以支持 src/ 导入
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.client.unified import DICOMDownloadClient
+from src.utils.packaging import create_result_zip
 
 
 def list_upload_zips(uploads_dir: str) -> List[str]:

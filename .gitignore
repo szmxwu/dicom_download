@@ -190,3 +190,5 @@ output/*
 .env
 *.zip
 plan.md
+AGENTS.md
+*.dcm

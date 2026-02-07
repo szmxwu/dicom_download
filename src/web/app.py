@@ -1,27 +1,30 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 """
-DICOM处理Web应用
-简化版本 - 仅包含文件处理功能，无需用户认证
+Flask Web 应用主模块
 
-修改说明：
-- 每个需要下载的任务都会自动创建新的DICOM客户端实例
-- 任务开始前会调用DICOM客户端的兼容性登录接口（当前实现不做真实认证）
-- 任务完成后自动登出，确保会话安全
-- 上传文件处理不需要登录，仅处理本地文件
-- 全局客户端仅用于系统状态检查
+提供 DICOM 处理 Web 服务和 REST API 接口，支持：
+- PACS 配置管理
+- 单条/批量任务处理
+- 文件上传处理
+- WebSocket 实时通信
 """
 
-from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
-from flask_socketio import SocketIO, emit
 import os
-import json
+import sys
+
+# 将项目根目录添加到 Python 路径（确保能找到 src 模块）
+# 从 src/web/app.py 向上两级到达项目根目录
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from flask import Flask, render_template, request, jsonify, send_file
+from flask_socketio import SocketIO, emit
 import time
 import uuid
 import threading
-from pathlib import Path
 import shutil
-import sys
 import logging
 from logging.handlers import RotatingFileHandler
 from werkzeug.utils import secure_filename
@@ -30,8 +33,8 @@ from dotenv import set_key
 import secrets
 
 # 导入我们的DICOM处理客户端
-from dicom_client_unified import DICOMDownloadClient
-from result_packaging import create_result_zip
+from src.client.unified import DICOMDownloadClient
+from src.utils.packaging import create_result_zip
 
 def get_base_path():
     """获取程序运行时的根目录路径，兼容 PyInstaller 打包"""
@@ -39,18 +42,25 @@ def get_base_path():
         return sys._MEIPASS
     return os.path.abspath(".")
 
-# Flask应用配置 - 指定静态文件和模板路径
+def get_project_root():
+    """获取项目根目录路径（从 src/web/ 向上两级）"""
+    current_file = os.path.abspath(__file__)
+    # src/web/app.py -> 向上两级到达项目根目录
+    return os.path.dirname(os.path.dirname(os.path.dirname(current_file)))
+
+# Flask应用配置 - 指定静态文件和模板路径（从项目根目录查找）
+project_root = get_project_root()
 app = Flask(__name__,
-            static_folder=os.path.join(get_base_path(), 'static'),
-            template_folder=os.path.join(get_base_path(), 'templates'))
+            static_folder=os.path.join(project_root, 'static'),
+            template_folder=os.path.join(project_root, 'templates'))
 
 _secret_key = os.environ.get('FLASK_SECRET_KEY')
 if not _secret_key:
     # 仅用于本地/临时运行；生产环境请通过环境变量提供固定值
     _secret_key = secrets.token_hex(32)
 app.config['SECRET_KEY'] = _secret_key
-app.config['UPLOAD_FOLDER'] = './uploads'
-app.config['RESULT_FOLDER'] = './results'
+app.config['UPLOAD_FOLDER'] = os.path.abspath('./uploads')
+app.config['RESULT_FOLDER'] = os.path.abspath('./results')
 app.config['MAX_CONTENT_LENGTH'] = 1500 * 1024 * 1024  # 1500MB最大文件大小
 
 # 创建必要的目录
@@ -97,7 +107,7 @@ processing_tasks = {}
 # 创建DICOM客户端实例用于系统状态检查（不登录）
 dicom_client_checker = DICOMDownloadClient()
 
-ENV_FILE_PATH = os.path.join(os.path.dirname(__file__), '.env')
+ENV_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
 
 
 def _parse_port(value, field_name: str) -> int:
@@ -138,9 +148,26 @@ def _normalize_host(value) -> str:
         raise ValueError("PACS_IP is too long")
     return host
 
-# 自动清理配置
-CLEANUP_THRESHOLD_GB = 50  # 50GB阈值
-CLEANUP_TARGET_GB = 40     # 清理到40GB以下
+# 自动清理配置（从 .env 读取，若不存在则写回 .env）
+try:
+    CLEANUP_THRESHOLD_GB = float(os.getenv('CLEANUP_THRESHOLD_GB', '50'))
+except Exception:
+    CLEANUP_THRESHOLD_GB = 50.0
+
+try:
+    CLEANUP_TARGET_GB = float(os.getenv('CLEANUP_TARGET_GB', '40'))
+except Exception:
+    CLEANUP_TARGET_GB = 40.0
+
+# 将读取到的默认值持久化到 .env，便于用户修改与持久化配置
+try:
+    # 写入整数值时保留整型格式，浮点数保留原样
+    thr_val = str(int(CLEANUP_THRESHOLD_GB) if float(CLEANUP_THRESHOLD_GB).is_integer() else CLEANUP_THRESHOLD_GB)
+    tgt_val = str(int(CLEANUP_TARGET_GB) if float(CLEANUP_TARGET_GB).is_integer() else CLEANUP_TARGET_GB)
+    set_key(ENV_FILE_PATH, 'CLEANUP_THRESHOLD_GB', thr_val)
+    set_key(ENV_FILE_PATH, 'CLEANUP_TARGET_GB', tgt_val)
+except Exception as e:
+    logger.warning(f"无法将清理阈值写入 {ENV_FILE_PATH}: {e}")
 
 def get_directory_size(directory):
     """计算目录总大小（GB）"""
@@ -533,27 +560,79 @@ def download_result(task_id, file_type):
     """下载处理结果"""
     task = processing_tasks.get(task_id)
     if not task or not task.result:
+        logger.warning(f"下载请求失败: 任务不存在或无结果 - task_id={task_id}")
         return jsonify({'error': 'Result file not found'}), 404
     
     try:
         if file_type == 'excel' and 'excel_file' in task.result:
+            file_path = task.result['excel_file']
+            logger.info(f"下载Excel文件: {file_path}")
+            if not file_path or not os.path.exists(file_path):
+                logger.error(f"Excel文件不存在: {file_path}")
+                return jsonify({'error': f'File not found: {file_path}'}), 404
+            
+            # Windows下使用pathlib处理路径
+            from pathlib import Path
+            file_path = str(Path(file_path).resolve())
+            
             return send_file(
-                task.result['excel_file'],
+                file_path,
                 as_attachment=True,
-                download_name=f"metadata_{task_id}.xlsx"
+                download_name=f"metadata_{task_id}.xlsx",
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
         elif (file_type == 'zip' or file_type == 'result_zip') and (task.result.get('zip_file') or task.result.get('result_zip')):
             path = task.result.get('result_zip') or task.result.get('zip_file')
-            return send_file(
-                path,
+            logger.info(f"下载ZIP文件: path={path}, exists={os.path.exists(path) if path else False}")
+            
+            if not path:
+                logger.error("ZIP路径为空")
+                return jsonify({'error': 'ZIP path is empty'}), 404
+            
+            # Windows下使用pathlib处理路径
+            from pathlib import Path
+            abs_path = str(Path(path).resolve())
+            logger.info(f"绝对路径: {abs_path}, exists={os.path.exists(abs_path)}")
+            
+            if not os.path.exists(abs_path):
+                logger.error(f"ZIP文件不存在: {abs_path}")
+                # 尝试列出results目录内容帮助调试
+                try:
+                    result_dir = app.config['RESULT_FOLDER']
+                    files = os.listdir(result_dir)
+                    logger.info(f"Results目录内容: {files}")
+                except Exception as list_e:
+                    logger.error(f"无法列出results目录: {list_e}")
+                return jsonify({'error': f'ZIP file not found: {abs_path}'}), 404
+            
+            # 检查文件大小
+            try:
+                file_size = os.path.getsize(abs_path)
+                logger.info(f"ZIP文件大小: {file_size} bytes")
+                if file_size == 0:
+                    logger.error("ZIP文件大小为0")
+                    return jsonify({'error': 'ZIP file is empty'}), 500
+            except Exception as size_e:
+                logger.error(f"无法获取文件大小: {size_e}")
+            
+            logger.info(f"开始发送文件: {abs_path}")
+            response = send_file(
+                abs_path,
                 as_attachment=True,
-                download_name=f"organized_{task_id}.zip"
+                download_name=f"organized_{task_id}.zip",
+                mimetype='application/zip'
             )
+            logger.info(f"文件发送成功: {abs_path}")
+            return response
         else:
+            logger.warning(f"不支持的文件类型: {file_type}, result keys={list(task.result.keys())}")
             return jsonify({'error': 'File type not supported'}), 400
             
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"下载文件时出错: {type(e).__name__}: {e}", exc_info=True)
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return jsonify({'error': f'{type(e).__name__}: {str(e)}'}), 500
 
 @app.route('/api/system/status')
 def system_status():
@@ -718,6 +797,18 @@ def process_single_task(task):
 
         task_client.progress_callback = _mr_progress
         
+        # Attach download progress callback to update task status during C-MOVE
+        def _download_progress(current_series, total_series, series_name, progress_pct):
+            try:
+                step_name = f"Downloading series {current_series}/{total_series}: {series_name}"
+                task.update_status('running', progress_pct, step_name)
+                if current_series % 3 == 0 or current_series == total_series:  # 每3个series记录一次日志，避免日志过多
+                    task.add_log(f"Downloaded {current_series}/{total_series} series: {series_name}")
+            except Exception as e:
+                logger.warning(f"Download progress callback error: {e}")
+        
+        task_client.download_progress_callback = _download_progress
+        
         # 获取参数
         accession_number = task.parameters['accession_number']
         options = task.parameters.get('options', {})
@@ -771,14 +862,21 @@ def process_single_task(task):
                 # 创建结果ZIP文件
                 if results.get('organized_dir'):
                     task.add_log('Creating result ZIP...')
-                    zip_path = create_result_zip(
-                        results['organized_dir'],
-                        task.task_id,
-                        app.config['RESULT_FOLDER'],
-                        extra_files=[results.get('excel_file')]
-                    )
-                    results['result_zip'] = zip_path
-                    task.add_log('Result ZIP created')
+                    logger.info(f"Creating ZIP: source={results['organized_dir']}, task_id={task.task_id}, result_dir={app.config['RESULT_FOLDER']}")
+                    try:
+                        zip_path = create_result_zip(
+                            results['organized_dir'],
+                            task.task_id,
+                            app.config['RESULT_FOLDER'],
+                            extra_files=[results.get('excel_file')]
+                        )
+                        results['result_zip'] = zip_path
+                        task.add_log(f'Result ZIP created: {zip_path}')
+                        logger.info(f"ZIP created successfully: {zip_path}, exists={os.path.exists(zip_path)}")
+                    except Exception as zip_e:
+                        logger.error(f"Failed to create ZIP: {zip_e}", exc_info=True)
+                        task.add_log(f'Failed to create ZIP: {str(zip_e)}', 'error')
+                        raise
                 
                 task.result = results
                 task.update_status('completed', 100, 'Completed')
