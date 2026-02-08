@@ -70,7 +70,7 @@ def main():
         print(f"No zip files found in: {uploads_dir}")
         return 1
 
-    formats = ['nifti', 'npz']
+    formats = ['nifti']
     failures = []
 
     for zip_path in zip_files:

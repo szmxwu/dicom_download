@@ -683,7 +683,7 @@ class DICOMDownloadClient:
             if not dicom_files:
                 return
 
-            read_all = modality in ['DR', 'MG', 'DX']
+            read_all = modality in ['DR', 'MG', 'DX', 'CR']
             records = self._collect_metadata_from_dicoms(
                 dicom_files=dicom_files,
                 series_folder=series_name,

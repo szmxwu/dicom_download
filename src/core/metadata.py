@@ -93,7 +93,7 @@ def extract_dicom_metadata(
                     cached_modality = str(cache.get('modality', '')).upper()
                     sample_tags = cache.get('sample_tags') or {}
                     current_keywords = get_keywords(cached_modality) if cached_modality else []
-                    read_all = cached_modality in ['DR', 'MG', 'DX']
+                    read_all = cached_modality in ['DR', 'MG', 'DX', 'CR']
 
                     if cached_records:
                         for record in cached_records:
@@ -139,7 +139,7 @@ def extract_dicom_metadata(
             sample_file = dicom_files[0]
             dcm = pydicom.dcmread(sample_file, force=True)
             modality = getattr(dcm, 'Modality', '')
-            need_read_all = modality in ['DR', 'MG', 'DX']
+            need_read_all = modality in ['DR', 'MG', 'DX', 'CR']
 
             current_keywords = get_keywords(modality)
 

@@ -623,7 +623,7 @@ def convert_with_dcm2niix(
 
         output_name = client._sanitize_folder_name(series_name)
 
-        if modality in ['DR', 'MG', 'DX']:
+        if modality in ['DR', 'MG', 'DX', 'CR']:
             logger.info("Detected %s modality, converting each DICOM to NIfTI", modality)
 
             success_count = 0
@@ -823,7 +823,7 @@ def convert_with_python_libs(
         first_dcm = pydicom.dcmread(dicom_files[0], force=True)
         modality = getattr(first_dcm, 'Modality', '')
 
-        if modality in ['DR', 'MG', 'DX']:
+        if modality in ['DR', 'MG', 'DX', 'CR']:
             logger.info("Detected %s modality; converting each DICOM file to NIfTI", modality)
 
             success_count = 0
