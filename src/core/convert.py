@@ -25,6 +25,7 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -38,6 +39,9 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger('DICOMApp')
+
+# 全局锁用于保护 dcm2niix 调用，避免 Windows 下多进程/多线程并发问题
+dcm2niix_global_lock = threading.Lock()
 
 
 def _build_conversion_entry(output_file: str, dcm: FileDataset, file_index: Optional[int] = None, source_file: Optional[str] = None) -> Dict[str, str]:
@@ -647,9 +651,19 @@ def convert_with_dcm2niix(
                         temp_dir
                     ]
 
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                    # 使用全局锁保护 dcm2niix 调用，避免 Windows 下并发问题
+                    # 添加重试机制应对 Windows 文件句柄未释放问题
+                    result = None
+                    for attempt in range(3):
+                        with dcm2niix_global_lock:
+                            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                        if result.returncode == 0:
+                            break
+                        if attempt < 2:
+                            logger.warning("dcm2niix failed for %s (attempt %d/3), retrying in 0.5s...", file_output_name, attempt + 1)
+                            time.sleep(0.5)
 
-                    if result.returncode == 0:
+                    if result and result.returncode == 0:
                         nifti_file = f"{file_output_name}.nii.gz"
                         if os.path.exists(os.path.join(series_dir, nifti_file)):
                             output_files.append(nifti_file)
@@ -665,6 +679,18 @@ def convert_with_dcm2niix(
                                 conversion_entries.append(entry)
                             except Exception:
                                 pass
+                        else:
+                            # dcm2niix returncode 为 0 但没有生成文件，记录详细诊断信息
+                            logger.warning("dcm2niix returned 0 but no output file for %s, stdout=%s, stderr=%s", 
+                                          file_output_name, 
+                                          result.stdout[:300] if result.stdout else 'empty',
+                                          result.stderr[:300] if result.stderr else 'empty')
+                    else:
+                        if result:
+                            logger.warning("dcm2niix failed for %s after 3 attempts: stdout=%s, stderr=%s", 
+                                          file_output_name, 
+                                          result.stdout[:300] if result.stdout else 'empty',
+                                          result.stderr[:300] if result.stderr else 'empty')
 
                     if (idx + 1) % 10 == 0:
                         logger.info("Converted %d/%d files...", idx + 1, len(dicom_files))
@@ -709,9 +735,19 @@ def convert_with_dcm2niix(
             series_dir
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        # 使用全局锁保护 dcm2niix 调用，避免 Windows 下并发问题
+        # 添加重试机制应对 Windows 文件句柄未释放问题
+        result = None
+        for attempt in range(3):
+            with dcm2niix_global_lock:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode == 0:
+                break
+            if attempt < 2:
+                logger.warning("dcm2niix failed for %s (attempt %d/3), retrying in 0.5s...", output_name, attempt + 1)
+                time.sleep(0.5)
 
-        if result.returncode == 0:
+        if result and result.returncode == 0:
             nifti_files = [f for f in os.listdir(series_dir) if f.endswith(('.nii.gz', '.nii'))]
             if nifti_files:
                 logger.info("   ✅ dcm2niix conversion succeeded: %s", nifti_files[0])
@@ -732,8 +768,16 @@ def convert_with_dcm2niix(
                     'conversion_mode': 'series',
                     'output_file': nifti_files[0]
                 }
+            else:
+                # dcm2niix returncode 为 0 但没有生成文件，记录详细诊断信息
+                logger.warning("dcm2niix returned 0 but no output files for series %s, stdout=%s, stderr=%s", 
+                              output_name, 
+                              result.stdout[:300] if result.stdout else 'empty',
+                              result.stderr[:300] if result.stderr else 'empty')
 
-        return {'success': False, 'error': result.stderr}
+        if result and result.stderr:
+            logger.warning("dcm2niix failed for series %s: stderr=%s", output_name, result.stderr[:300])
+        return {'success': False, 'error': result.stderr if result else 'dcm2niix failed'}
 
     except Exception as e:
         logger.error("dcm2niix conversion failed: %s", e)

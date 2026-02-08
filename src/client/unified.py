@@ -553,7 +553,7 @@ class DICOMDownloadClient:
         sample_tags = None
         try:
             if dicom_files:
-                sample_dcm = pydicom.dcmread(dicom_files[0], force=True)
+                sample_dcm = pydicom.dcmread(dicom_files[0], force=True, stop_before_pixels=True)
                 sample_tags = self._build_sample_tags(sample_dcm)
                 if not sample_tags.get('Modality'):
                     sample_tags['Modality'] = modality
@@ -628,15 +628,32 @@ class DICOMDownloadClient:
             return False
     
     def _sanitize_folder_name(self, name):
-        """清理文件夹名称"""
+        """清理文件夹名称，移除或替换Windows和dcm2niix不兼容的字符"""
         if not name:
             return "Unknown"
         
-        name = re.sub(r'[<>"/\\|?*]', '_', str(name))
-        name = name.strip()
+        name = str(name)
         
+        # 1. 替换Windows非法字符
+        name = re.sub(r'[<>"/\\|?*]', '_', name)
+        
+        # 2. 替换可能导致dcm2niix问题的字符组合
+        # 点+空格（如 "303. X Elbow" -> "303_X Elbow"）
+        name = re.sub(r'\.\s+', '_', name)
+        # 多个连续空格转为单个下划线
+        name = re.sub(r'\s+', '_', name)
+        # 多个连续点转为单个
+        name = re.sub(r'\.+', '.', name)
+        
+        # 3. 移除首尾的特殊字符
+        name = name.strip('. _')
+        
+        # 4. 长度限制
         if len(name) > 50:
             name = name[:50]
+        
+        # 5. 确保不以点开头或结尾（Windows问题）
+        name = name.strip('.')
         
         return name if name else "Unknown"
     
@@ -715,7 +732,7 @@ class DICOMDownloadClient:
             if read_all:
                 for idx, dicom_file in enumerate(dicom_files):
                     try:
-                        dcm = pydicom.dcmread(dicom_file, force=True)
+                        dcm = pydicom.dcmread(dicom_file, force=True, stop_before_pixels=True)
                         metadata = {
                             'SeriesFolder': series_folder,
                             'FileName': os.path.basename(dicom_file),
