@@ -54,6 +54,60 @@ MRI 治理的规则（关键词/阈值/正则等）已抽离到 `mr_clean_config
    - `classification.sequence_family`：GRE/SE/TSE 家族判断规则
    - `dynamic.*`：动态增强分组与增强判定规则
 
+### 质量控制 (QC) 阈值配置
+质控系统支持基于模态（Modality）的可配置阈值，通过 `.env` 文件自定义各模态的质控标准。
+
+**默认配置示例**（`.env` 文件）：
+```ini
+# 动态范围最小阈值
+QC_DEFAULT_DYNAMIC_RANGE_MIN=20
+QC_CT_DYNAMIC_RANGE_MIN=20
+QC_MR_DYNAMIC_RANGE_MIN=15
+QC_DX_DYNAMIC_RANGE_MIN=10
+QC_DR_DYNAMIC_RANGE_MIN=10
+QC_MG_DYNAMIC_RANGE_MIN=10
+QC_CR_DYNAMIC_RANGE_MIN=10
+
+# 标准差最小阈值（对比度）
+QC_DEFAULT_STD_MIN=5
+QC_CT_STD_MIN=5
+QC_MR_STD_MIN=5
+QC_DX_STD_MIN=3
+QC_DR_STD_MIN=3
+QC_MG_STD_MIN=3
+QC_CR_STD_MIN=3
+
+# 唯一值比例最小阈值（复杂度）
+# X-ray图像（DX/DR/MG/CR）通常比CT/MR具有更低的唯一值比例
+QC_DEFAULT_UNIQUE_RATIO_MIN=0.01
+QC_CT_UNIQUE_RATIO_MIN=0.01
+QC_MR_UNIQUE_RATIO_MIN=0.008
+QC_DX_UNIQUE_RATIO_MIN=0.001
+QC_DR_UNIQUE_RATIO_MIN=0.001
+QC_MG_UNIQUE_RATIO_MIN=0.001
+QC_CR_UNIQUE_RATIO_MIN=0.001
+
+# 曝光检测阈值
+QC_DEFAULT_LOW_RATIO_THRESHOLD=0.6
+QC_DEFAULT_HIGH_RATIO_THRESHOLD=0.6
+
+# 系列低质量阈值（超过此比例的图像为低质量则标记整个系列为低质量）
+QC_DEFAULT_SERIES_LOW_QUALITY_RATIO=0.3
+```
+
+**不同模态的默认阈值**：
+
+| 模态 | unique_ratio_min | std_min | dynamic_range_min |
+|-----|-----------------|---------|-------------------|
+| CT  | 0.01 (严格)      | 5       | 20                |
+| MR  | 0.008 (适中)     | 5       | 15                |
+| DX  | 0.001 (宽松)     | 3       | 10                |
+| DR  | 0.001 (宽松)     | 3       | 10                |
+| MG  | 0.001 (宽松)     | 3       | 10                |
+| CR  | 0.001 (宽松)     | 3       | 10                |
+
+说明：X-ray 类图像（DX/DR/MG/CR）通常具有更简单的图像内容，因此使用更宽松的复杂度阈值。
+
 ## 使用方法
 
 1. 启动 Web 应用：
@@ -153,7 +207,23 @@ arr_zxy = np.transpose(arr, (0, 2, 1))  # 现在 shape == (Z, X, Y)
    - NPZ 生成会先用 dcm2niix（若可用）或 Python 库生成 NIfTI 中间文件以获取可靠的方向信息。
    - `.npz` 使用 `np.savez_compressed` 压缩并以 float32 存储，以平衡精度与文件大小。
 
-近期改进（2026-01-17）：
+近期改进（2026-02-08）：
+
+- **基于模态的可配置质控阈值**：
+   - 质控系统现在支持按模态（CT/MR/DX/DR/MG/CR）设置不同的阈值。
+   - 阈值可通过 `.env` 文件自定义，无需修改代码。
+   - X-ray 类图像（DX/DR/MG/CR）使用更宽松的复杂度阈值（unique_ratio_min=0.001），而 CT/MR 使用更严格的标准（CT: 0.01, MR: 0.008）。
+
+- **质控原因说明**：
+   - `metadata.xlsx` 新增 `Low_quality_reason` 列，以英文描述低质量原因。
+   - 支持的原因包括：`Low dynamic range`、`Low contrast`、`Low complexity`、`Under-exposed`、`Over-exposed`、`Potential inverted border` 等。
+   - 正常质量图像显示为 `Normal`。
+
+- **文件名格式改进**：
+   - `metadata.xlsx` 中的 `FileName` 列现在格式为 `AccessionNumber/filename`（例如：`M22042704067/SHWMS13A_0001.nii.gz`）。
+   - 这便于将低质量标签与最终输出图像匹配。
+
+早期改进（2026-01-17）：
 
 - 转换过程中的质量检测：
    - 在 NPZ 转换流程中新增了轻量级图像 QC（`_assess_image_quality`），用于检测低动态范围、低对比度、灰度反转（MONOCHROME1）和曝光异常（过暗/过亮），并对异常图像标记。

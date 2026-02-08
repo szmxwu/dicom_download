@@ -56,6 +56,60 @@ MRI normalization rules (keywords/thresholds/regex) are externalized in `mr_clea
    - `classification.sequence_family`: GRE/SE/TSE family heuristics
    - `dynamic.*`: dynamic grouping / contrast heuristics
 
+### Quality Control (QC) Threshold Configuration
+The QC system supports modality-specific configurable thresholds via the `.env` file.
+
+**Example Configuration** (in `.env` file):
+```ini
+# Dynamic range minimum threshold
+QC_DEFAULT_DYNAMIC_RANGE_MIN=20
+QC_CT_DYNAMIC_RANGE_MIN=20
+QC_MR_DYNAMIC_RANGE_MIN=15
+QC_DX_DYNAMIC_RANGE_MIN=10
+QC_DR_DYNAMIC_RANGE_MIN=10
+QC_MG_DYNAMIC_RANGE_MIN=10
+QC_CR_DYNAMIC_RANGE_MIN=10
+
+# Standard deviation minimum threshold (contrast)
+QC_DEFAULT_STD_MIN=5
+QC_CT_STD_MIN=5
+QC_MR_STD_MIN=5
+QC_DX_STD_MIN=3
+QC_DR_STD_MIN=3
+QC_MG_STD_MIN=3
+QC_CR_STD_MIN=3
+
+# Unique pixel value ratio minimum threshold (complexity)
+# X-ray images (DX/DR/MG/CR) typically have lower unique ratios than CT/MR
+QC_DEFAULT_UNIQUE_RATIO_MIN=0.01
+QC_CT_UNIQUE_RATIO_MIN=0.01
+QC_MR_UNIQUE_RATIO_MIN=0.008
+QC_DX_UNIQUE_RATIO_MIN=0.001
+QC_DR_UNIQUE_RATIO_MIN=0.001
+QC_MG_UNIQUE_RATIO_MIN=0.001
+QC_CR_UNIQUE_RATIO_MIN=0.001
+
+# Exposure detection thresholds
+QC_DEFAULT_LOW_RATIO_THRESHOLD=0.6
+QC_DEFAULT_HIGH_RATIO_THRESHOLD=0.6
+
+# Series low quality threshold (mark series as low quality if > this ratio of images are low quality)
+QC_DEFAULT_SERIES_LOW_QUALITY_RATIO=0.3
+```
+
+**Default Thresholds by Modality**:
+
+| Modality | unique_ratio_min | std_min | dynamic_range_min |
+|----------|------------------|---------|-------------------|
+| CT       | 0.01 (strict)    | 5       | 20                |
+| MR       | 0.008 (moderate) | 5       | 15                |
+| DX       | 0.001 (lenient)  | 3       | 10                |
+| DR       | 0.001 (lenient)  | 3       | 10                |
+| MG       | 0.001 (lenient)  | 3       | 10                |
+| CR       | 0.001 (lenient)  | 3       | 10                |
+
+Note: X-ray images (DX/DR/MG/CR) typically have simpler content, so they use more lenient complexity thresholds.
+
 ## Usage
 
 1. Start the web application:
@@ -158,7 +212,23 @@ Notes:
    - NPZ generation uses a temporary NIfTI intermediate (dcm2niix or Python libs) to obtain robust orientation information from DICOM tags.
    - The `.npz` files are compressed with `np.savez_compressed` and use float32 to balance precision and size.
 
-Recent improvements (2026-01-17):
+Recent improvements (2026-02-08):
+
+- **Modality-specific Configurable QC Thresholds**:
+   - The QC system now supports different thresholds per modality (CT/MR/DX/DR/MG/CR).
+   - Thresholds can be customized via the `.env` file without code changes.
+   - X-ray images (DX/DR/MG/CR) use more lenient complexity thresholds (unique_ratio_min=0.001), while CT/MR use stricter standards (CT: 0.01, MR: 0.008).
+
+- **QC Reason Descriptions**:
+   - The `metadata.xlsx` now includes a `Low_quality_reason` column with English descriptions of quality issues.
+   - Supported reasons include: `Low dynamic range`, `Low contrast`, `Low complexity`, `Under-exposed`, `Over-exposed`, `Potential inverted border`, etc.
+   - Normal quality images are marked as `Normal`.
+
+- **Filename Format Improvement**:
+   - The `FileName` column in `metadata.xlsx` now uses the format `AccessionNumber/filename` (e.g., `M22042704067/SHWMS13A_0001.nii.gz`).
+   - This facilitates matching low-quality labels with final output images.
+
+Earlier improvements (2026-01-17):
 
 - Quality control during conversion:
    - The tool now runs a lightweight QC (`_assess_image_quality`) on images during NPZ conversion. It detects low dynamic range, low contrast, grayscale inversion (MONOCHROME1-like), and exposure anomalies (under/over-exposed) and marks problematic images.

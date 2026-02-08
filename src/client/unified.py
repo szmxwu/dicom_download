@@ -903,13 +903,23 @@ class DICOMDownloadClient:
         """基于直方图/对比度的简单质检，返回0/1（输入为数组）"""
         return assess_image_quality_from_array_impl(pixel_data)
 
-    def _assess_converted_file_quality(self, filepath):
-        """基于转换后的NPZ/NIfTI文件做质检，返回0/1"""
-        return assess_converted_file_quality_impl(filepath)
+    def _assess_converted_file_quality(self, filepath, modality=None):
+        """基于转换后的NPZ/NIfTI文件做质检，返回0/1
+        
+        Args:
+            filepath: 文件路径
+            modality: 模态代码 (CT, MR, DX, etc.)，可选
+        """
+        return assess_converted_file_quality_impl(filepath, modality)
 
-    def _assess_series_quality_converted(self, converted_files):
-        """对转换后的序列做QC，<=200全量，>200中间±3抽样"""
-        return assess_series_quality_converted_impl(converted_files)
+    def _assess_series_quality_converted(self, converted_files, modality=None):
+        """对转换后的序列做QC，<=200全量，>200中间±3抽样
+        
+        Args:
+            converted_files: 转换后的文件路径列表
+            modality: 模态代码 (CT, MR, DX, etc.)，可选
+        """
+        return assess_series_quality_converted_impl(converted_files, modality)
 
     def _get_converted_files(self, series_path):
         """获取转换后的NPZ/NIfTI文件列表，优先NPZ"""

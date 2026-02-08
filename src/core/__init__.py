@@ -13,6 +13,9 @@ from src.core.qc import (
     ImageQualityResult,
     QualityReasons,
     REASON_DESCRIPTIONS,
+    QCConfig,
+    get_qc_config,
+    reset_qc_config,
 )
 from src.core.preview import generate_series_preview
 from src.core.mr_clean import process_mri_dataframe
@@ -26,6 +29,9 @@ __all__ = [
     "ImageQualityResult",
     "QualityReasons",
     "REASON_DESCRIPTIONS",
+    "QCConfig",
+    "get_qc_config",
+    "reset_qc_config",
     "generate_series_preview",
     "process_mri_dataframe",
 ]

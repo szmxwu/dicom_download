@@ -4,6 +4,8 @@
 
 提供 DICOM 和转换后图像（NIfTI/NPZ）的质量评估功能，
 包括过曝、欠曝、对比度检查等。
+
+支持基于模态（Modality）的可配置阈值，从环境变量读取配置。
 """
 
 import os
@@ -37,9 +39,9 @@ REASON_DESCRIPTIONS = {
     QualityReasons.NO_PIXEL_DATA: "No pixel data available",
     QualityReasons.EMPTY_DATA: "Empty pixel data",
     QualityReasons.DYNAMIC_RANGE_INVALID: "Invalid dynamic range",
-    QualityReasons.DYNAMIC_RANGE_LOW: "Low dynamic range (< 20)",
-    QualityReasons.CONTRAST_LOW: "Low contrast (std < 5)",
-    QualityReasons.COMPLEXITY_LOW: "Low complexity (unique ratio < 0.01)",
+    QualityReasons.DYNAMIC_RANGE_LOW: "Low dynamic range",
+    QualityReasons.CONTRAST_LOW: "Low contrast",
+    QualityReasons.COMPLEXITY_LOW: "Low complexity",
     QualityReasons.UNDER_EXPOSED: "Under-exposed",
     QualityReasons.OVER_EXPOSED: "Over-exposed",
     QualityReasons.INVERTED_BORDER: "Potential inverted border",
@@ -47,6 +49,159 @@ REASON_DESCRIPTIONS = {
     QualityReasons.FILE_NOT_FOUND: "File not found",
     QualityReasons.UNSUPPORTED_FORMAT: "Unsupported file format",
 }
+
+
+class QCConfig:
+    """
+    质量控制的阈值配置类
+    
+    从环境变量读取配置，支持按模态设置不同的阈值。
+    配置格式：QC_{MODALITY}_{THRESHOLD_NAME}
+    """
+    
+    # 默认阈值
+    DEFAULT_THRESHOLDS = {
+        'dynamic_range_min': 20.0,
+        'std_min': 5.0,
+        'unique_ratio_min': 0.01,
+        'low_ratio_threshold': 0.6,
+        'high_ratio_threshold': 0.6,
+        'percentile_low': 2.0,
+        'percentile_high': 98.0,
+        'series_low_quality_ratio': 0.3,
+    }
+    
+    # 各模态特定的默认值（在环境变量未设置时使用）
+    MODALITY_DEFAULTS = {
+        'DX': {
+            'dynamic_range_min': 10.0,
+            'std_min': 3.0,
+            'unique_ratio_min': 0.001,
+        },
+        'DR': {
+            'dynamic_range_min': 10.0,
+            'std_min': 3.0,
+            'unique_ratio_min': 0.001,
+        },
+        'MG': {
+            'dynamic_range_min': 10.0,
+            'std_min': 3.0,
+            'unique_ratio_min': 0.001,
+        },
+        'CR': {
+            'dynamic_range_min': 10.0,
+            'std_min': 3.0,
+            'unique_ratio_min': 0.001,
+        },
+        'CT': {
+            'dynamic_range_min': 20.0,
+            'std_min': 5.0,
+            'unique_ratio_min': 0.01,
+        },
+        'MR': {
+            'dynamic_range_min': 15.0,
+            'std_min': 5.0,
+            'unique_ratio_min': 0.008,
+        },
+    }
+    
+    def __init__(self):
+        """初始化配置，从环境变量读取"""
+        self._config = self._load_config()
+    
+    def _load_config(self) -> Dict[str, Dict[str, float]]:
+        """从环境变量加载配置"""
+        config = {'DEFAULT': self.DEFAULT_THRESHOLDS.copy()}
+        
+        # 为已知模态创建配置
+        for modality in ['CT', 'MR', 'DX', 'DR', 'MG', 'CR', 'US', 'PT', 'NM', 'XA', 'RF']:
+            config[modality] = {}
+        
+        # 从环境变量读取配置
+        for key, value in os.environ.items():
+            if key.startswith('QC_') and not key.startswith('QC_DEFAULT'):
+                # 解析格式：QC_{MODALITY}_{THRESHOLD}
+                parts = key.split('_')
+                if len(parts) >= 3:
+                    modality = parts[1]
+                    threshold_name = '_'.join(parts[2:]).lower()
+                    try:
+                        if modality not in config:
+                            config[modality] = {}
+                        config[modality][threshold_name] = float(value)
+                    except ValueError:
+                        pass  # 忽略无效数值
+            elif key.startswith('QC_DEFAULT_'):
+                # 解析格式：QC_DEFAULT_{THRESHOLD}
+                threshold_name = '_'.join(key.split('_')[2:]).lower()
+                try:
+                    config['DEFAULT'][threshold_name] = float(value)
+                except ValueError:
+                    pass
+        
+        return config
+    
+    def get_threshold(self, modality: str, threshold_name: str) -> float:
+        """
+        获取指定模态的阈值
+        
+        Args:
+            modality: 模态代码 (CT, MR, DX, etc.)
+            threshold_name: 阈值名称
+            
+        Returns:
+            float: 阈值数值
+        """
+        modality = modality.upper() if modality else 'DEFAULT'
+        
+        # 1. 从环境变量配置查找
+        if modality in self._config and threshold_name in self._config[modality]:
+            return self._config[modality][threshold_name]
+        
+        # 2. 从硬编码的模态默认值查找
+        if modality in self.MODALITY_DEFAULTS and threshold_name in self.MODALITY_DEFAULTS[modality]:
+            return self.MODALITY_DEFAULTS[modality][threshold_name]
+        
+        # 3. 使用全局默认值
+        return self._config['DEFAULT'].get(threshold_name, self.DEFAULT_THRESHOLDS.get(threshold_name, 0.0))
+    
+    def get_all_thresholds(self, modality: str) -> Dict[str, float]:
+        """
+        获取指定模态的所有阈值
+        
+        Args:
+            modality: 模态代码
+            
+        Returns:
+            Dict[str, float]: 所有阈值的字典
+        """
+        result = self.DEFAULT_THRESHOLDS.copy()
+        modality = modality.upper() if modality else 'DEFAULT'
+        
+        # 应用硬编码的模态默认值
+        if modality in self.MODALITY_DEFAULTS:
+            result.update(self.MODALITY_DEFAULTS[modality])
+        
+        # 应用环境变量配置
+        if modality in self._config:
+            result.update(self._config[modality])
+        
+        return result
+
+
+# 全局配置实例
+_qc_config = QCConfig()
+
+
+def get_qc_config() -> QCConfig:
+    """获取全局QC配置实例"""
+    return _qc_config
+
+
+def reset_qc_config():
+    """重置QC配置（主要用于测试）"""
+    global _qc_config
+    _qc_config = QCConfig()
 
 
 @dataclass
@@ -76,7 +231,7 @@ class ImageQualityResult:
     def get_reason_description(self) -> str:
         """Get human readable reason description"""
         if not self.reasons:
-            return ""
+            return "Normal"
         descriptions = [REASON_DESCRIPTIONS.get(r, r) for r in self.reasons]
         return "; ".join(descriptions)
 
@@ -121,12 +276,13 @@ def _apply_photometric(pixel_data: np.ndarray, dcm) -> np.ndarray:
     return pixel_data
 
 
-def assess_image_quality(dcm) -> ImageQualityResult:
+def assess_image_quality(dcm, modality: Optional[str] = None) -> ImageQualityResult:
     """
     评估 DICOM 图像质量
 
     Args:
         dcm: pydicom Dataset 对象
+        modality: 模态代码 (CT, MR, DX, etc.)，可选，自动从 dcm 读取
 
     Returns:
         ImageQualityResult: 质量评估结果
@@ -139,10 +295,14 @@ def assess_image_quality(dcm) -> ImageQualityResult:
                 metrics={}
             )
 
+        # 自动获取模态
+        if modality is None:
+            modality = getattr(dcm, 'Modality', '')
+
         pixel_data = dcm.pixel_array.astype(np.float32)
         pixel_data = _apply_rescale(pixel_data, dcm)
         pixel_data = _apply_photometric(pixel_data, dcm)
-        return assess_image_quality_from_array(pixel_data)
+        return assess_image_quality_from_array(pixel_data, modality)
     except Exception as e:
         return ImageQualityResult(
             is_low_quality=True,
@@ -151,7 +311,10 @@ def assess_image_quality(dcm) -> ImageQualityResult:
         )
 
 
-def assess_image_quality_from_array(pixel_data: np.ndarray) -> ImageQualityResult:
+def assess_image_quality_from_array(
+    pixel_data: np.ndarray,
+    modality: Optional[str] = None
+) -> ImageQualityResult:
     """
     从像素数组评估图像质量
 
@@ -164,12 +327,18 @@ def assess_image_quality_from_array(pixel_data: np.ndarray) -> ImageQualityResul
 
     Args:
         pixel_data: 像素数据数组
+        modality: 模态代码 (CT, MR, DX, etc.)，用于选择不同阈值
 
     Returns:
         ImageQualityResult: 质量评估结果
     """
     reasons = []
     metrics = {}
+    
+    # 获取当前模态的阈值
+    config = get_qc_config()
+    modality = modality.upper() if modality else 'DEFAULT'
+    thresholds = config.get_all_thresholds(modality)
     
     try:
         if pixel_data is None:
@@ -193,7 +362,11 @@ def assess_image_quality_from_array(pixel_data: np.ndarray) -> ImageQualityResul
         if flat.size > 200000:
             flat = flat[:: max(1, flat.size // 200000)]
 
-        p2, p98 = np.percentile(flat, [2, 98])
+        # 获取百分位阈值
+        p_low = thresholds.get('percentile_low', 2.0)
+        p_high = thresholds.get('percentile_high', 98.0)
+        
+        p2, p98 = np.percentile(flat, [p_low, p_high])
         dynamic_range = p98 - p2
         std = float(np.std(flat))
         unique_ratio = len(np.unique(flat)) / max(1, flat.size)
@@ -206,7 +379,8 @@ def assess_image_quality_from_array(pixel_data: np.ndarray) -> ImageQualityResul
             'unique_ratio': round(unique_ratio, 4),
             'mean_val': round(mean_val, 2),
             'p2': round(p2, 2),
-            'p98': round(p98, 2)
+            'p98': round(p98, 2),
+            'modality': modality,
         }
 
         if dynamic_range <= 0:
@@ -217,15 +391,22 @@ def assess_image_quality_from_array(pixel_data: np.ndarray) -> ImageQualityResul
                 metrics=metrics
             )
 
-        # 质量判定规则
-        if dynamic_range < 20:
+        # 质量判定规则（使用模态特定阈值）
+        dynamic_range_min = thresholds.get('dynamic_range_min', 20.0)
+        std_min = thresholds.get('std_min', 5.0)
+        unique_ratio_min = thresholds.get('unique_ratio_min', 0.01)
+        
+        if dynamic_range < dynamic_range_min:
             reasons.append(QualityReasons.DYNAMIC_RANGE_LOW)
+            metrics['dynamic_range_threshold'] = dynamic_range_min
 
-        if std < 5:
+        if std < std_min:
             reasons.append(QualityReasons.CONTRAST_LOW)
+            metrics['std_threshold'] = std_min
 
-        if unique_ratio < 0.01:
+        if unique_ratio < unique_ratio_min:
             reasons.append(QualityReasons.COMPLEXITY_LOW)
+            metrics['unique_ratio_threshold'] = unique_ratio_min
 
         # 检测过曝和欠曝
         low_thresh = p2 + 0.01 * range_eps
@@ -236,8 +417,11 @@ def assess_image_quality_from_array(pixel_data: np.ndarray) -> ImageQualityResul
         metrics['low_ratio'] = round(low_ratio, 4)
         metrics['high_ratio'] = round(high_ratio, 4)
 
-        under_exposed = mean_val < (p2 + 0.1 * range_eps) or low_ratio > 0.6
-        over_exposed = mean_val > (p98 - 0.1 * range_eps) or high_ratio > 0.6
+        low_ratio_threshold = thresholds.get('low_ratio_threshold', 0.6)
+        high_ratio_threshold = thresholds.get('high_ratio_threshold', 0.6)
+
+        under_exposed = mean_val < (p2 + 0.1 * range_eps) or low_ratio > low_ratio_threshold
+        over_exposed = mean_val > (p98 - 0.1 * range_eps) or high_ratio > high_ratio_threshold
 
         if under_exposed:
             reasons.append(QualityReasons.UNDER_EXPOSED)
@@ -280,16 +464,17 @@ def assess_image_quality_from_array(pixel_data: np.ndarray) -> ImageQualityResul
         return ImageQualityResult(
             is_low_quality=True,
             reasons=[QualityReasons.READ_ERROR],
-            metrics={'error': str(e)}
+            metrics={'error': str(e), 'modality': modality}
         )
 
 
-def assess_converted_file_quality(filepath: str) -> ImageQualityResult:
+def assess_converted_file_quality(filepath: str, modality: Optional[str] = None) -> ImageQualityResult:
     """
     评估转换后文件（NIfTI/NPZ）的质量
 
     Args:
         filepath: 文件路径
+        modality: 模态代码 (CT, MR, DX, etc.)，可选
 
     Returns:
         ImageQualityResult: 质量评估结果
@@ -324,7 +509,7 @@ def assess_converted_file_quality(filepath: str) -> ImageQualityResult:
                 metrics={'filepath': filepath, 'extension': os.path.splitext(filepath)[1]}
             )
 
-        return assess_image_quality_from_array(data)
+        return assess_image_quality_from_array(data, modality)
         
     except Exception as e:
         return ImageQualityResult(
@@ -363,12 +548,16 @@ def _summarize_reasons(results: List[ImageQualityResult], total_files: int) -> s
     return f"{ratio*100:.0f}% files with issues - " + ", ".join(reason_parts)
 
 
-def assess_series_quality_converted(converted_files: List[str]) -> Dict[str, Any]:
+def assess_series_quality_converted(
+    converted_files: List[str],
+    modality: Optional[str] = None
+) -> Dict[str, Any]:
     """
     评估转换后序列的质量
 
     Args:
         converted_files: 转换后的文件路径列表
+        modality: 模态代码 (CT, MR, DX, etc.)，可选
 
     Returns:
         Dict: 包含以下字段的字典：
@@ -403,7 +592,7 @@ def assess_series_quality_converted(converted_files: List[str]) -> Dict[str, Any
         file_results = []
         for idx in sample_indices:
             try:
-                result = assess_converted_file_quality(converted_files[idx])
+                result = assess_converted_file_quality(converted_files[idx], modality)
                 file_results.append({
                     'file_index': idx,
                     'file_name': os.path.basename(converted_files[idx]),
@@ -422,7 +611,11 @@ def assess_series_quality_converted(converted_files: List[str]) -> Dict[str, Any
 
         low_count = sum(1 for r in file_results if r['is_low_quality'])
         ratio = low_count / max(1, len(sample_indices))
-        is_low_quality = ratio > 0.3
+        
+        # 获取模态特定的系列阈值
+        config = get_qc_config()
+        series_threshold = config.get_threshold(modality or 'DEFAULT', 'series_low_quality_ratio')
+        is_low_quality = ratio > series_threshold
         
         # Generate reason summary
         if is_low_quality:
@@ -457,13 +650,18 @@ def assess_series_quality_converted(converted_files: List[str]) -> Dict[str, Any
         }
 
 
-def assess_series_quality(dicom_files: List[str], dcmread) -> Dict[str, Any]:
+def assess_series_quality(
+    dicom_files: List[str],
+    dcmread,
+    modality: Optional[str] = None
+) -> Dict[str, Any]:
     """
     评估 DICOM 序列的质量
 
     Args:
         dicom_files: DICOM 文件路径列表
         dcmread: pydicom.dcmread 函数
+        modality: 模态代码 (CT, MR, DX, etc.)，可选
 
     Returns:
         Dict: 质量评估结果字典
@@ -492,7 +690,11 @@ def assess_series_quality(dicom_files: List[str], dcmread) -> Dict[str, Any]:
         for idx in sample_indices:
             try:
                 dcm = dcmread(dicom_files[idx], force=True)
-                result = assess_image_quality(dcm)
+                # 如果未提供模态，尝试从DICOM读取
+                file_modality = modality
+                if file_modality is None:
+                    file_modality = getattr(dcm, 'Modality', None)
+                result = assess_image_quality(dcm, file_modality)
                 file_results.append({
                     'file_index': idx,
                     'file_name': os.path.basename(dicom_files[idx]),
@@ -511,7 +713,11 @@ def assess_series_quality(dicom_files: List[str], dcmread) -> Dict[str, Any]:
 
         low_count = sum(1 for r in file_results if r['is_low_quality'])
         ratio = low_count / max(1, len(sample_indices))
-        is_low_quality = ratio > 0.3
+        
+        # 获取模态特定的系列阈值
+        config = get_qc_config()
+        series_threshold = config.get_threshold(modality or 'DEFAULT', 'series_low_quality_ratio')
+        is_low_quality = ratio > series_threshold
         
         # Generate reason summary
         if is_low_quality:

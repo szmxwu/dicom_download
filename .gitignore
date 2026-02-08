@@ -192,3 +192,4 @@ output/*
 plan.md
 AGENTS.md
 *.dcm
+upload_tests

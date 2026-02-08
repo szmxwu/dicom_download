@@ -31,7 +31,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import pandas as pd
 import pydicom
 
-from src.core.qc import ImageQualityResult
+from src.core.qc import ImageQualityResult, assess_converted_file_quality as _default_assess_file_qc, assess_series_quality_converted as _default_assess_series_qc
 
 
 def _extract_quality_value(result: Union[ImageQualityResult, int]) -> Tuple[int, str]:
@@ -55,13 +55,30 @@ def _extract_quality_value(result: Union[ImageQualityResult, int]) -> Tuple[int,
         return val, "Normal" if val == 0 else ""
 
 
+def _build_converted_filename(accession_number: str, converted_file_path: str) -> str:
+    """
+    构建转换后的文件名，格式为: AccessionNumber/filename
+    
+    Args:
+        accession_number: AccessionNumber (访问号)
+        converted_file_path: 转换后文件的完整路径
+        
+    Returns:
+        str: 格式为 "AccessionNumber/filename" 的字符串
+    """
+    if not accession_number:
+        accession_number = "Unknown"
+    filename = os.path.basename(converted_file_path)
+    return f"{accession_number}/{filename}"
+
+
 def extract_dicom_metadata(
     organized_dir: str,
     output_excel: Optional[str],
     get_keywords: Callable[[str], List[str]],
     get_converted_files: Callable[[str], Tuple[List[str], Optional[str]]],
-    assess_converted_file_quality: Callable[[str], Union[ImageQualityResult, int]],
-    assess_series_quality_converted: Callable[[List[str]], Dict],
+    assess_converted_file_quality: Callable[[str, Optional[str]], Union[ImageQualityResult, int]],
+    assess_series_quality_converted: Callable[[List[str], Optional[str]], Dict],
     append_mr_cleaned_sheet: Callable[[pd.DataFrame, str], None],
 ) -> Optional[str]:
     """
@@ -76,8 +93,8 @@ def extract_dicom_metadata(
         output_excel: 输出 Excel 文件路径，若为 None 则自动生成带时间戳的文件名
         get_keywords: 回调函数，接收模态字符串（如 'CT', 'MR'），返回要提取的 DICOM 关键字列表
         get_converted_files: 回调函数，接收序列路径，返回 (转换文件列表, 附加信息) 元组
-        assess_converted_file_quality: 回调函数，接收文件路径，返回质量评分（0=正常，1=低质量）或 ImageQualityResult
-        assess_series_quality_converted: 回调函数，接收文件路径列表，返回质量汇总字典（包含 low_quality_reason）
+        assess_converted_file_quality: 回调函数，接收(文件路径, 模态)，返回质量评分（0=正常，1=低质量）或 ImageQualityResult
+        assess_series_quality_converted: 回调函数，接收(文件路径列表, 模态)，返回质量汇总字典（包含 low_quality_reason）
         append_mr_cleaned_sheet: 回调函数，接收 DataFrame 和 Excel 路径，用于添加 MR 清洗结果
 
     返回:
@@ -133,22 +150,35 @@ def extract_dicom_metadata(
                         for keyword in current_keywords:
                             cached_records[0][keyword] = str(sample_tags.get(keyword, ""))
 
+                    # Get AccessionNumber from cache or records
+                    accession_number = ""
+                    if cached_records and 'AccessionNumber' in cached_records[0]:
+                        accession_number = cached_records[0]['AccessionNumber']
+                    elif sample_tags and 'AccessionNumber' in sample_tags:
+                        accession_number = sample_tags['AccessionNumber']
+                    
                     if read_all:
-                        converted_quality_results = [assess_converted_file_quality(p) for p in converted_files]
+                        converted_quality_results = [assess_converted_file_quality(p, cached_modality) for p in converted_files]
                         for idx, record in enumerate(cached_records):
                             quality_val, quality_reason = _extract_quality_value(
                                 converted_quality_results[idx] if idx < len(converted_quality_results) else 1
                             )
                             record['Low_quality'] = quality_val
                             record['Low_quality_reason'] = quality_reason
+                            # Update FileName to converted filename format
+                            if idx < len(converted_files):
+                                record['FileName'] = _build_converted_filename(accession_number, converted_files[idx])
                             all_metadata.append(record)
                     else:
-                        series_quality_result = assess_series_quality_converted(converted_files)
+                        series_quality_result = assess_series_quality_converted(converted_files, cached_modality)
                         series_quality = series_quality_result.get('low_quality', 1)
                         series_quality_reason = series_quality_result.get('low_quality_reason', '')
                         if cached_records:
                             cached_records[0]['Low_quality'] = series_quality
                             cached_records[0]['Low_quality_reason'] = series_quality_reason
+                            # Update SampleFileName to first converted filename for 3D series
+                            if converted_files:
+                                cached_records[0]['SampleFileName'] = _build_converted_filename(accession_number, converted_files[0])
                             all_metadata.append(cached_records[0])
                     continue
                 except Exception:
@@ -173,6 +203,9 @@ def extract_dicom_metadata(
 
             current_keywords = get_keywords(modality)
 
+            # Get AccessionNumber from the sample DICOM
+            accession_number = getattr(dcm, 'AccessionNumber', '')
+            
             if need_read_all:
                 print(f"   ℹ️  Detected {modality} modality; will read all {len(dicom_files)} DICOM files")
                 records: List[Dict] = []
@@ -205,13 +238,16 @@ def extract_dicom_metadata(
                     except Exception:
                         continue
 
-                converted_quality_results = [assess_converted_file_quality(p) for p in converted_files]
+                converted_quality_results = [assess_converted_file_quality(p, modality) for p in converted_files]
                 for idx, record in enumerate(records):
                     quality_val, quality_reason = _extract_quality_value(
                         converted_quality_results[idx] if idx < len(converted_quality_results) else 1
                     )
                     record['Low_quality'] = quality_val
                     record['Low_quality_reason'] = quality_reason
+                    # Update FileName to converted filename format: AccessionNumber/filename
+                    if idx < len(converted_files):
+                        record['FileName'] = _build_converted_filename(accession_number, converted_files[idx])
                     all_metadata.append(record)
 
                     if (idx + 1) % 10 == 0:
@@ -240,9 +276,12 @@ def extract_dicom_metadata(
                             metadata[keyword] = ""
                     except Exception:
                         metadata[keyword] = ""
-                series_quality_result = assess_series_quality_converted(converted_files)
+                series_quality_result = assess_series_quality_converted(converted_files, modality)
                 metadata['Low_quality'] = series_quality_result.get('low_quality', 1)
                 metadata['Low_quality_reason'] = series_quality_result.get('low_quality_reason', '')
+                # Update SampleFileName to first converted filename for 3D series
+                if converted_files:
+                    metadata['SampleFileName'] = _build_converted_filename(accession_number, converted_files[0])
                 all_metadata.append(metadata)
 
         except Exception as e:
