@@ -13,6 +13,31 @@ import numpy as np
 import nibabel as nib
 from PIL import Image
 from typing import Tuple, Optional, Callable
+from dotenv import load_dotenv
+
+
+def _get_project_root() -> str:
+    try:
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    except Exception:
+        return os.getcwd()
+
+
+def get_preview_target_size(default: int = 896) -> int:
+    """
+    使用 python-dotenv 从项目根目录的 .env 读取 PREVIEW_TARGET_SIZE，失败则返回默认值
+    """
+    try:
+        env_path = os.path.join(_get_project_root(), '.env')
+        # load .env if present (python-dotenv handles nonexistent paths)
+        load_dotenv(env_path)
+        val = os.getenv('PREVIEW_TARGET_SIZE', str(default))
+        try:
+            return int(val)
+        except Exception:
+            return default
+    except Exception:
+        return default
 
 
 def get_window_params(dcm) -> Tuple[Optional[float], Optional[float]]:
@@ -423,9 +448,10 @@ def _generate_single_preview(
     # 应用纵横比调整
     image_2d = resize_with_aspect(image_2d, aspect_ratio)
     
-    # 2D 图像标准化尺寸
+    # 2D 图像标准化尺寸（从 .env 读取 PREVIEW_TARGET_SIZE）
     if not is_3d:
-        image_2d = normalize_2d_preview(image_2d, target_size=896)
+        target_size = get_preview_target_size(default=896)
+        image_2d = normalize_2d_preview(image_2d, target_size=target_size)
     
     # 保存预览图
     base_name = sanitize_folder_name(series_name)
