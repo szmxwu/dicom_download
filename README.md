@@ -122,6 +122,7 @@ Note: X-ray images (DX/DR/MG/CR) typically have simpler content, so they use mor
 ### Output
 - The metadata Excel contains at least `DICOM_Metadata` and `Series_Summary` sheets.
 - If MR records are present, an additional `MR_Cleaned` sheet is generated.
+- download.py is recommended for large tasks 
 
 ## Project Structure
 

@@ -120,6 +120,7 @@ QC_DEFAULT_SERIES_LOW_QUALITY_RATIO=0.3
 ### 输出说明
 - 元数据 Excel 至少包含 `DICOM_Metadata` 与 `Series_Summary` 两个工作表。
 - 当存在 MR 记录时，会额外生成 `MR_Cleaned` 工作表。
+- 大量任务建议使用download.py执行
 
 ## 项目结构
 

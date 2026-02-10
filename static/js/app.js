@@ -6,8 +6,36 @@ class DICOMProcessor {
         this.currentTask = null;
         this.selectedFile = null;
         this.pacsConfigLoaded = false;
+        this.historyPage = 1;
+        this.historyPageSize = 20;
+        this.historyTotalPages = 0;
+        this.historyTotalCount = 0;
+        
+        // 防止重复提交的标志
+        this.isProcessing = false;
+        
+        // 防抖包装的处理方法
+        this.startSingleProcess = this.debounce(this._startSingleProcess.bind(this), 500, true);
+        this.startBatchProcess = this.debounce(this._startBatchProcess.bind(this), 500, true);
+        this.startUploadProcess = this.debounce(this._startUploadProcess.bind(this), 500, true);
         
         this.init();
+    }
+
+    // 带立即执行选项的防抖函数
+    debounce(func, wait, immediate = false) {
+        let timeout;
+        return function executedFunction(...args) {
+            const context = this;
+            const later = () => {
+                timeout = null;
+                if (!immediate) func.apply(context, args);
+            };
+            const callNow = immediate && !timeout;
+            clearTimeout(timeout);
+            timeout = setTimeout(later, wait);
+            if (callNow) func.apply(context, args);
+        };
     }
 
     // 初始化应用
@@ -18,11 +46,39 @@ class DICOMProcessor {
         this.updateCurrentTime();
         this.loadSystemStatus();
         
+        // 防抖包装的方法
+        this.debouncedLoadSystemStatus = this.debounce(() => this.loadSystemStatus(), 1000);
+        
         // 设置定时器
         setInterval(() => this.updateCurrentTime(), 1000);
-        setInterval(() => this.loadSystemStatus(), 30000);
+        setInterval(() => this.debouncedLoadSystemStatus(), 30000);
         
         console.log('🏥 DICOM处理系统已初始化');
+    }
+
+    // 防抖函数
+    debounce(func, wait) {
+        let timeout;
+        return function executedFunction(...args) {
+            const later = () => {
+                clearTimeout(timeout);
+                func(...args);
+            };
+            clearTimeout(timeout);
+            timeout = setTimeout(later, wait);
+        };
+    }
+
+    // 节流函数
+    throttle(func, limit) {
+        let inThrottle;
+        return function(...args) {
+            if (!inThrottle) {
+                func.apply(this, args);
+                inThrottle = true;
+                setTimeout(() => inThrottle = false, limit);
+            }
+        };
     }
 
     // 初始化多语言支持
@@ -72,6 +128,11 @@ class DICOMProcessor {
                 'download_excel': 'Excel',
                 'download_zip': 'ZIP',
                 'no_history_tasks': 'No completed tasks yet',
+                'page_size': 'Page size',
+                'prev_page': 'Prev',
+                'next_page': 'Next',
+                'page': 'Page',
+                'of': 'of',
                 'process_options': 'Process Options',
                 'basic_settings': 'Basic Settings',
                 'auto_extract': 'Auto Extract',
@@ -180,6 +241,11 @@ class DICOMProcessor {
                 'download_excel': 'Excel',
                 'download_zip': '文件包',
                 'no_history_tasks': '暂无已完成任务',
+                'page_size': '每页',
+                'prev_page': '上一页',
+                'next_page': '下一页',
+                'page': '第',
+                'of': '页/共',
                 'process_options': '处理选项',
                 'basic_settings': '基本设置',
                 'auto_extract': '自动解压',
@@ -284,25 +350,71 @@ class DICOMProcessor {
         // Update specific elements that might need dynamic content
         this.updateCurrentTime();
         this.loadSystemStatus();
+        this.renderHistoryPagination();
     }
 
-    // 初始化WebSocket连接
+    // 初始化WebSocket连接 - 带自动重连
     initializeSocket() {
-        this.socket = io();
+        this.socketReconnectAttempts = 0;
+        this.socketMaxReconnectAttempts = 5;
+        this.socketReconnectDelay = 1000; // 初始重连延迟1秒
         
-        this.socket.on('connect', () => {
-            console.log('✅ WebSocket连接成功');
-            this.updateConnectionStatus(true);
-        });
+        const connectSocket = () => {
+            this.socket = io();
+            
+            this.socket.on('connect', () => {
+                console.log('✅ WebSocket连接成功');
+                this.updateConnectionStatus(true);
+                // 重置重连计数
+                this.socketReconnectAttempts = 0;
+                this.socketReconnectDelay = 1000;
+                
+                // 如果有当前任务，重新订阅
+                if (this.currentTask && this.currentTask.id) {
+                    this.subscribeToTask(this.currentTask.id);
+                }
+            });
 
-        this.socket.on('disconnect', () => {
-            console.log('❌ WebSocket连接断开');
-            this.updateConnectionStatus(false);
-        });
+            this.socket.on('disconnect', (reason) => {
+                console.log('❌ WebSocket连接断开:', reason);
+                this.updateConnectionStatus(false);
+                
+                // 如果断开原因是io server disconnect，需要手动重连
+                if (reason === 'io server disconnect') {
+                    this.attemptReconnect();
+                }
+            });
 
-        this.socket.on('task_update', (data) => {
-            this.handleTaskUpdate(data);
-        });
+            this.socket.on('connect_error', (error) => {
+                console.error('WebSocket连接错误:', error);
+                this.attemptReconnect();
+            });
+
+            this.socket.on('task_update', (data) => {
+                this.handleTaskUpdate(data);
+            });
+        };
+        
+        connectSocket();
+    }
+
+    // WebSocket重连
+    attemptReconnect() {
+        if (this.socketReconnectAttempts >= this.socketMaxReconnectAttempts) {
+            console.error('WebSocket重连次数已达上限，请刷新页面');
+            this.showError('连接丢失，请刷新页面重试');
+            return;
+        }
+        
+        this.socketReconnectAttempts++;
+        const delay = Math.min(this.socketReconnectDelay * Math.pow(2, this.socketReconnectAttempts - 1), 30000);
+        
+        console.log(`WebSocket将在 ${delay}ms 后尝试第 ${this.socketReconnectAttempts} 次重连...`);
+        
+        setTimeout(() => {
+            console.log('尝试重连WebSocket...');
+            this.initializeSocket();
+        }, delay);
     }
 
     // 绑定事件监听器
@@ -354,6 +466,34 @@ class DICOMProcessor {
             historyTab.addEventListener('shown.bs.tab', () => this.loadTaskHistory());
         }
 
+        const historyPageSize = document.getElementById('historyPageSize');
+        if (historyPageSize) {
+            historyPageSize.addEventListener('change', (event) => {
+                const nextSize = Number.parseInt(event.target.value, 10);
+                this.historyPageSize = Number.isNaN(nextSize) ? this.historyPageSize : nextSize;
+                this.historyPage = 1;
+                this.loadTaskHistory(1);
+            });
+        }
+
+        const historyPrev = document.getElementById('historyPrev');
+        if (historyPrev) {
+            historyPrev.addEventListener('click', () => {
+                if (this.historyPage > 1) {
+                    this.loadTaskHistory(this.historyPage - 1);
+                }
+            });
+        }
+
+        const historyNext = document.getElementById('historyNext');
+        if (historyNext) {
+            historyNext.addEventListener('click', () => {
+                if (this.historyPage < this.historyTotalPages) {
+                    this.loadTaskHistory(this.historyPage + 1);
+                }
+            });
+        }
+
         // 键盘快捷键
         document.addEventListener('keydown', this.handleKeydown.bind(this));
 
@@ -366,23 +506,34 @@ class DICOMProcessor {
         });
     }
 
-    async loadTaskHistory() {
+    async loadTaskHistory(page = null) {
         const tbody = document.getElementById('historyTableBody');
         const emptyState = document.getElementById('historyEmpty');
         if (!tbody || !emptyState) {
             return;
         }
 
+        const targetPage = page || this.historyPage || 1;
+        const pageSize = this.historyPageSize || 20;
+
         try {
-            const response = await fetch('/api/tasks/history');
+            const response = await fetch(`/api/tasks/history?page=${targetPage}&page_size=${pageSize}`);
             const data = await response.json();
             if (!response.ok) {
                 throw new Error(data.error || 'Failed to load history');
             }
+            this.historyPage = data.page || targetPage;
+            this.historyPageSize = data.page_size || pageSize;
+            this.historyTotalPages = data.total_pages || 0;
+            this.historyTotalCount = data.total || 0;
             this.renderHistoryTasks(data.tasks || []);
+            this.renderHistoryPagination();
         } catch (error) {
             console.error('获取历史任务失败:', error);
             this.renderHistoryTasks([]);
+            this.historyTotalPages = 0;
+            this.historyTotalCount = 0;
+            this.renderHistoryPagination();
         }
     }
 
@@ -432,6 +583,40 @@ class DICOMProcessor {
             `;
             tbody.appendChild(row);
         });
+    }
+
+    renderHistoryPagination() {
+        const container = document.getElementById('historyPagination');
+        const info = document.getElementById('historyPageInfo');
+        const prevBtn = document.getElementById('historyPrev');
+        const nextBtn = document.getElementById('historyNext');
+        const pageSizeSelect = document.getElementById('historyPageSize');
+        if (!container || !info || !prevBtn || !nextBtn || !pageSizeSelect) {
+            return;
+        }
+
+        if (pageSizeSelect.value !== String(this.historyPageSize)) {
+            pageSizeSelect.value = String(this.historyPageSize);
+        }
+
+        const t = this.translations[this.currentLang];
+        const totalPages = this.historyTotalPages || 0;
+        const page = this.historyPage || 1;
+        const total = this.historyTotalCount || 0;
+
+        prevBtn.disabled = page <= 1 || totalPages <= 0;
+        nextBtn.disabled = totalPages <= 0 || page >= totalPages;
+
+        if (totalPages <= 0 || total <= 0) {
+            info.textContent = '';
+            return;
+        }
+
+        if (this.currentLang === 'zh') {
+            info.textContent = `${t.page}${page}${t.of}${totalPages}`;
+        } else {
+            info.textContent = `${t.page} ${page} ${t.of} ${totalPages}`;
+        }
     }
 
     getTaskTypeLabel(taskType) {
@@ -668,14 +853,22 @@ class DICOMProcessor {
         };
     }
 
-    // 开始单个处理
-    async startSingleProcess() {
+    // 开始单个处理 - 内部实现
+    async _startSingleProcess() {
+        // 防止重复提交
+        if (this.isProcessing) {
+            console.warn('已有处理任务在进行中');
+            return;
+        }
+
         const accessionNumber = document.getElementById('accessionNumber').value.trim();
         
         if (!accessionNumber) {
             this.showError(this.translations[this.currentLang]['enter_accession_number_error']);
             return;
         }
+
+        this.isProcessing = true;
 
         // 先检查系统状态
         try {
@@ -729,11 +922,22 @@ class DICOMProcessor {
             }
         } catch (error) {
             this.showError(this.translations[this.currentLang]['network_error'] + error.message);
+        } finally {
+            // 延迟重置标志，防止快速重复点击
+            setTimeout(() => {
+                this.isProcessing = false;
+            }, 1000);
         }
     }
 
-    // 开始批量处理
-    async startBatchProcess() {
+    // 开始批量处理 - 内部实现
+    async _startBatchProcess() {
+        // 防止重复提交
+        if (this.isProcessing) {
+            console.warn('已有处理任务在进行中');
+            return;
+        }
+
         const batchText = document.getElementById('batchAccessionNumbers').value.trim();
         
         if (!batchText) {
@@ -750,6 +954,7 @@ class DICOMProcessor {
             return;
         }
 
+        this.isProcessing = true;
         const options = this.getProcessingOptions();
         
         try {
@@ -780,16 +985,27 @@ class DICOMProcessor {
             }
         } catch (error) {
             this.showError(this.translations[this.currentLang]['network_error'] + error.message);
+        } finally {
+            setTimeout(() => {
+                this.isProcessing = false;
+            }, 1000);
         }
     }
 
-    // 开始上传文件处理
-    async startUploadProcess() {
+    // 开始上传文件处理 - 内部实现
+    async _startUploadProcess() {
+        // 防止重复提交
+        if (this.isProcessing) {
+            console.warn('已有处理任务在进行中');
+            return;
+        }
+
         if (!this.selectedFile) {
             this.showError(this.translations[this.currentLang]['select_zip_error']);
             return;
         }
 
+        this.isProcessing = true;
         const formData = new FormData();
         formData.append('file', this.selectedFile);
         
@@ -820,6 +1036,10 @@ class DICOMProcessor {
             }
         } catch (error) {
             this.showError(this.translations[this.currentLang]['network_error'] + error.message);
+        } finally {
+            setTimeout(() => {
+                this.isProcessing = false;
+            }, 1000);
         }
     }
 
@@ -970,15 +1190,33 @@ class DICOMProcessor {
         }
     }
 
-    // 更新日志
+    // 更新日志 - 增量更新优化
     updateLogs(logs) {
         const logContainer = document.getElementById('logContainer');
         if (!logContainer) return;
 
-        // 清空现有日志
-        logContainer.innerHTML = '';
+        // 如果没有日志，显示等待信息
+        if (!logs || logs.length === 0) {
+            if (logContainer.children.length === 0 || 
+                logContainer.children[0].classList.contains('text-muted')) {
+                logContainer.innerHTML = '<div class="text-muted text-center p-3">等待处理开始...</div>';
+            }
+            return;
+        }
+
+        // 清除等待信息（如果存在）
+        if (logContainer.children.length === 1 && 
+            logContainer.children[0].classList.contains('text-muted')) {
+            logContainer.innerHTML = '';
+        }
+
+        // 获取当前已显示的日志数量
+        const currentLogCount = logContainer.querySelectorAll('.log-entry').length;
         
-        logs.forEach(log => {
+        // 只添加新日志（增量更新）
+        const newLogs = logs.slice(currentLogCount);
+        
+        newLogs.forEach(log => {
             const logEntry = document.createElement('div');
             logEntry.className = `log-entry ${log.level}`;
             logEntry.innerHTML = `
@@ -987,6 +1225,16 @@ class DICOMProcessor {
             `;
             logContainer.appendChild(logEntry);
         });
+
+        // 限制日志数量，防止DOM过大（保留最近100条）
+        const maxLogs = 100;
+        const allLogs = logContainer.querySelectorAll('.log-entry');
+        if (allLogs.length > maxLogs) {
+            const toRemove = allLogs.length - maxLogs;
+            for (let i = 0; i < toRemove; i++) {
+                allLogs[i].remove();
+            }
+        }
 
         // 滚动到底部
         logContainer.scrollTop = logContainer.scrollHeight;

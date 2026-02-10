@@ -103,6 +103,57 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 # 全局变量存储处理任务
 processing_tasks = {}
+_task_lock = threading.Lock()  # 任务字典锁，防止竞态条件
+
+# 已完成任务缓存，避免每次请求全量序列化
+_completed_tasks_lock = threading.Lock()
+_completed_tasks_cache = []
+_completed_task_ids = set()
+_serialized_history_cache = []
+
+# 任务取消标志字典 - 用于真正中断任务执行
+_task_cancel_flags = {}
+
+# 任务清理配置
+TASK_MAX_AGE_HOURS = 24  # 任务最大保留时间（小时）
+TASK_CLEANUP_INTERVAL = 3600  # 清理检查间隔（秒）
+
+
+def _cleanup_old_tasks():
+    """后台线程：定期清理过期任务"""
+    while True:
+        try:
+            time.sleep(TASK_CLEANUP_INTERVAL)
+            _do_cleanup_old_tasks()
+        except Exception as e:
+            logger.error(f"任务清理失败: {e}")
+
+
+def _do_cleanup_old_tasks():
+    """执行清理过期任务"""
+    cutoff_time = time.time() - (TASK_MAX_AGE_HOURS * 3600)
+    cleaned_count = 0
+    
+    with _task_lock:
+        # 找出过期任务
+        expired_tasks = []
+        for task_id, task in processing_tasks.items():
+            if task.end_time and task.end_time < cutoff_time:
+                expired_tasks.append(task_id)
+        
+        # 删除过期任务
+        for task_id in expired_tasks:
+            del processing_tasks[task_id]
+            _task_cancel_flags.pop(task_id, None)
+            cleaned_count += 1
+    
+    if cleaned_count > 0:
+        logger.info(f"清理了 {cleaned_count} 个过期任务（超过 {TASK_MAX_AGE_HOURS} 小时）")
+
+
+# 启动后台清理线程
+cleanup_thread = threading.Thread(target=_cleanup_old_tasks, daemon=True)
+cleanup_thread.start()
 
 # 创建DICOM客户端实例用于系统状态检查（不登录）
 dicom_client_checker = DICOMDownloadClient()
@@ -294,6 +345,54 @@ class ProcessingTask:
         self.start_time = time.time()
         self.end_time = None
         self.logs = []
+        self._cancelled = False  # 取消标志
+        self._log_buffer = []     # 日志缓冲区，用于批量发送
+        self._last_emit_time = 0  # 上次发送时间
+        self._emit_interval = 0.5  # 最小发送间隔（秒）
+
+    def is_cancelled(self):
+        """检查任务是否被取消"""
+        # 检查本地标志
+        if self._cancelled:
+            return True
+        # 检查全局取消标志
+        return _task_cancel_flags.get(self.task_id, False)
+
+    def cancel(self):
+        """标记任务为已取消"""
+        self._cancelled = True
+        _task_cancel_flags[self.task_id] = True
+        self.status = 'cancelled'
+        self.end_time = time.time()
+
+    def check_cancellation(self, step_name=""):
+        """检查取消标志，如已取消则抛出异常中断执行"""
+        if self.is_cancelled():
+            raise InterruptedError(f"Task {self.task_id} cancelled at step: {step_name}")
+
+    def _should_emit(self):
+        """判断是否应该发送WebSocket更新（节流控制）"""
+        current_time = time.time()
+        if current_time - self._last_emit_time >= self._emit_interval:
+            self._last_emit_time = current_time
+            return True
+        return False
+
+    def _emit_update(self, force=False):
+        """发送WebSocket更新（内部方法）"""
+        if not force and not self._should_emit():
+            return
+        
+        try:
+            socketio.emit('task_update', {
+                'task_id': self.task_id,
+                'status': self.status,
+                'progress': self.progress,
+                'current_step': self.current_step,
+                'logs': self.logs[-5:]  # 只发送最新5条日志
+            })
+        except Exception as e:
+            logger.error(f"WebSocket发送失败: {str(e)}")
 
     def add_log(self, message, level='info'):
         """添加日志"""
@@ -308,20 +407,16 @@ class ProcessingTask:
         log_method = getattr(logger, level.lower(), logger.info)
         log_method(f"[Task {self.task_id}] {message}")
         
-        # 通过WebSocket发送更新
-        try:
-            socketio.emit('task_update', {
-                'task_id': self.task_id,
-                'status': self.status,
-                'progress': self.progress,
-                'current_step': self.current_step,
-                'logs': self.logs[-5:]  # 只发送最新5条日志
-            })  # 默认广播给所有连接的客户端
-        except Exception as e:
-            logger.error(f"WebSocket发送失败: {str(e)}")
+        # 通过WebSocket发送更新（节流控制）
+        self._emit_update()
 
     def update_status(self, status, progress=None, step=None):
         """更新任务状态"""
+        # 如果任务已取消，不再更新状态
+        if self.is_cancelled() and status not in ['cancelled', 'failed']:
+            logger.warning(f"Task {self.task_id} is cancelled, ignoring status update to {status}")
+            return
+        
         self.status = status
         if progress is not None:
             self.progress = progress
@@ -331,17 +426,8 @@ class ProcessingTask:
         # 使用 logger 记录状态转换
         logger.info(f"Task {self.task_id} status update: {status} ({progress or 0}% - {step or 'N/A'})")
         
-        # 通过WebSocket发送更新
-        try:
-            socketio.emit('task_update', {
-                'task_id': self.task_id,
-                'status': self.status,
-                'progress': self.progress,
-                'current_step': self.current_step,
-                'logs': self.logs[-5:]  # 只发送最新5条日志
-            })  # 默认广播给所有连接的客户端
-        except Exception as e:
-            logger.error(f"WebSocket发送失败: {str(e)}")
+        # 通过WebSocket发送更新（强制发送状态变更）
+        self._emit_update(force=True)
 
 @app.route('/api/debug/test-connection')
 def test_connection():
@@ -531,18 +617,69 @@ def _serialize_task_history(task: 'ProcessingTask') -> dict:
     }
 
 
+def _parse_pagination_param(value, default, min_value=1, max_value=None):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+
+    if parsed < min_value:
+        parsed = min_value
+    if max_value is not None and parsed > max_value:
+        parsed = max_value
+    return parsed
+
+
+def _refresh_completed_cache_from_tasks():
+    completed_tasks = [t for t in processing_tasks.values() if t.status == 'completed']
+    completed_tasks.sort(key=lambda x: x.end_time or x.start_time, reverse=True)
+    with _completed_tasks_lock:
+        _completed_tasks_cache.clear()
+        _completed_tasks_cache.extend(completed_tasks)
+        _completed_task_ids.clear()
+        _completed_task_ids.update(t.task_id for t in completed_tasks)
+        _serialized_history_cache.clear()
+        _serialized_history_cache.extend([_serialize_task_history(task) for task in completed_tasks])
+
+
+def _record_task_completion(task: 'ProcessingTask'):
+    with _completed_tasks_lock:
+        if task.task_id in _completed_task_ids:
+            return
+        _completed_task_ids.add(task.task_id)
+        _completed_tasks_cache.insert(0, task)
+        _serialized_history_cache.insert(0, _serialize_task_history(task))
+
+
 @app.route('/api/tasks/history')
 def get_task_history():
     """返回已完成任务的历史列表"""
-    completed_tasks = [t for t in processing_tasks.values() if t.status == 'completed']
-    completed_tasks.sort(key=lambda x: x.end_time or x.start_time, reverse=True)
+    page = _parse_pagination_param(request.args.get('page'), 1, min_value=1)
+    page_size = _parse_pagination_param(request.args.get('page_size'), 20, min_value=1, max_value=200)
+
+    if not _serialized_history_cache:
+        _refresh_completed_cache_from_tasks()
+
+    total = len(_serialized_history_cache)
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+    if total_pages > 0 and page > total_pages:
+        page = total_pages
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    paged_tasks = _serialized_history_cache[start:end]
+
     return jsonify({
-        'tasks': [_serialize_task_history(task) for task in completed_tasks]
+        'tasks': paged_tasks,
+        'page': page,
+        'page_size': page_size,
+        'total': total,
+        'total_pages': total_pages
     })
 
 @app.route('/api/task/<task_id>/cancel', methods=['POST'])
 def cancel_task(task_id):
-    """取消任务"""
+    """取消任务 - 修复版，真正中断任务执行"""
     task = processing_tasks.get(task_id)
     if not task:
         return jsonify({'error': 'Task not found'}), 404
@@ -550,8 +687,12 @@ def cancel_task(task_id):
     if task.status in ['completed', 'failed', 'cancelled']:
         return jsonify({'error': 'Task completed, cannot cancel'}), 400
     
-    task.update_status('cancelled')
+    # 设置取消标志，任务线程会在检查点抛出InterruptedError
+    task.cancel()
     task.add_log('任务已被用户取消', 'warning')
+    
+    # 强制发送更新
+    task._emit_update(force=True)
     
     return jsonify({'message': 'Task cancelled'})
 
@@ -739,7 +880,7 @@ def set_pacs_config():
 
 # 处理任务函数
 def process_single_task(task):
-    """处理单个AccessionNumber任务 - 修复版"""
+    """处理单个AccessionNumber任务 - 修复版，支持取消检查"""
     client_logged_in = False
     task_client = None
     
@@ -747,6 +888,9 @@ def process_single_task(task):
         # 立即更新状态，确保WebSocket发送
         task.update_status('running', 5, 'Connecting to DICOM service')
         task.add_log("Connecting to DICOM service...")
+        
+        # 检查取消标志
+        task.check_cancellation("initial_connect")
         
         # 添加调试日志
         logger.debug(f"开始处理任务: {task.task_id}")
@@ -760,6 +904,9 @@ def process_single_task(task):
             task.add_log(f"Failed to create DICOM client: {str(e)}", 'error')
             raise Exception(f"Failed to create DICOM client: {str(e)}")
         
+        # 检查取消标志
+        task.check_cancellation("after_client_create")
+        
         # 检查PACS连接状态
         task.update_status('running', 8, 'Checking PACS connection')
         task.add_log("Checking PACS connection status...")
@@ -771,6 +918,9 @@ def process_single_task(task):
         except Exception as e:
             task.add_log(f"PACS connection check failed: {str(e)}", 'error')
             raise
+        
+        # 检查取消标志
+        task.check_cancellation("after_pacs_check")
         
         # 自动登录（兼容性接口：当前DICOM客户端不做真实认证）
         task.update_status('running', 10, 'Logging in to DICOM service')
@@ -800,10 +950,16 @@ def process_single_task(task):
         # Attach download progress callback to update task status during C-MOVE
         def _download_progress(current_series, total_series, series_name, progress_pct):
             try:
+                # 检查取消标志
+                if task.is_cancelled():
+                    raise InterruptedError("Task cancelled during download")
+                
                 step_name = f"Downloading series {current_series}/{total_series}: {series_name}"
                 task.update_status('running', progress_pct, step_name)
                 if current_series % 3 == 0 or current_series == total_series:  # 每3个series记录一次日志，避免日志过多
                     task.add_log(f"Downloaded {current_series}/{total_series} series: {series_name}")
+            except InterruptedError:
+                raise
             except Exception as e:
                 logger.warning(f"Download progress callback error: {e}")
         
@@ -816,6 +972,9 @@ def process_single_task(task):
         task.update_status('running', 15, 'Preparing process')
         task.add_log(f"Start processing AccessionNumber: {accession_number}")
         
+        # 检查取消标志
+        task.check_cancellation("before_create_dir")
+        
         # 创建结果目录
         result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id)
         os.makedirs(result_dir, exist_ok=True)
@@ -827,6 +986,9 @@ def process_single_task(task):
         # 执行处理流程
         task.update_status('running', 30, 'Querying PACS data')
         task.add_log('Querying data from PACS...')
+        
+        # 检查取消标志
+        task.check_cancellation("before_query")
         
         # 先查询是否存在数据
         try:
@@ -882,6 +1044,7 @@ def process_single_task(task):
                 task.update_status('completed', 100, 'Completed')
                 task.add_log('✅ Process completed successfully!', 'success')
                 task.end_time = time.time()
+                _record_task_completion(task)
                 
                 # 输出成功日志
                 logger.debug(f"任务完成: {task.task_id}")
@@ -899,6 +1062,11 @@ def process_single_task(task):
             task.add_log(f'Error during process: {str(e)}', 'error')
             raise
             
+    except InterruptedError:
+        # 任务被取消，不要标记为失败
+        task.add_log('Process cancelled by user', 'warning')
+        # 状态已在cancel()方法中设置
+        logger.info(f"任务被取消: {task.task_id}")
     except Exception as e:
         error_msg = str(e)
         logger.error(f"任务处理失败: {task.task_id}, 错误: {error_msg}")
@@ -919,15 +1087,31 @@ def process_single_task(task):
                 logger.warning(f"登出失败: {str(e)}")
 
 def process_batch_task(task):
-    """处理批量AccessionNumber任务"""
+    """处理批量AccessionNumber任务 - 修复版，支持去重和取消检查"""
     client_logged_in = False
     task_client = None  # 初始化变量
     try:
         accession_numbers = task.parameters['accession_numbers']
         options = task.parameters['options']
         
+        # 去重处理，保持顺序
+        seen = set()
+        unique_accession_numbers = []
+        for acc in accession_numbers:
+            if acc and acc not in seen:
+                seen.add(acc)
+                unique_accession_numbers.append(acc)
+        
+        if len(unique_accession_numbers) < len(accession_numbers):
+            task.add_log(f"Removed {len(accession_numbers) - len(unique_accession_numbers)} duplicates, {len(unique_accession_numbers)} unique studies to process")
+        
+        accession_numbers = unique_accession_numbers
+        
         task.update_status('running', 5, 'Connecting to DICOM service')
         task.add_log("Connecting to DICOM service...")
+        
+        # 检查取消标志
+        task.check_cancellation("before_connect")
         
         # 创建新的DICOM客户端实例并登录
         task_client = DICOMDownloadClient()
@@ -941,6 +1125,7 @@ def process_batch_task(task):
         
         client_logged_in = True
         task.add_log("DICOM service login successful")
+        
         # Attach progress callback so MR_clean can report progress back to task logs
         def _mr_progress(msg, stage=None):
             try:
@@ -958,6 +1143,9 @@ def process_batch_task(task):
         total = len(accession_numbers)
         
         for i, accno in enumerate(accession_numbers):
+            # 检查取消标志
+            task.check_cancellation(f"before_processing_{accno}")
+            
             # 计算进度 (10-90%用于处理，剩余用于整理)
             progress = 10 + int((i / total) * 80)
             task.update_status('running', progress, f'Processing {accno} ({i+1}/{total})')
@@ -1005,10 +1193,16 @@ def process_batch_task(task):
         task.update_status('completed', 100, 'Batch process completed')
         task.add_log('Batch process completed')
         task.end_time = time.time()
+        _record_task_completion(task)
         
         # 批量任务完成后检查并清理结果目录
         check_and_cleanup_results()
         
+    except InterruptedError:
+        # 任务被取消，已在上面的循环中处理
+        task.add_log('Batch process cancelled by user', 'warning')
+        task.update_status('cancelled')
+        task.end_time = time.time()
     except Exception as e:
         task.add_log(f'Batch process error: {str(e)}', 'error')
         task.update_status('failed')
@@ -1025,7 +1219,7 @@ def process_batch_task(task):
                 task.add_log(f"Error during logout: {str(e)}", 'warning')
 
 def process_upload_task(task):
-    """处理上传文件任务"""
+    """处理上传文件任务 - 修复版，支持取消检查"""
     try:
         filepath = task.parameters['filepath']
         options = task.parameters['options']
@@ -1033,8 +1227,14 @@ def process_upload_task(task):
         task.update_status('running', 5, 'Initializing upload process')
         task.add_log(f"Start processing uploaded file: {task.parameters['filename']}")
         
+        # 检查取消标志
+        task.check_cancellation("initial")
+        
         # 创建本地DICOM客户端实例（无需登录，仅用于本地文件处理）
         local_client = DICOMDownloadClient()
+        
+        # 检查取消标志
+        task.check_cancellation("after_client_create")
         
         # 创建结果目录
         result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id)
@@ -1045,6 +1245,10 @@ def process_upload_task(task):
         # 处理上传流程
         task.update_status('running', 20, 'Processing upload workflow')
         task.add_log("Processing uploaded ZIP file...")
+        
+        # 检查取消标志
+        task.check_cancellation("before_processing")
+        
         result = local_client.process_upload_workflow(filepath, result_dir, options)
 
         if result.get('success'):
@@ -1052,6 +1256,9 @@ def process_upload_task(task):
             series_info = result.get('series_info', {})
             excel_file = result.get('excel_file')
 
+            # 检查取消标志
+            task.check_cancellation("before_create_zip")
+            
             task.update_status('running', 95, 'Creating result files')
             task.add_log("Creating result files...")
             zip_path = create_result_zip(
@@ -1071,6 +1278,7 @@ def process_upload_task(task):
             task.update_status('completed', 100, 'Upload process completed')
             task.add_log('Upload process completed')
             task.end_time = time.time()
+            _record_task_completion(task)
 
             # 上传文件处理完成后检查并清理结果目录
             check_and_cleanup_results()
@@ -1079,6 +1287,11 @@ def process_upload_task(task):
             task.update_status('failed')
             task.error = result.get('error') or 'Failed to process uploaded file'
             
+    except InterruptedError:
+        # 任务被取消
+        task.add_log('Upload process cancelled by user', 'warning')
+        task.update_status('cancelled')
+        task.end_time = time.time()
     except Exception as e:
         task.add_log(f'Upload process error: {str(e)}', 'error')
         task.update_status('failed')
