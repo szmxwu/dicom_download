@@ -229,6 +229,55 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int) -> Optional
         return None
 
 
+def _get_orientation_from_dcm(dcm) -> str:
+    """
+    从DICOM对象中获取扫描方位
+    
+    通过ImageOrientationPatient(IOP)计算法向量来确定方位。
+    能够精确区分轴位(AX)，矢状位(SAG)，冠状位(COR)，并能识别斜位(OBL)。
+    
+    Args:
+        dcm: pydicom Dataset 对象
+        
+    Returns:
+        str: 标准化的方位名称 ('AX', 'SAG', 'COR', 'OBL', 'UNKNOWN')
+    """
+    try:
+        if dcm is None:
+            return 'UNKNOWN'
+        
+        # 获取ImageOrientationPatient
+        iop = getattr(dcm, 'ImageOrientationPatient', None)
+        if iop is None or len(iop) != 6:
+            return 'UNKNOWN'
+        
+        # 转换为numpy数组
+        row_vec = np.array([float(iop[0]), float(iop[1]), float(iop[2])])
+        col_vec = np.array([float(iop[3]), float(iop[4]), float(iop[5])])
+        
+        # 计算法向量
+        normal = np.cross(row_vec, col_vec)
+        
+        # 检查是否为斜位：如果没有一个轴占绝对主导，则为斜位
+        # 判断依据：主轴分量的平方是否小于向量模长平方的 0.9
+        oblique_ratio = 0.9
+        if np.max(np.abs(normal))**2 < oblique_ratio * np.sum(normal**2):
+            return 'OBL'
+        
+        # 根据法向量的主轴判断方位
+        main_axis = np.argmax(np.abs(normal))
+        if main_axis == 0:
+            return 'SAG'  # 法向量主轴为X
+        elif main_axis == 1:
+            return 'COR'  # 法向量主轴为Y
+        elif main_axis == 2:
+            return 'AX'   # 法向量主轴为Z
+        
+        return 'UNKNOWN'
+    except Exception:
+        return 'UNKNOWN'
+
+
 def _correct_image_orientation(
     image_2d: np.ndarray,
     preview_file: str,
@@ -239,6 +288,9 @@ def _correct_image_orientation(
 ) -> np.ndarray:
     """
     校正图像方向（处理行列颠倒的情况）
+    
+    结合DICOM元数据中的尺寸信息和扫描方位信息进行校正。
+    对于冠状位(COR)图像，使用特殊的校正逻辑以确保方向正确。
     
     Args:
         image_2d: 输入图像
@@ -252,8 +304,12 @@ def _correct_image_orientation(
         校正后的图像
     """
     try:
+        h, w = image_2d.shape[:2]
+        
+        # 从DICOM缓存或对象中获取Rows和Columns
         rows = None
         cols = None
+        
         if not is_3d:
             cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
             if os.path.exists(cache_path):
@@ -292,16 +348,42 @@ def _correct_image_orientation(
                         except Exception:
                             continue
 
+        # 如果缓存中没有，从sample_dcm获取
         if (rows is None or cols is None) and sample_dcm is not None:
             rows = getattr(sample_dcm, 'Rows', None)
             cols = getattr(sample_dcm, 'Columns', None)
-
-        # 如果尺寸颠倒，进行转置校正
+        
+        # 获取扫描方位
+        orientation = _get_orientation_from_dcm(sample_dcm)
+        
+        # 基于尺寸判断是否转置
+        needs_transpose = False
         if rows and cols:
-            h, w = image_2d.shape[:2]
             if h == int(cols) and w == int(rows):
-                image_2d = image_2d.T
+                needs_transpose = True
+        
+        # 应用校正
+        if needs_transpose:
+            image_2d = image_2d.T
+            # 根据方位决定翻转方向
+            if orientation == 'COR':
+                # 冠状位：水平翻转（左右翻转）
+                image_2d = image_2d[:, ::-1]
+            elif orientation == 'SAG':
+                # 矢状位：垂直翻转
                 image_2d = image_2d[::-1, :]
+            elif orientation == 'AX':
+                # 轴位：垂直翻转
+                image_2d = image_2d[::-1, :]
+            else:
+                # 默认：垂直翻转保持原有行为
+                image_2d = image_2d[::-1, :]
+        else:
+            # 不需要转置时，根据方位进行必要的翻转
+            if orientation == 'COR':
+                # 冠状位可能需要水平翻转以保持标准方向
+                # 标准冠状位：左在右，右在左
+                image_2d = image_2d[:, ::-1]
         
         return image_2d
     except Exception:
