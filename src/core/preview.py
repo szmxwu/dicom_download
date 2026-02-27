@@ -179,7 +179,7 @@ def normalize_2d_preview(img: np.ndarray, target_size: int = 896) -> np.ndarray:
         return img
 
 
-def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int) -> Optional[np.ndarray]:
+def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int, orientation: str = 'UNKNOWN') -> Optional[np.ndarray]:
     """
     从NIfTI或NPZ文件加载2D图像数据
     
@@ -187,6 +187,7 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int) -> Optional
         preview_file: 图像文件路径
         is_3d: 是否为3D图像
         preview_idx: 预览索引（用于错误信息）
+        orientation: 扫描方位 ('AX', 'SAG', 'COR', 'OBL', 'UNKNOWN')
         
     Returns:
         2D图像数组，失败时返回None
@@ -202,8 +203,18 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int) -> Optional
                     return None
 
             if data.ndim == 3 and is_3d:
-                mid_y = data.shape[1] // 2
-                image_2d = data[:, mid_y, :]
+                # npz data is saved as (Z, Y, X) in convert.py
+                # Z: top to bottom, Y: anterior to posterior, X: right to left
+                if orientation == 'SAG':
+                    mid_x = data.shape[2] // 2
+                    image_2d = data[:, :, mid_x]
+                elif orientation == 'COR':
+                    mid_y = data.shape[1] // 2
+                    image_2d = data[:, mid_y, :]
+                else: # AX or UNKNOWN
+                    mid_z = data.shape[0] // 2
+                    image_2d = data[mid_z, :, :]
+                
                 image_2d = image_2d.astype(np.float32)
             else:
                 image_2d = data if data.ndim == 2 else data[0, :, :]
@@ -214,10 +225,28 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int) -> Optional
             data = img_canonical.get_fdata()
 
             if data.ndim == 3 and is_3d:
-                mid_y = data.shape[1] // 2
-                slice_xz = data[:, mid_y, :]
-                image_2d = np.transpose(slice_xz, (1, 0))
-                image_2d = image_2d[::-1, ::-1].astype(np.float32)
+                # canonical data is (X, Y, Z)
+                # X: Left to Right, Y: Posterior to Anterior, Z: Inferior to Superior
+                if orientation == 'SAG':
+                    mid_x = data.shape[0] // 2
+                    slice_yz = data[mid_x, :, :]
+                    # Y: Posterior to Anterior -> Anterior to Posterior (flip)
+                    # Z: Inferior to Superior -> Superior to Inferior (flip)
+                    image_2d = np.transpose(slice_yz, (1, 0))[::-1, ::-1]
+                elif orientation == 'COR':
+                    mid_y = data.shape[1] // 2
+                    slice_xz = data[:, mid_y, :]
+                    # X: Left to Right -> Right to Left (flip)
+                    # Z: Inferior to Superior -> Superior to Inferior (flip)
+                    image_2d = np.transpose(slice_xz, (1, 0))[::-1, ::-1]
+                else: # AX or UNKNOWN
+                    mid_z = data.shape[2] // 2
+                    slice_xy = data[:, :, mid_z]
+                    # X: Left to Right -> Right to Left (flip)
+                    # Y: Posterior to Anterior -> Anterior to Posterior (flip)
+                    image_2d = np.transpose(slice_xy, (1, 0))[::-1, ::-1]
+                
+                image_2d = image_2d.astype(np.float32)
             else:
                 image_2d = data if data.ndim == 2 else data[:, :, 0]
                 image_2d = image_2d[::-1, :]
@@ -353,37 +382,19 @@ def _correct_image_orientation(
             rows = getattr(sample_dcm, 'Rows', None)
             cols = getattr(sample_dcm, 'Columns', None)
         
-        # 获取扫描方位
-        orientation = _get_orientation_from_dcm(sample_dcm)
-        
-        # 基于尺寸判断是否转置
+        # 对于3D图像，_load_image_2d 已经处理了正确的方向，不需要再转置
+        if is_3d:
+            return image_2d
+
+        # 基于尺寸判断是否转置（行列颠倒）
         needs_transpose = False
-        if rows and cols:
+        if rows and cols and int(rows) != int(cols):
             if h == int(cols) and w == int(rows):
                 needs_transpose = True
         
-        # 应用校正
+        # 应用校正：只需要处理行列颠倒的情况
         if needs_transpose:
             image_2d = image_2d.T
-            # 根据方位决定翻转方向
-            if orientation == 'COR':
-                # 冠状位：水平翻转（左右翻转）
-                image_2d = image_2d[:, ::-1]
-            elif orientation == 'SAG':
-                # 矢状位：垂直翻转
-                image_2d = image_2d[::-1, :]
-            elif orientation == 'AX':
-                # 轴位：垂直翻转
-                image_2d = image_2d[::-1, :]
-            else:
-                # 默认：垂直翻转保持原有行为
-                image_2d = image_2d[::-1, :]
-        else:
-            # 不需要转置时，根据方位进行必要的翻转
-            if orientation == 'COR':
-                # 冠状位可能需要水平翻转以保持标准方向
-                # 标准冠状位：左在右，右在左
-                image_2d = image_2d[:, ::-1]
         
         return image_2d
     except Exception:
@@ -490,8 +501,11 @@ def _generate_single_preview(
     Returns:
         生成的预览图路径，失败时返回None
     """
+    # 获取扫描方位
+    orientation = _get_orientation_from_dcm(sample_dcm)
+
     # 加载图像
-    image_2d = _load_image_2d(preview_file, is_3d, preview_idx)
+    image_2d = _load_image_2d(preview_file, is_3d, preview_idx, orientation)
     if image_2d is None:
         return None
     
@@ -521,8 +535,14 @@ def _generate_single_preview(
             if pixel_spacing and len(pixel_spacing) >= 2:
                 pixel_spacing = [float(pixel_spacing[0]), float(pixel_spacing[1])]
                 if is_3d:
-                    aspect_ratio = slice_spacing / max(pixel_spacing[1], 1e-6)
+                    # 因为我们总是提取与原始DICOM相同方位的切片，
+                    # 所以切片的面内像素间距总是由 PixelSpacing 决定。
+                    # 无论是 AX, COR 还是 SAG，纵横比都应该是 PixelSpacing 的比值。
+                    # DICOM PixelSpacing 是 [row_spacing, col_spacing]
+                    # 对应于图像的 [height_spacing, width_spacing]
+                    aspect_ratio = pixel_spacing[0] / max(pixel_spacing[1], 1e-6)
                 else:
+                    # 2D图像：直接使用像素间距计算
                     aspect_ratio = pixel_spacing[0] / max(pixel_spacing[1], 1e-6)
     except Exception:
         aspect_ratio = None
