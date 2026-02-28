@@ -77,24 +77,224 @@ def get_window_params(dcm) -> Tuple[Optional[float], Optional[float]]:
         return None, None
 
 
-def apply_windowing(image_2d: np.ndarray, dcm) -> np.ndarray:
+def _get_mr_sequence_type(dcm) -> str:
+    """
+    根据 DICOM 参数判断 MR 序列类型
+    
+    简化版本的序列分类，基于 TR/TE/TI 和扫描序列类型
+    
+    Args:
+        dcm: pydicom Dataset 对象
+        
+    Returns:
+        str: 序列类型 ('T1', 'T2', 'FLAIR', 'STIR', 'DWI', 'PD', 'UNKNOWN')
+    """
+    try:
+        if dcm is None:
+            return 'UNKNOWN'
+        
+        # 获取关键参数
+        tr = getattr(dcm, 'RepetitionTime', None)
+        te = getattr(dcm, 'EchoTime', None)
+        ti = getattr(dcm, 'InversionTime', None)
+        scanning_seq = str(getattr(dcm, 'ScanningSequence', '')).upper()
+        seq_variant = str(getattr(dcm, 'SequenceVariant', '')).upper()
+        protocol_name = str(getattr(dcm, 'ProtocolName', '')).lower()
+        image_type = str(getattr(dcm, 'ImageType', '')).lower()
+        
+        # 转换为数值
+        tr = float(tr) if tr is not None else None
+        te = float(te) if te is not None else None
+        ti = float(ti) if ti is not None else None
+        
+        # 1. 首先检查特殊序列（基于关键词）
+        if any(k in protocol_name for k in ['localizer', 'survey', 'scout']):
+            return 'LOCALIZER'
+        
+        if 'flair' in protocol_name or 'tse_dark_fluid' in protocol_name:
+            return 'FLAIR'
+        
+        if 'stir' in protocol_name:
+            return 'STIR'
+        
+        if any(k in protocol_name for k in ['dwi', 'diff']):
+            return 'DWI'
+        
+        if 'adc' in image_type or 'adc' in protocol_name:
+            return 'ADC'
+        
+        # 2. 基于 TI 判断反转恢复序列
+        if ti is not None:
+            if ti >= 2000:  # 典型 FLAIR 的 TI
+                return 'FLAIR'
+            elif 100 <= ti <= 250:  # 典型 STIR 的 TI
+                return 'STIR'
+        
+        # 3. 基于 TR/TE 判断 T1/T2/PD
+        if tr is not None and te is not None:
+            # T2 加权：长 TE
+            if te > 80:
+                return 'T2'
+            # T1 加权：短 TR 且短 TE
+            elif tr < 800 and te < 30:
+                return 'T1'
+            # PD 加权：长 TR 且短 TE
+            elif tr > 2000 and te < 30:
+                return 'PD'
+        
+        # 4. 基于序列名称兜底
+        if 't1' in protocol_name:
+            return 'T1'
+        elif 't2' in protocol_name:
+            return 'T2'
+        elif 'pd' in protocol_name:
+            return 'PD'
+        
+        return 'UNKNOWN'
+    except Exception:
+        return 'UNKNOWN'
+
+
+def _estimate_window_params(dcm, image_2d: np.ndarray, modality: str) -> Tuple[float, float]:
+    """
+    根据模态和 DICOM 参数估算窗宽窗位
+    
+    Args:
+        dcm: pydicom Dataset 对象
+        image_2d: 2D 图像数组
+        modality: 模态类型 (CT, MR, DX, etc.)
+        
+    Returns:
+        Tuple: (low, high) 窗位范围
+    """
+    img = image_2d[np.isfinite(image_2d)]
+    
+    if len(img) == 0:
+        return 0.0, 1.0
+    
+    modality = (modality or '').upper()
+    
+    try:
+        if modality == 'CT':
+            # CT 默认使用腹窗 (Abdomen Window)
+            # WL=40, WW=400
+            wl, ww = 40.0, 400.0
+            low = wl - ww / 2.0
+            high = wl + ww / 2.0
+            
+        elif modality == 'MR':
+            # MR 根据序列类型选择不同的窗宽窗位策略
+            seq_type = _get_mr_sequence_type(dcm)
+            
+            # 计算图像统计信息
+            img_mean = np.mean(img)
+            img_std = np.std(img)
+            img_min = np.min(img)
+            img_max = np.max(img)
+            
+            if seq_type == 'T1':
+                # T1: 使用较窄的窗宽突出解剖结构
+                # 基于均值 ± 2*标准差，但限制最小窗宽
+                ww = max(img_std * 4, img_max - img_min)
+                wl = img_mean
+            elif seq_type == 'T2':
+                # T2: 液体信号高，使用较宽的窗宽
+                ww = max(img_std * 5, img_max - img_min)
+                wl = img_mean
+            elif seq_type in ['FLAIR', 'STIR']:
+                # FLAIR/STIR: 抑制液体信号，使用中等窗宽
+                ww = max(img_std * 4, img_max - img_min)
+                wl = img_mean
+            elif seq_type == 'DWI':
+                # DWI: 扩散受限区域信号高，使用较宽窗宽
+                ww = max(img_std * 5, img_max - img_min)
+                wl = img_mean
+            elif seq_type == 'LOCALIZER':
+                # 定位像：通常范围较大
+                ww = img_max - img_min
+                wl = (img_max + img_min) / 2
+            else:
+                # 未知 MR 序列：使用自适应方法
+                # 排除极端值后计算窗宽窗位
+                p5, p95 = np.percentile(img, [5, 95])
+                ww = p95 - p5
+                wl = (p5 + p95) / 2
+            
+            low = wl - ww / 2.0
+            high = wl + ww / 2.0
+            
+        elif modality in ['DX', 'DR', 'CR', 'RF']:
+            # X-ray 数字成像
+            # 基于位深估算窗宽窗位
+            if dcm is not None:
+                bits_stored = getattr(dcm, 'BitsStored', 12)
+                # 假设有效范围是完整动态范围的一部分
+                # 对于 X-ray，通常使用较宽的窗宽
+                high = (2 ** bits_stored) - 1
+                low = 0
+            else:
+                # 基于图像实际范围
+                p1, p99 = np.percentile(img, [1, 99])
+                low = p1
+                high = p99
+                
+        elif modality == 'MG':
+            # 乳腺钼靶：高对比度需求
+            # 使用较窄的窗宽突出组织细节
+            img_mean = np.mean(img)
+            img_std = np.std(img)
+            ww = img_std * 3  # 较窄的窗宽
+            wl = img_mean
+            low = wl - ww / 2.0
+            high = wl + ww / 2.0
+            
+        else:
+            # 其他模态：使用自适应百分位数方法
+            # 使用 5%-95% 范围，比原来的 1%-99% 更稳健
+            low, high = np.percentile(img, [5, 95])
+    
+    except Exception:
+        # 回退到稳健的百分位数方法
+        try:
+            low, high = np.percentile(img, [5, 95])
+        except Exception:
+            low, high = np.min(img), np.max(img)
+    
+    # 确保窗宽有效
+    if high <= low:
+        high = low + 1.0
+    
+    return low, high
+
+
+def apply_windowing(image_2d: np.ndarray, dcm, modality: str = None) -> np.ndarray:
     """
     应用窗宽窗位变换
+    
+    优先使用 DICOM 标签中的 WindowCenter/WindowWidth，
+    如果不存在则根据模态类型估算经验值。
 
     Args:
         image_2d: 2D 图像数组
         dcm: pydicom Dataset 对象（可选）
+        modality: 模态类型（CT/MR/DX 等），用于估算默认窗宽窗位
 
     Returns:
         np.ndarray: 8位灰度图像数组
     """
     img = image_2d.astype(np.float32)
     wc, ww = get_window_params(dcm)
+    
     if wc is not None and ww is not None:
+        # 使用 DICOM 标签中的窗宽窗位
         low = wc - ww / 2.0
         high = wc + ww / 2.0
     else:
-        low, high = np.percentile(img[np.isfinite(img)], [1, 99])
+        # 根据模态估算窗宽窗位
+        # 如果未提供 modality，尝试从 DICOM 读取
+        if modality is None and dcm is not None:
+            modality = getattr(dcm, 'Modality', None)
+        low, high = _estimate_window_params(dcm, img, modality)
 
     if high <= low:
         high = low + 1.0
@@ -518,7 +718,7 @@ def _generate_single_preview(
     file_dcm = _get_file_dcm_info(preview_file, preview_idx, series_dir, sample_dcm)
     
     # 应用窗宽窗位
-    image_2d = apply_windowing(image_2d, file_dcm)
+    image_2d = apply_windowing(image_2d, file_dcm, modality)
     
     # 计算纵横比
     aspect_ratio = None

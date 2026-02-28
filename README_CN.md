@@ -238,3 +238,108 @@ arr_zxy = np.transpose(arr, (0, 2, 1))  # 现在 shape == (Z, X, Y)
    - 对 `PhotometricInterpretation` 为 `MONOCHROME1` 的图像自动反转，使输出与常见显示（MONOCHROME2）一致。
 
 上述改进提高了对下游流程的鲁棒性，并可在早期检测出可疑序列以便人工复查。
+
+---
+
+## Web 界面
+
+系统提供友好的 Web 界面用于管理 DICOM 处理任务：
+
+![Web Interface](web/static/images/fig.png)
+
+**功能特点：**
+- **单个处理**：通过检查号（Accession Number）处理单个检查
+- **批量处理**：同时处理多个检查
+- **文件上传**：上传并处理 DICOM ZIP 文件
+- **任务列表**：查看历史任务并下载已完成的结果
+- **实时进度**：实时跟踪处理进度，显示分步状态
+- **处理选项**：可配置的提取、组织和输出格式设置
+- **PACS 配置**：直接配置 DICOM 服务器设置
+
+---
+
+## 架构与工作流程
+
+### 系统架构
+
+```mermaid
+graph TD
+    A[用户] -->|Web 界面/API| B[Flask Web 服务器]
+    B --> C[DICOMDownloadClient]
+    C --> D[从 PACS 下载]
+    C --> E[整理文件]
+    C --> F[转换为 NIfTI/NPZ]
+    C --> G[提取元数据]
+    C --> H[生成预览图]
+    D --> I[DICOM 文件]
+    E --> J[整理后的序列]
+    F --> K[.nii.gz / .npz]
+    G --> L[metadata.xlsx]
+    H --> M[preview.png]
+    K --> N[结果包]
+    L --> N
+    M --> N
+    N -->|ZIP 下载| A
+```
+
+### 预览图生成工作流程
+
+预览图生成系统使用方向感知算法确保图像正确显示：
+
+```mermaid
+flowchart TD
+    A[开始：生成预览图] --> B{文件格式}
+    B -->.npz| C[加载 NPZ 数据]
+    B -->.nii| D[加载 NIfTI 数据]
+    
+    C --> E[提取 X-Z 切片]
+    D --> E
+    
+    E --> F[转置：X→水平方向，Z→垂直方向]
+    
+    F --> G[获取 DICOM 扫描方位]
+    G --> H{方位类型}
+    
+    H -->|COR| I[计算纵横比：<br/>slice_spacing / pixel_spacing[X]]
+    H -->|SAG| J[计算纵横比：<br/>slice_spacing / pixel_spacing[Y]]
+    H -->|AX| K[计算纵横比：<br/>slice_spacing / pixel_spacing[Y]]
+    
+    I --> L[应用纵横比]
+    J --> L
+    K --> L
+    
+    L --> M[应用窗宽窗位]
+    M --> N[保存预览图像]
+    N --> O[结束]
+```
+
+### 方位检测逻辑
+
+系统使用 DICOM 的 `ImageOrientationPatient` (IOP) 标签检测扫描方位：
+
+```mermaid
+flowchart TD
+    A[读取 DICOM 的 IOP] --> B[计算法向量：<br/>cross(row_vec, col_vec)]
+    B --> C{检查斜位}
+    C -->|abs(max)² < 0.9 × sum²| D[返回：OBL]
+    C -->|否| E[查找主轴]
+    
+    E -->|X 轴为主| F[返回：SAG 矢状位]
+    E -->|Y 轴为主| G[返回：COR 冠状位]
+    E -->|Z 轴为主| H[返回：AX 轴位]
+    
+    F --> I[应用方位特定的<br/>纵横比计算]
+    G --> I
+    H --> I
+    D --> I
+```
+
+### 预览图生成的关键特性
+
+1. **统一格式处理**：`.npz` 和 `.nii` 文件在加载后使用相同的处理流程
+2. **方位感知纵横比**：
+   - **COR（冠状位）**：X-Z 平面 → 纵横比 = slice_spacing / pixel_spacing[0]
+   - **SAG（矢状位）**：Y-Z 平面 → 纵横比 = slice_spacing / pixel_spacing[1]
+   - **AX（轴位）**：X-Y 平面 → 纵横比 = slice_spacing / pixel_spacing[1]
+3. **自动行列校正**：根据 DICOM 元数据检测并校正行列颠倒
+4. **窗宽窗位支持**：应用 DICOM 窗位/窗宽实现正确对比度

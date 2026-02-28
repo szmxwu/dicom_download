@@ -243,3 +243,108 @@ Earlier improvements (2026-01-17):
    - `PhotometricInterpretation` MONOCHROME1 images are auto-inverted to match display expectation (consistent with MONOCHROME2).
 
 These changes improve robustness for downstream pipelines and provide early detection of problematic series.
+
+---
+
+## Web Interface
+
+The system provides a user-friendly web interface for managing DICOM processing tasks:
+
+![Web Interface](web/static/images/fig.png)
+
+**Features:**
+- **Single Process**: Process individual studies by Accession Number
+- **Batch Process**: Process multiple studies simultaneously
+- **File Upload**: Upload and process DICOM ZIP files
+- **Task List**: View history and download completed tasks
+- **Real-time Progress**: Live progress tracking with step-by-step status
+- **Process Options**: Configurable extraction, organization, and output format settings
+- **PACS Configuration**: Direct configuration of DICOM server settings
+
+---
+
+## Architecture & Workflow
+
+### System Architecture
+
+```mermaid
+graph TD
+    A[User] -->|Web Interface/API| B[Flask Web Server]
+    B --> C[DICOMDownloadClient]
+    C --> D[Download from PACS]
+    C --> E[Organize Files]
+    C --> F[Convert to NIfTI/NPZ]
+    C --> G[Extract Metadata]
+    C --> H[Generate Preview]
+    D --> I[DICOM Files]
+    E --> J[Organized Series]
+    F --> K[.nii.gz / .npz]
+    G --> L[metadata.xlsx]
+    H --> M[preview.png]
+    K --> N[Results Package]
+    L --> N
+    M --> N
+    N -->|ZIP Download| A
+```
+
+### Preview Generation Workflow
+
+The preview generation system uses a sophisticated orientation-aware algorithm to ensure correct image display:
+
+```mermaid
+flowchart TD
+    A[Start: Generate Preview] --> B{File Format}
+    B -->|.npz| C[Load NPZ Data]
+    B -->|.nii| D[Load NIfTI Data]
+    
+    C --> E[Extract X-Z Slice]
+    D --> E
+    
+    E --> F[Transpose: X→Horizontal, Z→Vertical]
+    
+    F --> G[Get DICOM Orientation]
+    G --> H{Orientation Type}
+    
+    H -->|COR| I[Calc Aspect Ratio:<br/>slice_spacing / pixel_spacing[X]]
+    H -->|SAG| J[Calc Aspect Ratio:<br/>slice_spacing / pixel_spacing[Y]]
+    H -->|AX| K[Calc Aspect Ratio:<br/>slice_spacing / pixel_spacing[Y]]
+    
+    I --> L[Apply Aspect Ratio]
+    J --> L
+    K --> L
+    
+    L --> M[Apply Windowing]
+    M --> N[Save Preview Image]
+    N --> O[End]
+```
+
+### Orientation Detection Logic
+
+The system uses DICOM `ImageOrientationPatient` (IOP) to detect scan orientation:
+
+```mermaid
+flowchart TD
+    A[Read IOP from DICOM] --> B[Calculate Normal Vector:<br/>cross(row_vec, col_vec)]
+    B --> C{Check Oblique}
+    C -->|abs(max)² < 0.9 × sum²| D[Return: OBL]
+    C -->|No| E[Find Dominant Axis]
+    
+    E -->|X dominant| F[Return: SAG]
+    E -->|Y dominant| G[Return: COR]
+    E -->|Z dominant| H[Return: AX]
+    
+    F --> I[Apply Orientation-Specific<br/>Aspect Ratio Calculation]
+    G --> I
+    H --> I
+    D --> I
+```
+
+### Key Features of Preview Generation
+
+1. **Format-Unified Processing**: Both `.npz` and `.nii` files are processed identically after loading
+2. **Orientation-Aware Aspect Ratio**: 
+   - **COR (Coronal)**: X-Z plane → aspect = slice_spacing / pixel_spacing[0]
+   - **SAG (Sagittal)**: Y-Z plane → aspect = slice_spacing / pixel_spacing[1]  
+   - **AX (Axial)**: X-Y plane → aspect = slice_spacing / pixel_spacing[1]
+3. **Automatic Transpose Correction**: Detects and corrects row/column mismatches based on DICOM metadata
+4. **Windowing Support**: Applies DICOM window center/width for proper contrast
