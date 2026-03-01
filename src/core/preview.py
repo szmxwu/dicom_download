@@ -448,8 +448,12 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int, orientation
                 
                 image_2d = image_2d.astype(np.float32)
             else:
+                # 2D图像 (如DX X光片)
+                # NIfTI存储为 (Columns, Rows)，DICOM为 (Rows, Columns)，需要转置
+                # as_closest_canonical将X轴从L->R变为R->L，需要水平翻转
+                # Y轴方向也需要垂直翻转以匹配标准医学图像显示
                 image_2d = data if data.ndim == 2 else data[:, :, 0]
-                image_2d = image_2d[::-1, :]
+                image_2d = np.transpose(image_2d, (1, 0))[::-1, ::-1]
         else:
             return None
         

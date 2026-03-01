@@ -912,14 +912,15 @@ class DICOMDownloadClient:
         """
         return assess_converted_file_quality_impl(filepath, modality)
 
-    def _assess_series_quality_converted(self, converted_files, modality=None):
+    def _assess_series_quality_converted(self, converted_files, modality=None, series_dir=None):
         """对转换后的序列做QC，<=200全量，>200中间±3抽样
         
         Args:
             converted_files: 转换后的文件路径列表
             modality: 模态代码 (CT, MR, DX, etc.)，可选
+            series_dir: 序列目录路径，用于检测NIfTI方向错误
         """
-        return assess_series_quality_converted_impl(converted_files, modality)
+        return assess_series_quality_converted_impl(converted_files, modality, series_dir)
 
     def _get_converted_files(self, series_path):
         """获取转换后的NPZ/NIfTI文件列表，优先NPZ"""

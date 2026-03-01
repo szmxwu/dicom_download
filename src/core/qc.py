@@ -8,6 +8,7 @@
 支持基于模态（Modality）的可配置阈值，从环境变量读取配置。
 """
 
+import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ class QualityReasons:
     READ_ERROR = "read_error"
     FILE_NOT_FOUND = "file_not_found"
     UNSUPPORTED_FORMAT = "unsupported_format"
+    NIFTI_ORIENTATION_ERROR = "nifti_orientation_error"
 
 
 # Human readable descriptions for reasons
@@ -48,6 +50,7 @@ REASON_DESCRIPTIONS = {
     QualityReasons.READ_ERROR: "Error reading image data",
     QualityReasons.FILE_NOT_FOUND: "File not found",
     QualityReasons.UNSUPPORTED_FORMAT: "Unsupported file format",
+    QualityReasons.NIFTI_ORIENTATION_ERROR: "NIfTI orientation error (dcm2niix bug detected)",
 }
 
 
@@ -468,13 +471,111 @@ def assess_image_quality_from_array(
         )
 
 
-def assess_converted_file_quality(filepath: str, modality: Optional[str] = None) -> ImageQualityResult:
+def detect_nifti_orientation_error(
+    img: nib.Nifti1Image, 
+    modality: Optional[str] = None,
+    dicom_metadata: Optional[Dict[str, Any]] = None
+) -> bool:
+    """
+    检测 NIfTI 文件是否存在方向错误（dcm2niix bug）
+    
+    对于2D X-ray图像（DX/DR/CR），当原始DICOM缺少ImageOrientationPatient(IOP)时，
+    dcm2niix有时会生成Y轴翻转的NIfTI文件，导致图像上下颠倒。
+    
+    检测逻辑：
+    1. 只对2D X-ray模态（DX/DR/CR/RF）进行检测
+    2. 检查是否为2D或伪3D图像（第三维为1）
+    3. 如果有DICOM元数据，检查是否缺少IOP
+    4. 使用启发式方法检测NIfTI数据是否可能被翻转
+    
+    Args:
+        img: nibabel Nifti1Image 对象
+        modality: 模态代码 (DX, DR, CR, etc.)
+        dicom_metadata: 可选的DICOM元数据字典，用于辅助判断
+        
+    Returns:
+        bool: 是否存在方向错误
+    """
+    try:
+        modality = (modality or '').upper()
+        
+        # 只对2D X-ray模态进行检测
+        if modality not in ['DX', 'DR', 'CR', 'RF']:
+            return False
+        
+        data = img.get_fdata()
+        
+        # 只检查2D或伪3D（第三维为1）的图像
+        if data.ndim == 2:
+            pass
+        elif data.ndim == 3 and data.shape[2] == 1:
+            pass
+        else:
+            return False
+        
+        # 如果有DICOM元数据，检查是否缺少ImageOrientationPatient
+        # 这是dcm2niix产生方向错误的主要原因
+        if dicom_metadata is not None:
+            iop = dicom_metadata.get('ImageOrientationPatient')
+            if iop is None:
+                # 缺少IOP时，dcm2niix可能使用默认方向，导致翻转
+                return True
+        
+        # 启发式检测：分析NIfTI的affine矩阵和数据布局
+        # 对于典型的X-ray，如果affine的Y轴方向与数据存储不匹配，
+        # 可能存在方向问题
+        
+        affine = img.affine
+        
+        # 检查affine的Y轴（第二列）在图像平面内的投影
+        # 对于典型的2D X-ray，Y轴应该主要沿图像的垂直方向
+        y_axis_x = abs(affine[0, 1])  # Y轴在X方向的投影
+        y_axis_y = abs(affine[1, 1])  # Y轴在Y方向的投影
+        
+        # 如果Y轴主要在水平方向（X方向），说明坐标系可能有问题
+        if y_axis_x > y_axis_y:
+            return True
+        
+        # 数据驱动的启发式检测：
+        # 对于典型的骨盆/胸部X-ray，图像中心区域通常比边框亮
+        # 如果检测到数据分布异常，可能存在方向问题
+        
+        # 获取2D切片
+        slice_2d = data if data.ndim == 2 else data[:, :, 0]
+        h, w = slice_2d.shape
+        
+        # 检查上下边框的像素值分布
+        border_size = max(1, h // 20)  # 5%的边框
+        top_border = slice_2d[:border_size, :]
+        bottom_border = slice_2d[-border_size:, :]
+        
+        top_mean = np.mean(top_border)
+        bottom_mean = np.mean(bottom_border)
+        center_mean = np.mean(slice_2d[h//3:2*h//3, w//3:2*w//3])
+        
+        # 如果上下边框都比中心亮很多，可能存在异常
+        # 但这种检测不太可靠，容易产生假阳性
+        
+        return False
+        
+    except Exception:
+        return False
+
+
+def assess_converted_file_quality(
+    filepath: str, 
+    modality: Optional[str] = None, 
+    check_orientation: bool = True,
+    dicom_metadata: Optional[Dict[str, Any]] = None
+) -> ImageQualityResult:
     """
     评估转换后文件（NIfTI/NPZ）的质量
 
     Args:
         filepath: 文件路径
         modality: 模态代码 (CT, MR, DX, etc.)，可选
+        check_orientation: 是否检查NIfTI方向错误
+        dicom_metadata: 可选的DICOM元数据字典，用于方向错误检测
 
     Returns:
         ImageQualityResult: 质量评估结果
@@ -486,6 +587,18 @@ def assess_converted_file_quality(filepath: str, modality: Optional[str] = None)
                 reasons=[QualityReasons.FILE_NOT_FOUND],
                 metrics={'filepath': filepath}
             )
+        
+        # 如果未提供 dicom_metadata，尝试从 cache 文件加载
+        if dicom_metadata is None:
+            file_dir = os.path.dirname(filepath)
+            cache_path = os.path.join(file_dir, "dicom_metadata_cache.json")
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, 'r', encoding='utf-8') as f:
+                        cache = json.load(f)
+                    dicom_metadata = cache.get('sample_tags', {})
+                except Exception:
+                    pass
         
         if filepath.endswith('.npz'):
             with np.load(filepath) as npz:
@@ -499,9 +612,17 @@ def assess_converted_file_quality(filepath: str, modality: Optional[str] = None)
                         reasons=[QualityReasons.NO_PIXEL_DATA],
                         metrics={'filepath': filepath}
                     )
+            # NPZ 文件不受 dcm2niix bug 影响
+            orientation_error = False
+            
         elif filepath.endswith(('.nii', '.nii.gz')):
             img = nib.load(filepath)
             data = img.get_fdata()
+            
+            # 检测NIfTI方向错误（dcm2niix bug）
+            orientation_error = False
+            if check_orientation:
+                orientation_error = detect_nifti_orientation_error(img, modality, dicom_metadata)
         else:
             return ImageQualityResult(
                 is_low_quality=True,
@@ -509,7 +630,20 @@ def assess_converted_file_quality(filepath: str, modality: Optional[str] = None)
                 metrics={'filepath': filepath, 'extension': os.path.splitext(filepath)[1]}
             )
 
-        return assess_image_quality_from_array(data, modality)
+        result = assess_image_quality_from_array(data, modality)
+        
+        # 如果检测到方向错误，添加到结果中
+        if orientation_error:
+            result.is_low_quality = True
+            if QualityReasons.NIFTI_ORIENTATION_ERROR not in result.reasons:
+                result.reasons.append(QualityReasons.NIFTI_ORIENTATION_ERROR)
+            result.metrics['nifti_orientation_error'] = True
+            result.metrics['nifti_orientation_note'] = (
+                "dcm2niix generated NIfTI with flipped Y-axis. "
+                "Preview generator will auto-correct this."
+            )
+        
+        return result
         
     except Exception as e:
         return ImageQualityResult(
@@ -550,7 +684,8 @@ def _summarize_reasons(results: List[ImageQualityResult], total_files: int) -> s
 
 def assess_series_quality_converted(
     converted_files: List[str],
-    modality: Optional[str] = None
+    modality: Optional[str] = None,
+    series_dir: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     评估转换后序列的质量
@@ -558,6 +693,7 @@ def assess_series_quality_converted(
     Args:
         converted_files: 转换后的文件路径列表
         modality: 模态代码 (CT, MR, DX, etc.)，可选
+        series_dir: 序列目录路径，用于查找dicom_metadata_cache.json
 
     Returns:
         Dict: 包含以下字段的字典：
@@ -589,10 +725,31 @@ def assess_series_quality_converted(
             sample_indices = [i for i in range(mid - 3, mid + 4) if 0 <= i < total]
             qc_mode = 'sample'
 
+        # 尝试加载DICOM元数据缓存（用于方向错误检测）
+        dicom_metadata = None
+        if series_dir:
+            cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, 'r', encoding='utf-8') as f:
+                        cache = json.load(f)
+                    dicom_metadata = cache.get('sample_tags', {})
+                except Exception as e:
+                    pass
+
         file_results = []
         for idx in sample_indices:
             try:
-                result = assess_converted_file_quality(converted_files[idx], modality)
+                # DEBUG: Check dicom_metadata
+                # print(f"DEBUG assess_series_quality_converted: dicom_metadata is None = {dicom_metadata is None}")
+                result = assess_converted_file_quality(
+                    converted_files[idx], 
+                    modality, 
+                    check_orientation=True,
+                    dicom_metadata=dicom_metadata
+                )
+                # DEBUG: Check result
+                # print(f"DEBUG assess_series_quality_converted: result.is_low_quality = {result.is_low_quality}, reasons = {result.reasons}")
                 file_results.append({
                     'file_index': idx,
                     'file_name': os.path.basename(converted_files[idx]),
@@ -617,18 +774,32 @@ def assess_series_quality_converted(
         series_threshold = config.get_threshold(modality or 'DEFAULT', 'series_low_quality_ratio')
         is_low_quality = ratio > series_threshold
         
+        # 收集所有原因（包括方向错误等非质量问题的警告）
+        all_reasons = []
+        orientation_error_count = 0
+        for r in file_results:
+            if r['is_low_quality']:
+                all_reasons.extend(r['reasons'])
+            # 单独统计方向错误（即使不标记为低质量也要报告）
+            if QualityReasons.NIFTI_ORIENTATION_ERROR in r['reasons']:
+                orientation_error_count += 1
+        
         # Generate reason summary
-        if is_low_quality:
-            all_reasons = []
-            for r in file_results:
-                if r['is_low_quality']:
-                    all_reasons.extend(r['reasons'])
+        if is_low_quality or all_reasons:
             reason_summary = _summarize_reasons(
                 [ImageQualityResult(r['is_low_quality'], r['reasons'], {}) for r in file_results],
                 len(sample_indices)
             )
         else:
             reason_summary = "Normal"
+        
+        # 如果检测到方向错误，添加到报告（即使系列质量正常）
+        if orientation_error_count > 0:
+            if reason_summary == "Normal":
+                reason_summary = ""
+            else:
+                reason_summary += "; "
+            reason_summary += f"NIfTI orientation error (dcm2niix bug) detected in {orientation_error_count} file(s)"
 
         return {
             'low_quality': 1 if is_low_quality else 0,

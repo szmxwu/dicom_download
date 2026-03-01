@@ -55,7 +55,8 @@ def _build_conversion_entry(output_file: str, dcm: FileDataset, file_index: Opti
 
     for attr in [
         'Rows', 'Columns', 'SOPInstanceUID', 'InstanceNumber',
-        'PhotometricInterpretation', 'ImageLaterality'
+        'PhotometricInterpretation', 'ImageLaterality',
+        'WindowCenter', 'WindowWidth', 'RescaleSlope', 'RescaleIntercept'
     ]:
         try:
             value = getattr(dcm, attr, None)
@@ -349,6 +350,7 @@ def convert_dicom_to_nifti(
                 series_name,
                 nifti_result.get('output_files') or nifti_result.get('output_file')
             )
+            print("   ✅ dcm2niix conversion succeeded.")
             client._generate_series_preview(series_dir, series_name, nifti_result, sample_dcm, modality)
             cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
             if not os.path.exists(cache_path) and sample_dcm is not None:
@@ -468,7 +470,9 @@ def convert_to_npz(
                 os.remove(nii_path)
 
         qc_summary = client._assess_series_quality_converted(
-            [os.path.join(series_dir, f) for f in output_files]
+            [os.path.join(series_dir, f) for f in output_files],
+            modality=modality,
+            series_dir=series_dir
         )
         print(
             f"   🧪 QC({qc_summary['qc_mode']}): "

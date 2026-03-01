@@ -78,7 +78,7 @@ def extract_dicom_metadata(
     get_keywords: Callable[[str], List[str]],
     get_converted_files: Callable[[str], Tuple[List[str], Optional[str]]],
     assess_converted_file_quality: Callable[[str, Optional[str]], Union[ImageQualityResult, int]],
-    assess_series_quality_converted: Callable[[List[str], Optional[str]], Dict],
+    assess_series_quality_converted: Callable[[List[str], Optional[str], Optional[str]], Dict],
     append_mr_cleaned_sheet: Callable[[pd.DataFrame, str], None],
 ) -> Optional[str]:
     """
@@ -94,7 +94,7 @@ def extract_dicom_metadata(
         get_keywords: 回调函数，接收模态字符串（如 'CT', 'MR'），返回要提取的 DICOM 关键字列表
         get_converted_files: 回调函数，接收序列路径，返回 (转换文件列表, 附加信息) 元组
         assess_converted_file_quality: 回调函数，接收(文件路径, 模态)，返回质量评分（0=正常，1=低质量）或 ImageQualityResult
-        assess_series_quality_converted: 回调函数，接收(文件路径列表, 模态)，返回质量汇总字典（包含 low_quality_reason）
+        assess_series_quality_converted: 回调函数，接收(文件路径列表, 模态, 序列目录)，返回质量汇总字典（包含 low_quality_reason）
         append_mr_cleaned_sheet: 回调函数，接收 DataFrame 和 Excel 路径，用于添加 MR 清洗结果
 
     返回:
@@ -170,7 +170,7 @@ def extract_dicom_metadata(
                                 record['FileName'] = _build_converted_filename(accession_number, converted_files[idx])
                             all_metadata.append(record)
                     else:
-                        series_quality_result = assess_series_quality_converted(converted_files, cached_modality)
+                        series_quality_result = assess_series_quality_converted(converted_files, cached_modality, series_path)
                         series_quality = series_quality_result.get('low_quality', 1)
                         series_quality_reason = series_quality_result.get('low_quality_reason', '')
                         if cached_records:
@@ -276,7 +276,7 @@ def extract_dicom_metadata(
                             metadata[keyword] = ""
                     except Exception:
                         metadata[keyword] = ""
-                series_quality_result = assess_series_quality_converted(converted_files, modality)
+                series_quality_result = assess_series_quality_converted(converted_files, modality, series_path)
                 metadata['Low_quality'] = series_quality_result.get('low_quality', 1)
                 metadata['Low_quality_reason'] = series_quality_result.get('low_quality_reason', '')
                 # Update SampleFileName to first converted filename for 3D series
