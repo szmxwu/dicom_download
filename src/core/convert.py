@@ -27,7 +27,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import nibabel as nib
 import numpy as np
@@ -154,6 +154,8 @@ def build_affine_from_dicom(
     使用 ImageOrientationPatient、ImagePositionPatient 和 PixelSpacing
     构建从体素坐标到世界坐标的 4×4 变换矩阵。将 LPS（左-后-上）坐标系
     转换为 RAS（右-前-上）坐标系。
+    
+    当缺少 IOP/IPP 时，对于 2D 图像使用 _build_2d_xray_affine 作为回退方案。
 
     参数:
         dcm: pydicom Dataset 对象，包含方向、位置和像素间距信息
@@ -167,9 +169,16 @@ def build_affine_from_dicom(
         iop = getattr(dcm, 'ImageOrientationPatient', None)
         ipp = getattr(dcm, 'ImagePositionPatient', None)
         pixel_spacing = getattr(dcm, 'PixelSpacing', [1.0, 1.0])
+        
         if iop is None or ipp is None:
-            logger.warning("Missing ImageOrientationPatient or ImagePositionPatient in DICOM, using identity affine")
-            raise ValueError("Missing orientation/position")
+            logger.warning("Missing ImageOrientationPatient or ImagePositionPatient in DICOM, using 2D fallback")
+            # 对于缺少 IOP/IPP 的 2D 图像，使用专门的 2D X-ray 仿射矩阵
+            modality = getattr(dcm, 'Modality', '')
+            if modality in ['DR', 'MG', 'DX', 'CR', 'US', 'XA', 'RF']:
+                return _build_2d_xray_affine(dcm)
+            else:
+                # 对于 3D 图像，仍使用单位矩阵作为最后的回退
+                return np.eye(4, dtype=np.float64)
 
         row_cosine = np.array([float(i) for i in iop[:3]], dtype=np.float64)
         col_cosine = np.array([float(i) for i in iop[3:6]], dtype=np.float64)
@@ -180,86 +189,94 @@ def build_affine_from_dicom(
         col_spacing = float(pixel_spacing[1])
 
         affine_lps = np.eye(4, dtype=np.float64)
-        affine_lps[:3, 0] = row_cosine * row_spacing
-        affine_lps[:3, 1] = col_cosine * col_spacing
+        # DICOM pixel_array is (Rows, Columns) stacked as (Rows, Columns, Slices)
+        # dim 0 = Rows (vertical, top to bottom) = -Y in patient coordinates (since row 0 is top)
+        # dim 1 = Columns (horizontal, left to right) = X in patient coordinates
+        # So: X axis = column direction, Y axis = -row direction
+        affine_lps[:3, 0] = col_cosine * col_spacing  # x-axis = column direction
+        affine_lps[:3, 1] = -row_cosine * row_spacing  # y-axis = negative row direction (flip vertical)
         affine_lps[:3, 2] = slice_cosines * float(slice_spacing)
         affine_lps[:3, 3] = np.array([float(i) for i in ipp], dtype=np.float64)
 
         lps_to_ras = np.diag([-1.0, -1.0, 1.0, 1.0])
         affine_ras = lps_to_ras @ affine_lps
         return affine_ras
-    except Exception:
-        logger.warning("Missing ImageOrientationPatient or ImagePositionPatient in DICOM, using identity affine")
+    except Exception as e:
+        logger.warning("Failed to build affine from DICOM: %s, using fallback", e)
+        # 尝试使用 2D 回退方案
+        modality = getattr(dcm, 'Modality', '')
+        if modality in ['DR', 'MG', 'DX', 'CR', 'US', 'XA', 'RF']:
+            return _build_2d_xray_affine(dcm)
         return np.eye(4, dtype=np.float64)
 
 
-def _get_pixel_spacing_2d(dcm: FileDataset) -> Tuple[float, float]:
-    pixel_spacing = getattr(dcm, 'PixelSpacing', None)
-    if not pixel_spacing:
-        pixel_spacing = getattr(dcm, 'ImagerPixelSpacing', None)
+def _build_decomposable_affine(img: Any) -> np.ndarray:
+    """
+    为不可分解 affine 构建一个可分解的回退 affine。
+
+    该矩阵仅保留体素尺寸、主方向符号与平移分量，以确保
+    nib.as_closest_canonical 能够进行方向变换。
+    """
+    affine = np.array(getattr(img, 'affine', np.eye(4)), dtype=np.float64)
+    if affine.shape != (4, 4):
+        affine = np.eye(4, dtype=np.float64)
+
+    fallback = np.eye(4, dtype=np.float64)
+
     try:
-        row_spacing = float(pixel_spacing[0])
-        col_spacing = float(pixel_spacing[1])
-        return row_spacing, col_spacing
+        zooms = tuple(float(v) for v in img.header.get_zooms()[:3])
     except Exception:
-        return 1.0, 1.0
+        zooms = (1.0, 1.0, 1.0)
+
+    for axis in range(3):
+        col = affine[:3, axis]
+        norm = float(np.linalg.norm(col))
+
+        voxel_size = zooms[axis] if axis < len(zooms) else 1.0
+        if not np.isfinite(voxel_size) or voxel_size <= 0:
+            voxel_size = norm if (np.isfinite(norm) and norm > 0) else 1.0
+
+        sign = 1.0
+        if np.all(np.isfinite(col)) and norm > 0:
+            dominant = float(col[int(np.argmax(np.abs(col)))])
+            sign = -1.0 if dominant < 0 else 1.0
+
+        fallback[axis, axis] = sign * float(voxel_size)
+
+    translation = affine[:3, 3]
+    if np.all(np.isfinite(translation)):
+        fallback[:3, 3] = translation
+
+    return fallback
 
 
-def _orientation_to_ras_vector(code: str) -> Optional[np.ndarray]:
-    mapping = {
-        'R': np.array([1.0, 0.0, 0.0], dtype=np.float64),
-        'L': np.array([-1.0, 0.0, 0.0], dtype=np.float64),
-        'A': np.array([0.0, 1.0, 0.0], dtype=np.float64),
-        'P': np.array([0.0, -1.0, 0.0], dtype=np.float64),
-        'H': np.array([0.0, 0.0, 1.0], dtype=np.float64),
-        'F': np.array([0.0, 0.0, -1.0], dtype=np.float64)
-    }
-    return mapping.get(code)
+def _safe_as_closest_canonical(img: Any) -> Any:
+    """
+    安全执行 canonical 方向转换。
 
+    若原始 affine 不可分解导致 as_closest_canonical 失败，则重建可分解 affine 后重试。
+    """
+    try:
+        return nib.as_closest_canonical(img)
+    except Exception as first_error:
+        logger.warning(
+            "as_closest_canonical failed, retrying with decomposable affine: %s",
+            first_error
+        )
 
-def _build_affine_for_2d_projection(dcm: FileDataset, slice_spacing: float = 1.0) -> np.ndarray:
-    iop = getattr(dcm, 'ImageOrientationPatient', None)
-    ipp = getattr(dcm, 'ImagePositionPatient', None)
-    row_spacing, col_spacing = _get_pixel_spacing_2d(dcm)
+    repaired_affine = _build_decomposable_affine(img)
+    repaired_img = nib.Nifti1Image(np.asanyarray(img.dataobj), repaired_affine, header=img.header.copy())
+    repaired_img.set_qform(repaired_affine, code=1)
+    repaired_img.set_sform(repaired_affine, code=1)
 
-    row_cosine = None
-    col_cosine = None
-
-    if iop is not None:
-        try:
-            row_cosine = np.array([float(i) for i in iop[:3]], dtype=np.float64)
-            col_cosine = np.array([float(i) for i in iop[3:6]], dtype=np.float64)
-        except Exception:
-            row_cosine = None
-            col_cosine = None
-
-    if row_cosine is None or col_cosine is None:
-        orientation = getattr(dcm, 'PatientOrientation', None)
-        if isinstance(orientation, (list, tuple)) and len(orientation) >= 2:
-            row_cosine = _orientation_to_ras_vector(str(orientation[0]))
-            col_cosine = _orientation_to_ras_vector(str(orientation[1]))
-
-    if row_cosine is None or col_cosine is None:
-        row_cosine = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        col_cosine = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-
-    slice_cosines = np.cross(row_cosine, col_cosine)
-    if np.linalg.norm(slice_cosines) < 1e-6:
-        slice_cosines = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-
-    origin = np.zeros(3, dtype=np.float64)
-    if ipp is not None:
-        try:
-            origin = np.array([float(i) for i in ipp], dtype=np.float64)
-        except Exception:
-            origin = np.zeros(3, dtype=np.float64)
-
-    affine_ras = np.eye(4, dtype=np.float64)
-    affine_ras[:3, 0] = row_cosine * row_spacing
-    affine_ras[:3, 1] = col_cosine * col_spacing
-    affine_ras[:3, 2] = slice_cosines * float(slice_spacing)
-    affine_ras[:3, 3] = origin
-    return affine_ras
+    try:
+        return nib.as_closest_canonical(repaired_img)
+    except Exception as second_error:
+        logger.warning(
+            "canonical retry failed after affine repair, using repaired image directly: %s",
+            second_error
+        )
+        return repaired_img
 
 
 def normalize_and_save_npz(nii_path: str, npz_path: str) -> None:
@@ -277,19 +294,24 @@ def normalize_and_save_npz(nii_path: str, npz_path: str) -> None:
     # 加载 NIfTI 文件，返回一个 Nifti1Image 对象（包含数据和头信息）
     img = nib.load(nii_path)
     # 将图像转换为最接近的标准方向（canonical），以统一轴向（通常为 RAS）
-    img_canonical = nib.as_closest_canonical(img)
+    # 对于 affine 不可分解的文件，先重建可分解 affine 再重试。
+    img_canonical = _safe_as_closest_canonical(img)
     # 从 Nifti 对象中获取数据数组（通常为 float64），形状如 (X, Y, Z[, T])
     data = img_canonical.get_fdata()
+
+    if data.ndim < 3:
+        raise ValueError(f"NIfTI data must be at least 3D, got shape={data.shape}")
 
     # 对数据在每个轴上做反转。具体含义：
     # - 第一个索引 `[::-1]` 代表在第 0 轴（X）上反转
     # - 第二个索引 `[::-1]` 代表在第 1 轴（Y）上反转
     # - 第三个索引 `[::-1]` 代表在第 2 轴（Z）上反转
     # 这样做通常用于将 NIfTI 的内部存储方向调整为期望的显示/处理方向
-    data = data[::-1, ::-1, ::-1]
-    # 重新排列轴顺序：把数据从 (X, Y, Z) 变为 (Z, Y, X)
-    # 这样第一维表示切片索引（slice），第二维为行，第三维为列，便于按切片处理或与其他工具兼容
-    data = np.transpose(data, (2, 1, 0))
+    data = np.flip(data, axis=(0, 1, 2))
+    # 重新排列轴顺序：把空间维从 (X, Y, Z) 变为 (Z, Y, X)，
+    # 若存在第 4 维（如多参数/时间维），则保持在后续维度不变。
+    transpose_axes = [2, 1, 0] + list(range(3, data.ndim))
+    data = np.transpose(data, transpose_axes)
 
     # 将数据转换为 float32（节省空间）并以压缩的 npz 格式写入磁盘
     np.savez_compressed(npz_path, data=data.astype(np.float32))
@@ -788,6 +810,100 @@ def convert_with_dcm2niix(
         return {'success': False, 'error': str(e)}
 
 
+def _build_2d_xray_affine(dcm: FileDataset) -> np.ndarray:
+    """
+    为 2D X-ray 图像构建正确的 RAS 仿射矩阵。
+    
+    关键：当 DICOM 缺少 ImageOrientationPatient 时，避免使用 as_closest_canonical
+    导致的 Y 轴翻转问题。直接构建标准 RAS 方向的仿射矩阵。
+    
+    RAS 坐标系定义：
+    - X: 右 (Right) = 患者右侧
+    - Y: 前 (Anterior) = 患者前方
+    - Z: 上 (Superior) = 患者头部
+    
+    对于 2D X-ray (仰卧位，AP/PA 视图)：
+    - 图像行方向 (i) 对应患者左右方向 (R/L)
+    - 图像列方向 (j) 对应患者头脚方向 (S/I) 或前后方向 (A/P)
+    - 标准视图：X 轴从左到右，Y 轴从上到下
+    
+    参数:
+        dcm: pydicom Dataset 对象
+        
+    返回:
+        4x4 仿射变换矩阵（RAS 坐标系）
+    """
+    # 获取像素间距
+    pixel_spacing = getattr(dcm, 'PixelSpacing', None)
+    if not pixel_spacing:
+        pixel_spacing = getattr(dcm, 'ImagerPixelSpacing', [1.0, 1.0])
+    row_spacing = float(pixel_spacing[0])  # 行间距离 (垂直方向)
+    col_spacing = float(pixel_spacing[1])  # 列间距离 (水平方向)
+    
+    rows = int(getattr(dcm, 'Rows', 1))
+    cols = int(getattr(dcm, 'Columns', 1))
+    
+    # 尝试从 IOP 获取方向
+    iop = getattr(dcm, 'ImageOrientationPatient', None)
+    
+    if iop is not None:
+        # 有 IOP 的情况：使用 IOP 构建仿射矩阵
+        try:
+            row_cosine = np.array([float(i) for i in iop[:3]], dtype=np.float64)
+            col_cosine = np.array([float(i) for i in iop[3:6]], dtype=np.float64)
+            slice_cosine = np.cross(row_cosine, col_cosine)
+            
+            # 获取图像位置
+            ipp = getattr(dcm, 'ImagePositionPatient', None)
+            if ipp is not None:
+                origin = np.array([float(i) for i in ipp], dtype=np.float64)
+            else:
+                origin = np.zeros(3, dtype=np.float64)
+            
+            # 构建 LPS 仿射矩阵
+            affine_lps = np.eye(4, dtype=np.float64)
+            affine_lps[:3, 0] = row_cosine * row_spacing
+            affine_lps[:3, 1] = col_cosine * col_spacing
+            affine_lps[:3, 2] = slice_cosine
+            affine_lps[:3, 3] = origin
+            
+            # 转换为 RAS: LPS_to_RAS = diag(-1, -1, 1, 1)
+            lps_to_ras = np.diag([-1.0, -1.0, 1.0, 1.0])
+            affine_ras = lps_to_ras @ affine_lps
+            
+            return affine_ras
+        except Exception:
+            pass  # 回退到默认方向
+    
+    # 缺少 IOP 的情况：构建标准 2D X-ray 方向矩阵
+    # 对于标准 AP/PA X-ray 视图：
+    # - 图像第1维 (行, i): 从上到下 -> Y轴从后向前 (患者仰卧)
+    # - 图像第2维 (列, j): 从左到右 -> X轴从左到右
+    
+    # 标准 2D X-ray 方向（仰卧位）：
+    # 行方向 (向下): 从患者头部到脚部 -> Y轴方向 (从后到前)
+    # 列方向 (向右): 从患者左侧到右侧 -> X轴方向 (从左到右)
+    
+    # 注意：不使用 as_closest_canonical 以避免 Y 轴翻转
+    # 直接构建 RAS 坐标系的仿射矩阵
+    affine = np.eye(4, dtype=np.float64)
+    
+    # 第1维 (行): Y轴 (Anterior方向) - 注意：图像行向下 = Y轴向前
+    affine[:3, 0] = [0.0, row_spacing, 0.0]  # 行方向映射到 Y 轴
+    
+    # 第2维 (列): X轴 (Right方向) - 图像列向右 = X轴向右
+    affine[:3, 1] = [col_spacing, 0.0, 0.0]  # 列方向映射到 X 轴
+    
+    # 第3维 (切片): Z轴 (Superior方向)
+    affine[:3, 2] = [0.0, 0.0, 1.0]
+    
+    # 原点设置为左上角 (RAS 坐标)
+    # 左上角在患者坐标系中的位置：左-后-上
+    affine[:3, 3] = [0.0, 0.0, 0.0]
+    
+    return affine
+
+
 def convert_with_python_libs(
     client: "DicomClient",
     series_dir: str,
@@ -798,6 +914,10 @@ def convert_with_python_libs(
 
     当 dcm2niix 不可用时作为回退方案。支持单文件和多文件序列转换，
     自动处理切片排序、像素值重缩放和光度解释。
+    
+    特殊处理：
+    - 2D X-ray (DX/DR/CR/MG)：正确处理缺少 ImageOrientationPatient 的情况，
+      避免使用 as_closest_canonical 导致的 Y 轴翻转问题。
 
     参数:
         client: DICOM 客户端实例
@@ -828,7 +948,7 @@ def convert_with_python_libs(
         modality = getattr(first_dcm, 'Modality', '')
 
         if modality in ['DR', 'MG', 'DX', 'CR']:
-            logger.info("Detected %s modality; converting each DICOM file to NIfTI", modality)
+            logger.info("Detected %s modality; converting each DICOM file to NIfTI (Python libs)", modality)
 
             success_count = 0
             output_files: List[str] = []
@@ -839,28 +959,32 @@ def convert_with_python_libs(
                     dcm = pydicom.dcmread(dcm_file, force=True)
 
                     if not hasattr(dcm, 'pixel_array'):
-                        logger.warning("File %d has no pixel data", idx + 1)
+                        logger.warning("File %d has no pixel data: %s", idx + 1, os.path.basename(dcm_file))
                         continue
 
+                    # 获取像素数据并应用重缩放和光度解释
                     pixel_data = dcm.pixel_array
                     pixel_data = apply_rescale(pixel_data, dcm)
                     pixel_data = apply_photometric(pixel_data, dcm)
 
-                    slice_thickness = float(getattr(dcm, 'SliceThickness', 1.0))
-                    iop = getattr(dcm, 'ImageOrientationPatient', None)
-                    ipp = getattr(dcm, 'ImagePositionPatient', None)
-                    if iop is not None and ipp is not None:
-                        affine = build_affine_from_dicom(dcm, slice_spacing=slice_thickness)
-                    else:
-                        affine = _build_affine_for_2d_projection(dcm, slice_spacing=slice_thickness)
-
+                    # 确保数据为 3D (添加单切片维度)
                     if len(pixel_data.shape) == 2:
                         pixel_data = pixel_data[:, :, np.newaxis]
 
-                    # 确保数据为 float32，创建 NIfTI 时指定 dtype
+                    # 为 2D X-ray 构建正确的仿射矩阵
+                    # 关键：不使用 as_closest_canonical 以避免方向问题
+                    affine = _build_2d_xray_affine(dcm)
+
+                    # 创建 NIfTI 图像
                     nifti_img = nib.Nifti1Image(pixel_data.astype(np.float32), affine)
-                    # 将图像转换为最接近的 canonical 方向后再保存，保证方向一致性
-                    nifti_img = nib.as_closest_canonical(nifti_img)
+                    
+                    # 注意：对于缺少 IOP 的 2D X-ray，不使用 as_closest_canonical
+                    # 因为这会导致 Y 轴翻转，与 dcm2niix 的问题相同
+                    iop = getattr(dcm, 'ImageOrientationPatient', None)
+                    if iop is not None:
+                        # 有 IOP 时，可以使用 canonical 转换
+                        nifti_img = nib.as_closest_canonical(nifti_img)
+                    # 否则：保持原方向，_build_2d_xray_affine 已经构建了正确的 RAS 矩阵
 
                     output_filename = f"{client._sanitize_folder_name(series_name)}_{idx+1:04d}.nii.gz"
                     output_path = os.path.join(series_dir, output_filename)
@@ -869,6 +993,7 @@ def convert_with_python_libs(
                     output_files.append(output_filename)
                     success_count += 1
 
+                    # 记录转换信息
                     try:
                         entry = _build_conversion_entry(
                             output_filename,
@@ -877,19 +1002,21 @@ def convert_with_python_libs(
                             source_file=os.path.basename(dcm_file)
                         )
                         conversion_entries.append(entry)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to build conversion entry for file %d: %s", idx + 1, e)
 
                     if (idx + 1) % 10 == 0:
                         logger.info("Converted %d/%d files...", idx + 1, len(dicom_files))
 
                 except Exception as e:
-                    logger.warning("Failed converting file %d: %s", idx + 1, e)
+                    logger.warning("Failed converting file %d (%s): %s", idx + 1, os.path.basename(dcm_file), e)
                     continue
 
             if success_count > 0:
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
                 _write_conversion_map(series_dir, conversion_entries)
+                
+                # 清理原始 DICOM 文件
                 for dcm_file in dicom_files:
                     try:
                         os.remove(dcm_file)
@@ -918,12 +1045,22 @@ def convert_with_python_libs(
             pixel_data = dcm.pixel_array
             pixel_data = apply_rescale(pixel_data, dcm)
             pixel_data = apply_photometric(pixel_data, dcm)
+            
+            # 确保数据为 3D（添加单切片维度如果需要）
+            if len(pixel_data.shape) == 2:
+                pixel_data = pixel_data[:, :, np.newaxis]
 
             slice_thickness = float(getattr(dcm, 'SliceThickness', 1.0))
             affine = build_affine_from_dicom(dcm, slice_spacing=slice_thickness)
 
             nifti_img = nib.Nifti1Image(pixel_data.astype(np.float32), affine)
-            nifti_img = nib.as_closest_canonical(nifti_img)
+            
+            # 对于缺少 IOP 的 2D 图像，不使用 as_closest_canonical 以避免方向问题
+            iop = getattr(dcm, 'ImageOrientationPatient', None)
+            if iop is not None:
+                nifti_img = nib.as_closest_canonical(nifti_img)
+            # 否则：保持原方向，build_affine_from_dicom 已经构建了正确的矩阵
+            
             output_filename = f"{client._sanitize_folder_name(series_name)}.nii.gz"
             output_path = os.path.join(series_dir, output_filename)
             nib.save(nifti_img, output_path)
@@ -980,6 +1117,8 @@ def convert_with_python_libs(
         if not slices:
             return {'success': False, 'error': 'No pixel data found'}
 
+        # DICOM pixel_array is (Rows, Columns)
+        # Stack directly: dim 0 = Rows (vertical), dim 1 = Columns (horizontal), dim 2 = Slices
         volume = np.stack(slices, axis=2)
 
         if len(positions) > 1:
@@ -1000,7 +1139,12 @@ def convert_with_python_libs(
         affine = build_affine_from_dicom(first_dcm, slice_spacing=slice_spacing, slice_cosines=slice_cosines)
 
         nifti_img = nib.Nifti1Image(volume.astype(np.float32), affine)
-        nifti_img = nib.as_closest_canonical(nifti_img)
+        
+        # 对于缺少 IOP 的序列，不使用 as_closest_canonical 以避免方向问题
+        if iop is not None:
+            nifti_img = nib.as_closest_canonical(nifti_img)
+        # 否则：保持原方向，build_affine_from_dicom 已经处理了回退方案
+        
         output_filename = f"{client._sanitize_folder_name(series_name)}.nii.gz"
         output_path = os.path.join(series_dir, output_filename)
         nib.save(nifti_img, output_path)

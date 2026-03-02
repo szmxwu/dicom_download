@@ -17,6 +17,10 @@ from src.core.qc import (
     get_qc_config,
     reset_qc_config,
 )
+from src.core.fix_nifti import (
+    fix_nifti_file,
+    NiftiFixResult,
+)
 from src.core.preview import generate_series_preview
 from src.core.mr_clean import process_mri_dataframe
 
@@ -32,6 +36,8 @@ __all__ = [
     "QCConfig",
     "get_qc_config",
     "reset_qc_config",
+    "fix_nifti_file",
+    "NiftiFixResult",
     "generate_series_preview",
     "process_mri_dataframe",
 ]

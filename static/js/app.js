@@ -1304,6 +1304,11 @@ class DICOMProcessor {
         resultCard.style.display = 'block';
         resultCard.classList.add('fade-in');
         
+        // 如果是批量处理结果，初始化质量分布图表
+        if (this.currentTask.type === 'batch' && window.Chart) {
+            setTimeout(() => this.initBatchReportChart(), 100);
+        }
+        
         // 滚动到结果卡片
         resultCard.scrollIntoView({ 
             behavior: 'smooth', 
@@ -1380,39 +1385,168 @@ class DICOMProcessor {
 
     // 渲染批量处理结果
     renderBatchResult(result) {
+        const total = (result.total_processed || 0) + (result.total_failed || 0);
+        const successRate = total > 0 ? ((result.total_processed || 0) / total * 100).toFixed(1) : 0;
+        const duration = result.duration || 0;
+        const minutes = Math.floor(duration / 60);
+        const seconds = Math.floor(duration % 60);
+        const durationStr = minutes > 0 ? `${minutes}分${seconds}秒` : `${seconds}秒`;
+        
+        // 质量分布数据
+        const qualityDist = result.quality_distribution || { normal: 0, low_quality: 0, fixed: 0, unknown: 0 };
+        const totalQuality = qualityDist.normal + qualityDist.low_quality + qualityDist.fixed + qualityDist.unknown;
+        
+        // 生成唯一的canvas ID
+        const chartId = `qualityChart_${this.currentTask ? this.currentTask.id : Date.now()}`;
+        
+        // 存储质量数据用于后续图表初始化
+        this._batchQualityData = qualityDist;
+        this._batchChartId = chartId;
+        
         return `
-            <div class="row">
-                <div class="col-md-4">
-                    <div class="result-stat">
-                        <div class="number text-success">${result.total_processed || 0}</div>
-                        <div class="label">成功处理</div>
+            <div class="batch-report" id="batchReport_${chartId}">
+                <!-- 统计概览 -->
+                <div class="row mb-4">
+                    <div class="col-12">
+                        <h6 class="text-primary mb-3"><i class="fas fa-chart-bar"></i> 处理统计概览</h6>
+                    </div>
+                    <div class="col-6 col-md-3 mb-2">
+                        <div class="result-stat">
+                            <div class="number text-success">${result.total_processed || 0}</div>
+                            <div class="label">成功研究</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3 mb-2">
+                        <div class="result-stat">
+                            <div class="number text-danger">${result.total_failed || 0}</div>
+                            <div class="label">失败研究</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3 mb-2">
+                        <div class="result-stat">
+                            <div class="number text-info">${result.total_series || 0}</div>
+                            <div class="label">总序列数</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3 mb-2">
+                        <div class="result-stat">
+                            <div class="number text-primary">${result.total_images || 0}</div>
+                            <div class="label">总图像数</div>
+                        </div>
                     </div>
                 </div>
-                <div class="col-md-4">
-                    <div class="result-stat">
-                        <div class="number text-danger">${result.total_failed || 0}</div>
-                        <div class="label">处理失败</div>
+                
+                <!-- 时间和速度 -->
+                <div class="row mb-4">
+                    <div class="col-12">
+                        <div class="card bg-light">
+                            <div class="card-body py-2">
+                                <div class="row text-center">
+                                    <div class="col-4">
+                                        <small class="text-muted">处理时长</small>
+                                        <div class="fw-bold">${durationStr}</div>
+                                    </div>
+                                    <div class="col-4">
+                                        <small class="text-muted">成功率</small>
+                                        <div class="fw-bold text-${successRate >= 90 ? 'success' : successRate >= 70 ? 'warning' : 'danger'}">${successRate}%</div>
+                                    </div>
+                                    <div class="col-4">
+                                        <small class="text-muted">平均速度</small>
+                                        <div class="fw-bold">${result.avg_speed ? result.avg_speed.toFixed(1) : 0} 张/秒</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
-                <div class="col-md-4">
-                    <div class="result-stat">
-                        <div class="number">${(result.total_processed || 0) + (result.total_failed || 0)}</div>
-                        <div class="label">总数</div>
+                
+                <!-- 质量分布图表 -->
+                ${totalQuality > 0 ? `
+                <div class="row mb-4">
+                    <div class="col-md-6">
+                        <h6 class="text-primary mb-3"><i class="fas fa-chart-pie"></i> 质量分布</h6>
+                        <div style="max-width: 250px; margin: 0 auto;">
+                            <canvas id="${chartId}" data-quality='${JSON.stringify(qualityDist)}'></canvas>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <h6 class="text-primary mb-3"><i class="fas fa-list"></i> 质量详情</h6>
+                        <ul class="list-group list-group-flush">
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                                <span><i class="fas fa-check-circle text-success"></i> 正常质量</span>
+                                <span class="badge bg-success rounded-pill">${qualityDist.normal}</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                                <span><i class="fas fa-exclamation-circle text-warning"></i> 低质量</span>
+                                <span class="badge bg-warning rounded-pill">${qualityDist.low_quality}</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                                <span><i class="fas fa-wrench text-info"></i> 已修复</span>
+                                <span class="badge bg-info rounded-pill">${qualityDist.fixed}</span>
+                            </li>
+                            ${qualityDist.unknown > 0 ? `
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                                <span><i class="fas fa-question-circle text-secondary"></i> 未检测</span>
+                                <span class="badge bg-secondary rounded-pill">${qualityDist.unknown}</span>
+                            </li>
+                            ` : ''}
+                        </ul>
                     </div>
                 </div>
-            </div>
-            <div class="mt-3">
-                <h6><i class="fas fa-download text-success"></i> 下载批量结果</h6>
-                <div class="d-grid">
-                    ${result.result_zip ? `
-                        <a href="/api/download/${this.currentTask.id}/zip" 
-                           class="btn btn-primary">
-                            <i class="fas fa-file-archive"></i> 下载批量结果ZIP
-                        </a>
-                    ` : ''}
+                ` : ''}
+                
+                <!-- 下载按钮 -->
+                <div class="mt-3">
+                    <h6 class="text-success mb-3"><i class="fas fa-download"></i> 下载批量结果</h6>
+                    <div class="d-grid">
+                        ${result.result_zip ? `
+                            <a href="/api/download/${this.currentTask.id}/zip" 
+                               class="btn btn-primary">
+                                <i class="fas fa-file-archive"></i> 下载批量结果ZIP
+                            </a>
+                        ` : ''}
+                    </div>
                 </div>
             </div>
         `;
+    }
+
+    // 初始化批量报告图表（在结果渲染后调用）
+    initBatchReportChart() {
+        if (!this._batchChartId || !this._batchQualityData) return;
+        
+        const canvas = document.getElementById(this._batchChartId);
+        if (!canvas || !window.Chart) return;
+        
+        const qualityDist = this._batchQualityData;
+        
+        new Chart(canvas, {
+            type: 'pie',
+            data: {
+                labels: ['正常', '低质量', '已修复', '未检测'],
+                datasets: [{
+                    data: [qualityDist.normal, qualityDist.low_quality, qualityDist.fixed, qualityDist.unknown],
+                    backgroundColor: ['#198754', '#ffc107', '#0dcaf0', '#6c757d'],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            boxWidth: 12,
+                            font: { size: 11 }
+                        }
+                    }
+                }
+            }
+        });
+        
+        // 清理
+        this._batchChartId = null;
+        this._batchQualityData = null;
     }
 
     // 渲染上传文件结果

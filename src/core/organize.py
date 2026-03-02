@@ -69,7 +69,17 @@ def organize_dicom_files(
         for file in os.listdir(series_path):
             filepath = os.path.join(series_path, file)
             if os.path.isfile(filepath) and client._is_dicom_file(filepath):
-                dicom_files.append(filepath)
+                normalized_path = filepath
+                file_root, file_ext = os.path.splitext(filepath)
+                if file_ext != '.dcm':
+                    target_path = f"{file_root}.dcm"
+                    if target_path != filepath:
+                        try:
+                            os.rename(filepath, target_path)
+                            normalized_path = target_path
+                        except Exception:
+                            normalized_path = filepath
+                dicom_files.append(normalized_path)
 
         if dicom_files:
             processed_files += len(dicom_files)
@@ -169,7 +179,17 @@ def process_single_series(
         for file in os.listdir(series_path):
             filepath = os.path.join(series_path, file)
             if os.path.isfile(filepath) and client._is_dicom_file(filepath):
-                dicom_files.append(filepath)
+                normalized_path = filepath
+                file_root, file_ext = os.path.splitext(filepath)
+                if file_ext != '.dcm':
+                    target_path = f"{file_root}.dcm"
+                    if target_path != filepath:
+                        try:
+                            os.rename(filepath, target_path)
+                            normalized_path = target_path
+                        except Exception:
+                            normalized_path = filepath
+                dicom_files.append(normalized_path)
         
         if dicom_files:
             break

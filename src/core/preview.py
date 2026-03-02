@@ -421,8 +421,69 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int, orientation
 
         elif preview_file.endswith(('.nii', '.nii.gz')):
             img = nib.load(preview_file)
-            img_canonical = nib.as_closest_canonical(img)
-            data = img_canonical.get_fdata()
+
+            # 对多参数/时间序列（4D及以上）先提取第一个序列，
+            # 再进行 canonical 重排，避免 4D 与 3D 方向处理不一致。
+            img_for_preview = img
+            first_volume_data = None
+            if len(img.shape) > 3:
+                try:
+                    slicer = (slice(None), slice(None), slice(None)) + (0,) * (len(img.shape) - 3)
+                    first_volume = np.asarray(img.dataobj[slicer])
+                    while first_volume.ndim > 3:
+                        first_volume = first_volume[..., 0]
+                    first_volume_data = first_volume
+
+                    # 直接用首序列+原 affine 构建 3D 图像；
+                    # 若 affine 不可分解，后续 canonical 阶段再做安全降级。
+                    img_for_preview = nib.Nifti1Image(first_volume, img.affine)
+                except Exception:
+                    img_for_preview = img
+
+            try:
+                img_canonical = nib.as_closest_canonical(img_for_preview)
+                data = img_canonical.get_fdata()
+            except Exception:
+                # 兜底：部分文件 affine 不可分解（如某轴缩放为0），
+                # 构建可分解 affine 后重试 canonical；再失败则回退原数据。
+                try:
+                    fallback_data = (
+                        first_volume_data
+                        if first_volume_data is not None
+                        else np.asarray(img_for_preview.get_fdata())
+                    )
+
+                    orig_affine = np.asarray(getattr(img_for_preview, 'affine', np.eye(4)), dtype=np.float64)
+                    try:
+                        zooms = tuple(float(z) for z in img_for_preview.header.get_zooms()[:3])
+                    except Exception:
+                        zooms = (1.0, 1.0, 1.0)
+                    safe_zooms = tuple(z if np.isfinite(z) and z > 1e-8 else 1.0 for z in zooms)
+
+                    signs = []
+                    for axis in range(3):
+                        val = orig_affine[axis, axis] if orig_affine.shape == (4, 4) else 1.0
+                        signs.append(-1.0 if np.isfinite(val) and val < 0 else 1.0)
+
+                    safe_affine = np.eye(4, dtype=np.float64)
+                    safe_affine[0, 0] = signs[0] * safe_zooms[0]
+                    safe_affine[1, 1] = signs[1] * safe_zooms[1]
+                    safe_affine[2, 2] = signs[2] * safe_zooms[2]
+                    if orig_affine.shape == (4, 4) and np.all(np.isfinite(orig_affine[:3, 3])):
+                        safe_affine[:3, 3] = orig_affine[:3, 3]
+
+                    safe_img = nib.Nifti1Image(fallback_data, safe_affine)
+                    data = nib.as_closest_canonical(safe_img).get_fdata()
+                except Exception:
+                    data = (
+                        first_volume_data
+                        if first_volume_data is not None
+                        else np.asarray(img_for_preview.get_fdata())
+                    )
+
+            # 防御性处理：若仍为4D及以上，继续默认选取第一个序列
+            while data.ndim > 3:
+                data = data[..., 0]
 
             if data.ndim == 3 and is_3d:
                 # canonical data is (X, Y, Z)
@@ -442,8 +503,12 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int, orientation
                 else: # AX or UNKNOWN
                     mid_z = data.shape[2] // 2
                     slice_xy = data[:, :, mid_z]
-                    # X: Left to Right -> Right to Left (flip)
-                    # Y: Posterior to Anterior -> Anterior to Posterior (flip)
+                    # nibabel array is (X, Y) where X=horizontal, Y=vertical
+                    # Image display: row=Y (top to bottom), column=X (left to right)
+                    # Transpose to get (Y, X) = (row, col) for image display
+                    # For radiological convention: patient right on image left, anterior on top
+                    # Flip X to make patient right on image left (radiological convention)
+                    # Flip Y to make Anterior (breast) on top
                     image_2d = np.transpose(slice_xy, (1, 0))[::-1, ::-1]
                 
                 image_2d = image_2d.astype(np.float32)
@@ -458,7 +523,8 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int, orientation
             return None
         
         return image_2d
-    except Exception:
+    except Exception as e:
+        print(f"❌ Error loading image for preview: {preview_file} (index {preview_idx}) - {str(e)}")
         return None
 
 

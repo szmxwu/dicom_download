@@ -9,6 +9,7 @@
 """
 
 import json
+import logging
 import os
 from collections import Counter
 from dataclasses import dataclass, field
@@ -16,7 +17,9 @@ from typing import Dict, List, Any, Optional
 
 import numpy as np
 import nibabel as nib
+from src.core.fix_nifti import fix_nifti_file
 
+logger = logging.getLogger('DICOMApp')
 
 # Quality issue reasons (English)
 class QualityReasons:
@@ -29,11 +32,16 @@ class QualityReasons:
     COMPLEXITY_LOW = "complexity_low"
     UNDER_EXPOSED = "under_exposed"
     OVER_EXPOSED = "over_exposed"
-    INVERTED_BORDER = "inverted_border"
+    # 灰度反转检测（合并 INVERTED_BORDER 和 PHOTOMETRIC_MISMATCH）
+    GRAYSCALE_INVERTED = "grayscale_inverted"
     READ_ERROR = "read_error"
     FILE_NOT_FOUND = "file_not_found"
     UNSUPPORTED_FORMAT = "unsupported_format"
     NIFTI_ORIENTATION_ERROR = "nifti_orientation_error"
+    # 修复状态（用于标记已修复的问题）
+    FIXED_ORIENTATION = "fixed_orientation"
+    FIXED_GRAYSCALE = "fixed_grayscale"
+    FIXED_BOTH = "fixed_both"
 
 
 # Human readable descriptions for reasons
@@ -46,11 +54,15 @@ REASON_DESCRIPTIONS = {
     QualityReasons.COMPLEXITY_LOW: "Low complexity",
     QualityReasons.UNDER_EXPOSED: "Under-exposed",
     QualityReasons.OVER_EXPOSED: "Over-exposed",
-    QualityReasons.INVERTED_BORDER: "Potential inverted border",
+    QualityReasons.GRAYSCALE_INVERTED: "Grayscale inverted (border brighter than center)",
     QualityReasons.READ_ERROR: "Error reading image data",
     QualityReasons.FILE_NOT_FOUND: "File not found",
     QualityReasons.UNSUPPORTED_FORMAT: "Unsupported file format",
     QualityReasons.NIFTI_ORIENTATION_ERROR: "NIfTI orientation error (dcm2niix bug detected)",
+    # 修复状态描述
+    QualityReasons.FIXED_ORIENTATION: "Fixed: NIfTI orientation corrected",
+    QualityReasons.FIXED_GRAYSCALE: "Fixed: Grayscale inversion corrected",
+    QualityReasons.FIXED_BOTH: "Fixed: Both orientation and grayscale corrected",
 }
 
 
@@ -451,9 +463,10 @@ def assess_image_quality_from_array(
             if border_vals.size > 0 and center_vals.size > 0:
                 border_mean = float(np.mean(border_vals))
                 center_mean = float(np.mean(center_vals))
+                # 检测灰度反转：边框比中心亮（对于医学影像通常不正常）
                 inverted_like = border_mean - center_mean > 0.1 * range_eps
                 if inverted_like:
-                    reasons.append(QualityReasons.INVERTED_BORDER)
+                    reasons.append(QualityReasons.GRAYSCALE_INVERTED)
                     metrics['border_mean'] = round(border_mean, 2)
                     metrics['center_mean'] = round(center_mean, 2)
 
@@ -566,7 +579,8 @@ def assess_converted_file_quality(
     filepath: str, 
     modality: Optional[str] = None, 
     check_orientation: bool = True,
-    dicom_metadata: Optional[Dict[str, Any]] = None
+    dicom_metadata: Optional[Dict[str, Any]] = None,
+    auto_fix: bool = True
 ) -> ImageQualityResult:
     """
     评估转换后文件（NIfTI/NPZ）的质量
@@ -576,9 +590,10 @@ def assess_converted_file_quality(
         modality: 模态代码 (CT, MR, DX, etc.)，可选
         check_orientation: 是否检查NIfTI方向错误
         dicom_metadata: 可选的DICOM元数据字典，用于方向错误检测
+        auto_fix: 是否自动修复检测到的问题（方向/灰度），默认True
 
     Returns:
-        ImageQualityResult: 质量评估结果
+        ImageQualityResult: 质量评估结果（包含修复信息）
     """
     try:
         if not os.path.exists(filepath):
@@ -632,6 +647,9 @@ def assess_converted_file_quality(
 
         result = assess_image_quality_from_array(data, modality)
         
+        # 检查assess_image_quality_from_array是否检测到灰度反转
+        grayscale_inverted = QualityReasons.GRAYSCALE_INVERTED in result.reasons
+        
         # 如果检测到方向错误，添加到结果中
         if orientation_error:
             result.is_low_quality = True
@@ -642,6 +660,63 @@ def assess_converted_file_quality(
                 "dcm2niix generated NIfTI with flipped Y-axis. "
                 "Preview generator will auto-correct this."
             )
+        
+        # 自动修复检测到的问题
+        if auto_fix and filepath.endswith(('.nii', '.nii.gz')):
+            fix_orientation = orientation_error
+            fix_grayscale = grayscale_inverted
+            
+            if fix_orientation or fix_grayscale:
+                try:
+                    fix_result = fix_nifti_file(
+                        filepath,
+                        fix_orientation=fix_orientation,
+                        fix_photometric=fix_grayscale,  # 灰度反转修复
+                        backup=False
+                    )
+                    
+                    if fix_result.success:
+                        # 更新原因列表：将错误替换为修复状态
+                        new_reasons = []
+                        for reason in result.reasons:
+                            if reason == QualityReasons.NIFTI_ORIENTATION_ERROR:
+                                continue  # 移除错误，稍后添加修复状态
+                            elif reason == QualityReasons.GRAYSCALE_INVERTED:
+                                continue  # 移除错误，稍后添加修复状态
+                            else:
+                                new_reasons.append(reason)
+                        
+                        # 添加修复状态
+                        fixed_orientation = QualityReasons.NIFTI_ORIENTATION_ERROR in result.reasons
+                        fixed_grayscale = QualityReasons.GRAYSCALE_INVERTED in result.reasons
+                        
+                        if fixed_orientation and fixed_grayscale:
+                            new_reasons.append(QualityReasons.FIXED_BOTH)
+                        elif fixed_orientation:
+                            new_reasons.append(QualityReasons.FIXED_ORIENTATION)
+                        elif fixed_grayscale:
+                            new_reasons.append(QualityReasons.FIXED_GRAYSCALE)
+                        
+                        result.reasons = new_reasons
+                        result.metrics['fixed'] = True
+                        result.metrics['fixes_applied'] = fix_result.fixes_applied
+                        
+                        # 问题已修复，不再标记为低质量（如果只修复了方向/灰度问题）
+                        if not new_reasons or all(r in [
+                            QualityReasons.FIXED_ORIENTATION,
+                            QualityReasons.FIXED_GRAYSCALE,
+                            QualityReasons.FIXED_BOTH
+                        ] for r in new_reasons):
+                            result.is_low_quality = False
+                        
+                        logger.info(
+                            "  [Auto-fix] Fixed %s: %s",
+                            os.path.basename(filepath),
+                            ', '.join(fix_result.fixes_applied)
+                        )
+                        
+                except Exception as e:
+                    logger.warning("  [Auto-fix] Failed to fix %s: %s", filepath, e)
         
         return result
         
@@ -727,6 +802,7 @@ def assess_series_quality_converted(
 
         # 尝试加载DICOM元数据缓存（用于方向错误检测）
         dicom_metadata = None
+        conversion_map = {}
         if series_dir:
             cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
             if os.path.exists(cache_path):
@@ -734,19 +810,30 @@ def assess_series_quality_converted(
                     with open(cache_path, 'r', encoding='utf-8') as f:
                         cache = json.load(f)
                     dicom_metadata = cache.get('sample_tags', {})
+                    conversion_map = cache.get('conversion_map', {})
                 except Exception as e:
                     pass
 
         file_results = []
         for idx in sample_indices:
             try:
+                # 对于2D图像，从 conversion_map 获取该文件独立的元数据
+                file_metadata = dicom_metadata
+                if modality and modality.upper() in ['DX', 'DR', 'CR', 'MG', 'RF']:
+                    # 尝试从 conversion_map 获取该文件的特定标签
+                    basename = os.path.basename(converted_files[idx])
+                    conv_entry = conversion_map.get(basename)
+                    if isinstance(conv_entry, dict):
+                        # 合并 sample_tags 和 conversion_map 的条目
+                        file_metadata = {**(dicom_metadata or {}), **conv_entry}
+                
                 # DEBUG: Check dicom_metadata
                 # print(f"DEBUG assess_series_quality_converted: dicom_metadata is None = {dicom_metadata is None}")
                 result = assess_converted_file_quality(
                     converted_files[idx], 
                     modality, 
                     check_orientation=True,
-                    dicom_metadata=dicom_metadata
+                    dicom_metadata=file_metadata
                 )
                 # DEBUG: Check result
                 # print(f"DEBUG assess_series_quality_converted: result.is_low_quality = {result.is_low_quality}, reasons = {result.reasons}")
@@ -766,6 +853,21 @@ def assess_series_quality_converted(
                     'metrics': {'error': str(e)}
                 })
 
+        # 统计自动修复的信息（assess_converted_file_quality 已经处理了自动修复）
+        fixed_count = 0
+        fixed_orientation_count = 0
+        fixed_grayscale_count = 0
+        
+        for r in file_results:
+            if r['metrics'].get('fixed'):
+                fixed_count += 1
+                fixes = r['metrics'].get('fixes_applied', [])
+                if 'orientation_flip_x' in fixes:
+                    fixed_orientation_count += 1
+                if 'photometric_inversion' in fixes:
+                    fixed_grayscale_count += 1
+        
+        # 重新计算低质量数量（修复后的文件可能不再是低质量）
         low_count = sum(1 for r in file_results if r['is_low_quality'])
         ratio = low_count / max(1, len(sample_indices))
         
@@ -774,15 +876,15 @@ def assess_series_quality_converted(
         series_threshold = config.get_threshold(modality or 'DEFAULT', 'series_low_quality_ratio')
         is_low_quality = ratio > series_threshold
         
-        # 收集所有原因（包括方向错误等非质量问题的警告）
+        # 收集所有原因（包括修复状态）
         all_reasons = []
-        orientation_error_count = 0
         for r in file_results:
             if r['is_low_quality']:
                 all_reasons.extend(r['reasons'])
-            # 单独统计方向错误（即使不标记为低质量也要报告）
-            if QualityReasons.NIFTI_ORIENTATION_ERROR in r['reasons']:
-                orientation_error_count += 1
+            # 也收集修复状态用于报告
+            if r.get('fixed'):
+                all_reasons.extend([reason for reason in r['reasons'] 
+                                   if reason.startswith('fixed_')])
         
         # Generate reason summary
         if is_low_quality or all_reasons:
@@ -793,13 +895,18 @@ def assess_series_quality_converted(
         else:
             reason_summary = "Normal"
         
-        # 如果检测到方向错误，添加到报告（即使系列质量正常）
-        if orientation_error_count > 0:
+        # 添加修复统计到报告
+        if fixed_count > 0:
+            fix_parts = []
+            if fixed_orientation_count > 0:
+                fix_parts.append(f"orientation x{fixed_orientation_count}")
+            if fixed_grayscale_count > 0:
+                fix_parts.append(f"grayscale x{fixed_grayscale_count}")
+            
             if reason_summary == "Normal":
-                reason_summary = ""
+                reason_summary = f"Fixed: {', '.join(fix_parts)}"
             else:
-                reason_summary += "; "
-            reason_summary += f"NIfTI orientation error (dcm2niix bug) detected in {orientation_error_count} file(s)"
+                reason_summary += f"; Fixed: {', '.join(fix_parts)}"
 
         return {
             'low_quality': 1 if is_low_quality else 0,
@@ -807,7 +914,10 @@ def assess_series_quality_converted(
             'low_quality_details': file_results,
             'low_quality_ratio': ratio,
             'qc_mode': qc_mode,
-            'qc_sample_indices': sample_indices
+            'qc_sample_indices': sample_indices,
+            'fixed_count': fixed_count,
+            'fixed_orientation_count': fixed_orientation_count,
+            'fixed_grayscale_count': fixed_grayscale_count
         }
         
     except Exception as e:
