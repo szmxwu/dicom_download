@@ -1183,11 +1183,76 @@ def process_batch_task(task):
             app.config['RESULT_FOLDER']
         )
         
+        # 计算详细的批处理统计信息
+        total_processed = len([r for r in results if r.get('success')])
+        total_failed = len([r for r in results if r.get('error')])
+        
+        # 收集质量统计数据
+        quality_stats = {
+            'normal': 0,
+            'low_quality': 0,
+            'fixed': 0,
+            'unknown': 0
+        }
+        total_images = 0
+        total_series = 0
+        
+        for r in results:
+            if r.get('success'):
+                series_info = r.get('series_info', {})
+                total_series += len(series_info)
+                
+                # 尝试从Excel元数据文件中读取质量统计
+                excel_file = r.get('excel_file')
+                if excel_file and os.path.exists(excel_file):
+                    try:
+                        import pandas as pd
+                        df = pd.read_excel(excel_file)
+                        if 'Low_quality' in df.columns:
+                            for _, row in df.iterrows():
+                                low_quality = row.get('Low_quality', 0)
+                                fixed = row.get('Fixed', '')
+                                if fixed == 'Yes' or 'Fixed' in str(row.get('Low_quality_reason', '')):
+                                    quality_stats['fixed'] += 1
+                                elif low_quality == 0 or low_quality == False:
+                                    quality_stats['normal'] += 1
+                                elif low_quality == 1 or low_quality == True:
+                                    quality_stats['low_quality'] += 1
+                                else:
+                                    quality_stats['unknown'] += 1
+                                total_images += 1
+                        else:
+                            # 如果没有质量列，只统计文件数量
+                            total_images += len(df)
+                            quality_stats['unknown'] += len(df)
+                    except Exception as e:
+                        # 如果读取Excel失败，使用series_info统计
+                        for series_name, series_data in series_info.items():
+                            file_count = series_data.get('file_count', 0)
+                            total_images += file_count
+                            quality_stats['unknown'] += file_count
+                else:
+                    # 如果没有Excel文件，使用series_info统计
+                    for series_name, series_data in series_info.items():
+                        file_count = series_data.get('file_count', 0)
+                        total_images += file_count
+                        quality_stats['unknown'] += file_count
+        
+        # 计算处理时间
+        duration = (task.end_time or time.time()) - task.start_time
+        avg_speed = total_images / duration if duration > 0 else 0
+        
         task.result = {
             'batch_results': results,
             'result_zip': zip_path,
-            'total_processed': len([r for r in results if r.get('success')]),
-            'total_failed': len([r for r in results if r.get('error')])
+            'total_processed': total_processed,
+            'total_failed': total_failed,
+            'total_studies': len(accession_numbers),
+            'total_series': total_series,
+            'total_images': total_images,
+            'duration': round(duration, 2),
+            'avg_speed': round(avg_speed, 2),
+            'quality_distribution': quality_stats
         }
         
         task.update_status('completed', 100, 'Batch process completed')
