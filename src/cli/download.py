@@ -17,6 +17,7 @@ import shutil
 from tqdm import tqdm
 import pandas as pd
 import json
+import html
 from datetime import datetime, timedelta
 import tempfile
 
@@ -257,23 +258,239 @@ def main(cli_args=None):
 PROGRESS_FILENAME = ".download_progress.json"
 
 
+def _is_low_quality(value):
+    if pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) == 1
+    value_str = str(value).strip().lower()
+    return value_str in {"1", "true", "yes", "y", "低质量", "poor", "bad"}
+
+
+def collect_accession_quality(accession, output_dir):
+    """采集单个 accession 的质量信息。
+
+    从 output_dir/<accession>/ 下的 dicom_metadata*.xlsx 中读取 DICOM_Metadata 工作表，
+    汇总 Low_quality 与 Low_quality_reason。
+    """
+    accession_str = str(accession)
+    accession_dir = os.path.join(output_dir, accession_str)
+    if not os.path.isdir(accession_dir):
+        return None
+
+    xlsx_files = [
+        os.path.join(accession_dir, name)
+        for name in os.listdir(accession_dir)
+        if name.lower().endswith('.xlsx') and 'dicom_metadata' in name.lower()
+    ]
+
+    if not xlsx_files:
+        return {
+            'accession': accession_str,
+            'generated_at': datetime.now().isoformat(timespec='seconds'),
+            'total_images': 0,
+            'low_quality_images': 0,
+            'reasons': {},
+            'files': []
+        }
+
+    total_images = 0
+    low_quality_images = 0
+    reason_counter = {}
+    file_summaries = []
+
+    for xlsx_path in sorted(xlsx_files):
+        try:
+            df = pd.read_excel(xlsx_path, sheet_name='DICOM_Metadata')
+        except Exception:
+            continue
+
+        if 'Low_quality' not in df.columns or 'Low_quality_reason' not in df.columns:
+            continue
+
+        file_total = len(df)
+        low_mask = df['Low_quality'].apply(_is_low_quality)
+        low_df = df[low_mask]
+        file_low = int(low_mask.sum())
+
+        file_reason_counter = {}
+        if not low_df.empty:
+            for reason in low_df['Low_quality_reason'].fillna('').astype(str):
+                clean_reason = reason.strip() or '未提供原因'
+                reason_counter[clean_reason] = reason_counter.get(clean_reason, 0) + 1
+                file_reason_counter[clean_reason] = file_reason_counter.get(clean_reason, 0) + 1
+
+        total_images += file_total
+        low_quality_images += file_low
+        file_summaries.append({
+            'file': os.path.basename(xlsx_path),
+            'total_images': file_total,
+            'low_quality_images': file_low,
+            'reasons': file_reason_counter
+        })
+
+    return {
+        'accession': accession_str,
+        'generated_at': datetime.now().isoformat(timespec='seconds'),
+        'total_images': int(total_images),
+        'low_quality_images': int(low_quality_images),
+        'reasons': reason_counter,
+        'files': file_summaries
+    }
+
+
+def generate_quality_report_html(output_dir, quality_records):
+    """根据质量记录生成 HTML 质量报表。"""
+    if not quality_records:
+        return None
+
+    report_path = os.path.join(output_dir, 'quality_report.html')
+
+    all_records = list(quality_records.values())
+    total_images = sum(int(item.get('total_images', 0)) for item in all_records)
+    low_quality_images = sum(int(item.get('low_quality_images', 0)) for item in all_records)
+    normal_images = max(total_images - low_quality_images, 0)
+
+    reason_counter = {}
+    for item in all_records:
+        for reason, count in (item.get('reasons') or {}).items():
+            reason_counter[reason] = reason_counter.get(reason, 0) + int(count)
+
+    sorted_reasons = sorted(reason_counter.items(), key=lambda x: x[1], reverse=True)
+    max_reason_count = sorted_reasons[0][1] if sorted_reasons else 0
+
+    low_ratio = (low_quality_images / total_images * 100.0) if total_images else 0.0
+    normal_ratio = (normal_images / total_images * 100.0) if total_images else 0.0
+
+    reason_rows = []
+    for reason, count in sorted_reasons:
+        width = (count / max_reason_count * 100.0) if max_reason_count else 0.0
+        reason_rows.append(
+            f"""
+            <tr>
+                <td>{html.escape(str(reason))}</td>
+                <td>{count}</td>
+                <td><div class=\"bar-wrap\"><div class=\"bar\" style=\"width:{width:.2f}%\"></div></div></td>
+            </tr>
+            """
+        )
+
+    accession_rows = []
+    for accession, item in sorted(quality_records.items(), key=lambda x: x[0]):
+        acc_total = int(item.get('total_images', 0))
+        acc_low = int(item.get('low_quality_images', 0))
+        acc_ratio = (acc_low / acc_total * 100.0) if acc_total else 0.0
+        top_reason = ''
+        if item.get('reasons'):
+            top_reason = max(item['reasons'].items(), key=lambda x: x[1])[0]
+        accession_rows.append(
+            f"""
+            <tr>
+                <td>{html.escape(str(accession))}</td>
+                <td>{acc_total}</td>
+                <td>{acc_low}</td>
+                <td>{acc_ratio:.2f}%</td>
+                <td>{html.escape(top_reason or '-')}</td>
+            </tr>
+            """
+        )
+
+    html_content = f"""<!DOCTYPE html>
+<html lang=\"zh-CN\">
+<head>
+  <meta charset=\"UTF-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <title>DICOM 质量报表</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 20px; color: #222; }}
+    h1, h2 {{ margin: 0 0 10px; }}
+    .summary {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }}
+    .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 12px 16px; min-width: 180px; }}
+    .card .num {{ font-size: 24px; font-weight: bold; margin-top: 6px; }}
+    .chart {{ border: 1px solid #ddd; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; }}
+    .bar-line {{ margin: 10px 0; }}
+    .label {{ display: inline-block; width: 120px; }}
+    .bar-wrap {{ display: inline-block; vertical-align: middle; width: calc(100% - 220px); height: 14px; background: #f1f3f5; border-radius: 8px; overflow: hidden; }}
+    .bar {{ height: 100%; background: #3b82f6; }}
+    .value {{ display: inline-block; width: 90px; text-align: right; margin-left: 8px; }}
+    table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 14px; }}
+    th {{ background: #f7f7f7; }}
+    .muted {{ color: #666; font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <h1>DICOM 下载质量报表</h1>
+  <p class=\"muted\">生成时间：{html.escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
+
+  <div class=\"summary\">
+    <div class=\"card\"><div>总图像数量</div><div class=\"num\">{total_images}</div></div>
+    <div class=\"card\"><div>质量差图像数量</div><div class=\"num\">{low_quality_images}</div></div>
+    <div class=\"card\"><div>质量差占比</div><div class=\"num\">{low_ratio:.2f}%</div></div>
+    <div class=\"card\"><div>检查数量</div><div class=\"num\">{len(all_records)}</div></div>
+  </div>
+
+  <div class=\"chart\">
+    <h2>总体质量分布</h2>
+    <div class=\"bar-line\">
+      <span class=\"label\">正常图像</span>
+      <div class=\"bar-wrap\"><div class=\"bar\" style=\"width:{normal_ratio:.2f}%\"></div></div>
+      <span class=\"value\">{normal_images} ({normal_ratio:.2f}%)</span>
+    </div>
+    <div class=\"bar-line\">
+      <span class=\"label\">质量差图像</span>
+      <div class=\"bar-wrap\"><div class=\"bar\" style=\"width:{low_ratio:.2f}%\"></div></div>
+      <span class=\"value\">{low_quality_images} ({low_ratio:.2f}%)</span>
+    </div>
+  </div>
+
+  <h2>质量差原因分布</h2>
+  <table>
+    <thead><tr><th>原因</th><th>数量</th><th>占比条形图</th></tr></thead>
+    <tbody>
+      {''.join(reason_rows) if reason_rows else '<tr><td colspan="3">暂无低质量原因数据</td></tr>'}
+    </tbody>
+  </table>
+
+  <h2>按检查汇总</h2>
+  <table>
+    <thead><tr><th>Accession</th><th>总图像数</th><th>质量差图像数</th><th>质量差占比</th><th>主要原因</th></tr></thead>
+    <tbody>
+      {''.join(accession_rows) if accession_rows else '<tr><td colspan="5">暂无数据</td></tr>'}
+    </tbody>
+  </table>
+</body>
+</html>
+"""
+
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+    return report_path
+
+
 def load_progress(output_dir):
     path = os.path.join(output_dir, PROGRESS_FILENAME)
     if not os.path.exists(path):
-        return set(), {}
+        return set(), {}, {}
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             completed = data.get('completed', [])
             timings = data.get('timings', {})
+            quality_records = data.get('quality_records', {})
             # ensure timings are floats
             timings = {str(k): float(v) for k, v in timings.items()}
-            return set(completed), timings
+            if not isinstance(quality_records, dict):
+                quality_records = {}
+            return set(completed), timings, quality_records
     except Exception:
-        return set(), {}
+        return set(), {}, {}
 
 
-def save_progress(output_dir, completed_set, timings_dict=None):
+def save_progress(output_dir, completed_set, timings_dict=None, quality_records=None):
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, PROGRESS_FILENAME)
     try:
@@ -281,6 +498,8 @@ def save_progress(output_dir, completed_set, timings_dict=None):
         if timings_dict:
             # convert timings to simple serializable map
             payload['timings'] = {str(k): float(v) for k, v in timings_dict.items()}
+        if quality_records:
+            payload['quality_records'] = quality_records
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -292,9 +511,18 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti'):
 
     进度记录保存在 output_dir/.download_progress.json，程序在每次成功下载后更新该文件。
     """
-    completed, timings = load_progress(output_dir)
+    completed, timings, quality_records = load_progress(output_dir)
     total = len(acc_list)
     # timings: dict accession->seconds (float)
+
+    # 对历史已完成但未记录质量数据的 accession 做一次补采
+    missing_quality = [acc for acc in completed if acc not in quality_records]
+    for accession in missing_quality:
+        quality_entry = collect_accession_quality(accession, output_dir)
+        if quality_entry is not None:
+            quality_records[str(accession)] = quality_entry
+    if missing_quality:
+        save_progress(output_dir, completed, timings, quality_records)
 
     for accession in tqdm(acc_list):
         if str(accession) in completed:
@@ -315,6 +543,11 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti'):
             # 仅在成功下载并解压后标记为完成
             completed.add(str(accession))
             timings[str(accession)] = elapsed
+
+            quality_entry = collect_accession_quality(accession, output_dir)
+            if quality_entry is not None:
+                quality_records[str(accession)] = quality_entry
+
             # 计算平均速度（秒/acc）基于所有已知 timings
             all_times = list(timings.values())
             avg_sec = sum(all_times) / len(all_times) if all_times else elapsed
@@ -322,11 +555,15 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti'):
             remaining_sec = avg_sec * remaining
             eta = datetime.now() + timedelta(seconds=remaining_sec)
 
-            save_progress(output_dir, completed, timings)
+            save_progress(output_dir, completed, timings, quality_records)
             tqdm.write(f"[+] 标记为已完成: {accession} (耗时 {elapsed:.2f} s)")
             tqdm.write(f"    平均: {avg_sec:.2f} s/accession；剩余: {remaining}，预计完成: {eta.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
             tqdm.write(f"[!] 处理失败，将在下次继续尝试: {accession}")
+
+    report_path = generate_quality_report_html(output_dir, quality_records)
+    if report_path:
+        tqdm.write(f"[+] 质量报表已生成: {report_path}")
 
 
 if __name__ == "__main__":
