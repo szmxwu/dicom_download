@@ -613,7 +613,21 @@ class DICOMDownloadClient:
     
     def _is_dicom_file(self, filepath):
         """判断是否为DICOM文件"""
-        if filepath.endswith("json") or filepath.endswith("csv") or filepath.endswith("txt"):
+        lower_path = filepath.lower()
+        if (
+            lower_path.endswith(".json")
+            or lower_path.endswith(".csv")
+            or lower_path.endswith(".txt")
+            or lower_path.endswith(".nii")
+            or lower_path.endswith(".nii.gz")
+            or lower_path.endswith(".npz")
+            or lower_path.endswith(".png")
+            or lower_path.endswith(".jpg")
+            or lower_path.endswith(".jpeg")
+            or lower_path.endswith(".bmp")
+            or lower_path.endswith(".gif")
+            or lower_path.endswith(".webp")
+        ):
             return False
         try:
             with open(filepath, 'rb') as f:
