@@ -1375,7 +1375,17 @@ class DICOMProcessor {
             result_zip: Boolean(result && result.result_zip),
             total_processed: Number((result && result.total_processed) || 0),
             total_failed: Number((result && result.total_failed) || 0),
-            series_count: Number((result && result.series_count) || 0)
+            series_count: Number((result && result.series_count) || 0),
+            total_series: Number((result && result.total_series) || 0),
+            total_images: Number((result && result.total_images) || 0),
+            duration: Number((result && result.duration) || 0),
+            avg_speed: Number((result && result.avg_speed) || 0),
+            quality_distribution: {
+                normal: Number((result && result.quality_distribution && result.quality_distribution.normal) || 0),
+                low_quality: Number((result && result.quality_distribution && result.quality_distribution.low_quality) || 0),
+                fixed: Number((result && result.quality_distribution && result.quality_distribution.fixed) || 0),
+                unknown: Number((result && result.quality_distribution && result.quality_distribution.unknown) || 0)
+            }
         };
 
         if (result && result.series_info && typeof result.series_info === 'object') {
@@ -1439,7 +1449,8 @@ class DICOMProcessor {
     renderBatchResult(result) {
         const total = (result.total_processed || 0) + (result.total_failed || 0);
         const successRate = total > 0 ? ((result.total_processed || 0) / total * 100).toFixed(1) : 0;
-        const duration = result.duration || 0;
+        const duration = Number(result.duration || 0);
+        const avgSpeed = Number(result.avg_speed || 0);
         const minutes = Math.floor(duration / 60);
         const seconds = Math.floor(duration % 60);
         const durationStr = minutes > 0 ? `${minutes}分${seconds}秒` : `${seconds}秒`;
@@ -1504,7 +1515,7 @@ class DICOMProcessor {
                                     </div>
                                     <div class="col-4">
                                         <small class="text-muted">平均速度</small>
-                                        <div class="fw-bold">${result.avg_speed ? result.avg_speed.toFixed(1) : 0} 张/秒</div>
+                                        <div class="fw-bold">${avgSpeed.toFixed(1)} 张/秒</div>
                                     </div>
                                 </div>
                             </div>
