@@ -6,6 +6,9 @@ class DICOMProcessor {
         this.currentTask = null;
         this.selectedFile = null;
         this.pacsConfigLoaded = false;
+        this.successModal = null;
+        this.errorModal = null;
+        this.isHandlingTaskCompletion = false;
         this.historyPage = 1;
         this.historyPageSize = 20;
         this.historyTotalPages = 0;
@@ -41,6 +44,7 @@ class DICOMProcessor {
     // 初始化应用
     init() {
         this.initLocalization();
+        this.initModals();
         this.initializeSocket();
         this.bindEvents();
         this.updateCurrentTime();
@@ -54,6 +58,30 @@ class DICOMProcessor {
         setInterval(() => this.debouncedLoadSystemStatus(), 30000);
         
         console.log('🏥 DICOM处理系统已初始化');
+    }
+
+    initModals() {
+        const successModalEl = document.getElementById('successModal');
+        const errorModalEl = document.getElementById('errorModal');
+
+        if (successModalEl) {
+            this.successModal = bootstrap.Modal.getOrCreateInstance(successModalEl);
+            successModalEl.addEventListener('hidden.bs.modal', () => this.cleanupModalArtifacts());
+        }
+
+        if (errorModalEl) {
+            this.errorModal = bootstrap.Modal.getOrCreateInstance(errorModalEl);
+            errorModalEl.addEventListener('hidden.bs.modal', () => this.cleanupModalArtifacts());
+        }
+    }
+
+    cleanupModalArtifacts() {
+        const hasVisibleModal = document.querySelector('.modal.show');
+        if (!hasVisibleModal) {
+            document.querySelectorAll('.modal-backdrop').forEach(backdrop => backdrop.remove());
+            document.body.classList.remove('modal-open');
+            document.body.style.removeProperty('padding-right');
+        }
     }
 
     // 防抖函数
@@ -192,6 +220,13 @@ class DICOMProcessor {
                 'task_cancelled': 'Task cancelled',
                 'cancel_task_failed': 'Failed to cancel task',
                 'initializing': 'Initializing...',
+                'status_running': 'Processing...',
+                'status_completed': 'Completed',
+                'status_failed': 'Failed',
+                'status_cancelled': 'Cancelled',
+                'status_unknown': 'Unknown Status',
+                'task_completed_message': 'Processing completed!',
+                'task_failed_message': 'Processing failed, please check logs',
                 'system_normal_html': '<i class="fas fa-circle"></i> System Normal',
                 'system_abnormal_html': '<i class="fas fa-exclamation-triangle"></i> System Abnormal',
                 'connection_lost_html': '<i class="fas fa-wifi"></i> Connection Lost',
@@ -305,6 +340,13 @@ class DICOMProcessor {
                 'task_cancelled': '任务已取消',
                 'cancel_task_failed': '取消任务失败',
                 'initializing': '初始化...',
+                'status_running': '处理中...',
+                'status_completed': '已完成',
+                'status_failed': '处理失败',
+                'status_cancelled': '已取消',
+                'status_unknown': '未知状态',
+                'task_completed_message': '处理完成！',
+                'task_failed_message': '处理失败，请检查日志信息',
                 'system_normal_html': '<i class="fas fa-circle"></i> 系统正常',
                 'system_abnormal_html': '<i class="fas fa-exclamation-triangle"></i> 系统异常',
                 'connection_lost_html': '<i class="fas fa-wifi"></i> 连接中断',
@@ -1158,27 +1200,29 @@ class DICOMProcessor {
         const statusElement = document.getElementById('currentStatus');
         if (!statusElement) return;
 
+        const t = this.translations[this.currentLang] || this.translations.en;
+
         let statusText, statusClass;
         
         switch (status) {
             case 'running':
-                statusText = '处理中...';
+                statusText = t.status_running;
                 statusClass = 'bg-primary';
                 break;
             case 'completed':
-                statusText = '已完成';
+                statusText = t.status_completed;
                 statusClass = 'bg-success';
                 break;
             case 'failed':
-                statusText = '处理失败';
+                statusText = t.status_failed;
                 statusClass = 'bg-danger';
                 break;
             case 'cancelled':
-                statusText = '已取消';
+                statusText = t.status_cancelled;
                 statusClass = 'bg-warning';
                 break;
             default:
-                statusText = '未知状态';
+                statusText = t.status_unknown;
                 statusClass = 'bg-secondary';
         }
 
@@ -1250,7 +1294,12 @@ class DICOMProcessor {
 
     // 处理任务完成
     async handleTaskCompleted() {
-        this.showSuccess('处理完成！');
+        if (this.isHandlingTaskCompletion) {
+            return;
+        }
+
+        this.isHandlingTaskCompletion = true;
+        this.showSuccess(this.translations[this.currentLang]['task_completed_message']);
         
         // 隐藏取消按钮
         this.hideCancelButton();
@@ -1265,14 +1314,17 @@ class DICOMProcessor {
             }
         } catch (error) {
             console.error('获取任务结果失败:', error);
+        } finally {
+            this.currentTask = null;
+            this.isHandlingTaskCompletion = false;
         }
-
-        this.currentTask = null;
     }
 
     // 处理任务失败
     handleTaskFailed(status) {
-        const message = status === 'cancelled' ? '任务已取消' : '处理失败，请检查日志信息';
+        const message = status === 'cancelled'
+            ? this.translations[this.currentLang]['task_cancelled']
+            : this.translations[this.currentLang]['task_failed_message'];
         this.showError(message);
         
         // 隐藏取消按钮
@@ -1665,13 +1717,29 @@ class DICOMProcessor {
     // 显示成功消息
     showSuccess(message) {
         document.getElementById('successMessage').textContent = message;
-        new bootstrap.Modal(document.getElementById('successModal')).show();
+        if (!this.successModal) {
+            const successModalEl = document.getElementById('successModal');
+            if (successModalEl) {
+                this.successModal = bootstrap.Modal.getOrCreateInstance(successModalEl);
+            }
+        }
+        if (this.successModal) {
+            this.successModal.show();
+        }
     }
 
     // 显示错误消息
     showError(message) {
         document.getElementById('errorMessage').textContent = message;
-        new bootstrap.Modal(document.getElementById('errorModal')).show();
+        if (!this.errorModal) {
+            const errorModalEl = document.getElementById('errorModal');
+            if (errorModalEl) {
+                this.errorModal = bootstrap.Modal.getOrCreateInstance(errorModalEl);
+            }
+        }
+        if (this.errorModal) {
+            this.errorModal.show();
+        }
     }
 
     // HTML转义
