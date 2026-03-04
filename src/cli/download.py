@@ -23,7 +23,7 @@ import tempfile
 
 # 可以通过环境变量 SERVER_URL 覆盖默认地址，例如：
 # export SERVER_URL="http://192.0.0.222:5005"
-SERVER_URL = os.environ.get("SERVER_URL", "http://192.0.0.222:5005")
+SERVER_URL = os.environ.get("SERVER_URL", "http://172.17.250.136:5005")
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "60"))  # 默认60秒超时
 API_SINGLE = f"{SERVER_URL}/api/process/single"
 API_STATUS = lambda task_id: f"{SERVER_URL}/api/task/{task_id}/status"
