@@ -34,6 +34,8 @@ class QualityReasons:
     OVER_EXPOSED = "over_exposed"
     # 灰度反转检测（合并 INVERTED_BORDER 和 PHOTOMETRIC_MISMATCH）
     GRAYSCALE_INVERTED = "grayscale_inverted"
+    # 分割图/掩码检测（PNG质量检测迁移）
+    SEGMENTATION_MASK = "segmentation_mask"
     READ_ERROR = "read_error"
     FILE_NOT_FOUND = "file_not_found"
     UNSUPPORTED_FORMAT = "unsupported_format"
@@ -55,6 +57,7 @@ REASON_DESCRIPTIONS = {
     QualityReasons.UNDER_EXPOSED: "Under-exposed",
     QualityReasons.OVER_EXPOSED: "Over-exposed",
     QualityReasons.GRAYSCALE_INVERTED: "Grayscale inverted (border brighter than center)",
+    QualityReasons.SEGMENTATION_MASK: "Segmentation mask detected (binary-like image with continuous white regions)",
     QualityReasons.READ_ERROR: "Error reading image data",
     QualityReasons.FILE_NOT_FOUND: "File not found",
     QualityReasons.UNSUPPORTED_FORMAT: "Unsupported file format",
@@ -84,6 +87,9 @@ class QCConfig:
         'percentile_low': 2.0,
         'percentile_high': 98.0,
         'series_low_quality_ratio': 0.3,
+        # 分割图检测阈值
+        'seg_bright_threshold': 0.05,  # 高亮像素(>250)比例阈值
+        'seg_max_components': 10,  # 255像素连通区域数阈值
     }
     
     # 各模态特定的默认值（在环境变量未设置时使用）
@@ -217,6 +223,105 @@ def reset_qc_config():
     """重置QC配置（主要用于测试）"""
     global _qc_config
     _qc_config = QCConfig()
+
+
+def is_segmentation_mask(
+    pixel_data: np.ndarray,
+    bright_threshold: float = 0.05,
+    max_components_threshold: int = 10
+) -> tuple[bool, dict]:
+    """
+    检测图像是否为分割图/掩码（从PNG质量检测迁移）
+
+    分割图特征（适用于任意灰度范围）：
+    - 图像主要是二值的（背景 + 前景）
+    - 前景区域是连续的（连通区域数很少）
+    - 前景像素值接近最大值
+
+    正常医学影像特征：
+    - 灰度值分布连续，不是二值的
+    - 高值像素分散为许多小区域
+    - 即使曝光过度也不会形成单一大连续区域
+
+    Args:
+        pixel_data: 像素数据数组 (2D或3D)
+        bright_threshold: 前景像素比例阈值，默认0.05(5%)
+        max_components_threshold: 前景连通区域数阈值，默认10
+
+    Returns:
+        tuple: (是否为分割图, 详细信息字典)
+    """
+    try:
+        # 处理3D数据（取中间切片）
+        if pixel_data.ndim == 3:
+            mid_idx = pixel_data.shape[2] // 2
+            slice_data = pixel_data[:, :, mid_idx]
+        else:
+            slice_data = pixel_data
+
+        # 确保是2D
+        if slice_data.ndim != 2:
+            return False, {'error': 'Unsupported data dimensions'}
+
+        # 获取数据范围
+        flat_data = slice_data[np.isfinite(slice_data)]
+        if flat_data.size == 0:
+            return False, {'error': 'No valid pixel data'}
+
+        min_val = float(np.min(flat_data))
+        max_val = float(np.max(flat_data))
+
+        # 如果最大值=最小值，无法判断
+        if max_val <= min_val:
+            return False, {'reason': 'Uniform image'}
+
+        total_pixels = flat_data.size
+
+        # 计算高值像素的阈值（靠近最大值的5%范围内）
+        # 对于分割图，前景像素应该非常接近最大值
+        bright_threshold_val = max_val - 0.05 * (max_val - min_val)
+
+        # 检查高值像素（靠近最大值）
+        bright_mask = slice_data > bright_threshold_val
+        bright_pixels = np.sum(bright_mask)
+        bright_ratio = bright_pixels / total_pixels
+
+        if bright_pixels == 0:
+            return False, {
+                'bright_ratio': bright_ratio,
+                'num_components': 0,
+                'reason': 'No bright pixels',
+                'value_range': [round(min_val, 2), round(max_val, 2)]
+            }
+
+        # 计算最大值像素的连通区域数
+        # 使用更严格的阈值：最顶部1%的像素
+        top_threshold = max_val - 0.01 * (max_val - min_val)
+        top_value_mask = slice_data > top_threshold
+
+        from scipy import ndimage
+        labeled_array, num_components = ndimage.label(top_value_mask)
+
+        # 判断是否为分割图
+        has_bright_area = bright_ratio > bright_threshold
+        is_continuous = num_components <= max_components_threshold
+        is_seg = has_bright_area and is_continuous
+
+        details = {
+            'bright_ratio': round(bright_ratio, 4),
+            'bright_threshold': bright_threshold,
+            'num_components': int(num_components),
+            'max_components_threshold': max_components_threshold,
+            'has_bright_area': has_bright_area,
+            'is_continuous': is_continuous,
+            'value_range': [round(min_val, 2), round(max_val, 2)],
+            'bright_threshold_val': round(bright_threshold_val, 2),
+        }
+
+        return is_seg, details
+
+    except Exception as e:
+        return False, {'error': str(e)}
 
 
 @dataclass
@@ -469,6 +574,23 @@ def assess_image_quality_from_array(
                     reasons.append(QualityReasons.GRAYSCALE_INVERTED)
                     metrics['border_mean'] = round(border_mean, 2)
                     metrics['center_mean'] = round(center_mean, 2)
+
+        # 分割图/掩码检测
+        # 主要针对2D X-ray图像（DX/DR/CR/MG等）以及CT/MR分割掩码，检测是否为分割掩码
+        if modality in ['DX', 'DR', 'CR', 'MG', 'RF', 'CT', 'MR', 'DEFAULT']:
+            seg_thresholds = config.get_all_thresholds(modality)
+            bright_thresh = seg_thresholds.get('seg_bright_threshold', 0.05)
+            components_thresh = seg_thresholds.get('seg_max_components', 10)
+
+            is_seg, seg_details = is_segmentation_mask(
+                pixel_data,
+                bright_threshold=bright_thresh,
+                max_components_threshold=components_thresh
+            )
+
+            if is_seg:
+                reasons.append(QualityReasons.SEGMENTATION_MASK)
+                metrics['segmentation_mask'] = seg_details
 
         return ImageQualityResult(
             is_low_quality=len(reasons) > 0,
