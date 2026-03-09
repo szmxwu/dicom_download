@@ -528,41 +528,116 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int, orientation
         return None
 
 
+def normalize_orientation(orientation: str, dcm=None) -> str:
+    """
+    标准化方位名称，将斜位映射到最接近的标准方位
+
+    处理以下情况：
+    1. 拼写变体：'OBL' -> 标准方位, 'OLB'/'OB'等 -> 标准方位
+    2. 斜位映射：根据法向量的最大分量，将OBL映射到最接近的AX/SAG/COR
+    3. 未知/空值处理：返回'AX'作为默认值
+
+    Args:
+        orientation: 原始方位名称
+        dcm: pydicom Dataset对象（用于斜位时计算最接近的标准方位）
+
+    Returns:
+        str: 标准化后的方位名称 ('AX', 'SAG', 'COR')，不会出现'OBL'或'UNKNOWN'
+    """
+    if orientation is None:
+        orientation = 'UNKNOWN'
+
+    orientation = str(orientation).upper().strip()
+
+    # 处理拼写变体和常见错误
+    correction_map = {
+        'OLB': 'OBL',      # 常见拼写错误
+        'OB': 'OBL',
+        'OBLIQUE': 'OBL',
+        'SAGITTAL': 'SAG',
+        'CORONAL': 'COR',
+        'AXIAL': 'AX',
+        'TRANSVERSE': 'AX',
+        'TRA': 'AX',
+    }
+    orientation = correction_map.get(orientation, orientation)
+
+    # 如果是标准方位，直接返回
+    if orientation in ('AX', 'SAG', 'COR'):
+        return orientation
+
+    # 对于斜位或未知，尝试从DICOM计算最接近的标准方位
+    if orientation in ('OBL', 'UNKNOWN', '') and dcm is not None:
+        try:
+            iop = getattr(dcm, 'ImageOrientationPatient', None)
+            if iop is not None and len(iop) == 6:
+                row_vec = np.array([float(iop[0]), float(iop[1]), float(iop[2])])
+                col_vec = np.array([float(iop[3]), float(iop[4]), float(iop[5])])
+                normal = np.cross(row_vec, col_vec)
+
+                # 即使被判定为斜位，法向量的最大分量仍指示最接近的方位
+                main_axis = np.argmax(np.abs(normal))
+                if main_axis == 0:
+                    return 'SAG'
+                elif main_axis == 1:
+                    return 'COR'
+                else:
+                    return 'AX'
+        except Exception:
+            pass
+
+    # 尝试从协议名推断（备用方案）
+    if dcm is not None:
+        try:
+            protocol_name = str(getattr(dcm, 'ProtocolName', '')).lower()
+            if any(k in protocol_name for k in ['sag', 'sg']):
+                return 'SAG'
+            elif any(k in protocol_name for k in ['cor', 'cr']):
+                return 'COR'
+            elif any(k in protocol_name for k in ['ax', 'tra', 'trans']):
+                return 'AX'
+        except Exception:
+            pass
+
+    # 默认返回轴位（最常见的扫描方位）
+    return 'AX'
+
+
 def _get_orientation_from_dcm(dcm) -> str:
     """
-    从DICOM对象中获取扫描方位
-    
+    从DICOM对象中获取扫描方位（原始值，包含斜位识别）
+
     通过ImageOrientationPatient(IOP)计算法向量来确定方位。
     能够精确区分轴位(AX)，矢状位(SAG)，冠状位(COR)，并能识别斜位(OBL)。
-    
+
     Args:
         dcm: pydicom Dataset 对象
-        
+
     Returns:
-        str: 标准化的方位名称 ('AX', 'SAG', 'COR', 'OBL', 'UNKNOWN')
+        str: 方位名称 ('AX', 'SAG', 'COR', 'OBL', 'UNKNOWN')
     """
     try:
         if dcm is None:
             return 'UNKNOWN'
-        
+
         # 获取ImageOrientationPatient
         iop = getattr(dcm, 'ImageOrientationPatient', None)
         if iop is None or len(iop) != 6:
             return 'UNKNOWN'
-        
+
         # 转换为numpy数组
         row_vec = np.array([float(iop[0]), float(iop[1]), float(iop[2])])
         col_vec = np.array([float(iop[3]), float(iop[4]), float(iop[5])])
-        
+
         # 计算法向量
         normal = np.cross(row_vec, col_vec)
-        
+
         # 检查是否为斜位：如果没有一个轴占绝对主导，则为斜位
         # 判断依据：主轴分量的平方是否小于向量模长平方的 0.9
         oblique_ratio = 0.9
         if np.max(np.abs(normal))**2 < oblique_ratio * np.sum(normal**2):
             return 'OBL'
-        
+
         # 根据法向量的主轴判断方位
         main_axis = np.argmax(np.abs(normal))
         if main_axis == 0:
@@ -571,7 +646,7 @@ def _get_orientation_from_dcm(dcm) -> str:
             return 'COR'  # 法向量主轴为Y
         elif main_axis == 2:
             return 'AX'   # 法向量主轴为Z
-        
+
         return 'UNKNOWN'
     except Exception:
         return 'UNKNOWN'
@@ -772,7 +847,9 @@ def _generate_single_preview(
         生成的预览图路径，失败时返回None
     """
     # 获取扫描方位
-    orientation = _get_orientation_from_dcm(sample_dcm)
+    # 获取并标准化方位（将斜位映射到最接近的标准方位）
+    raw_orientation = _get_orientation_from_dcm(sample_dcm)
+    orientation = normalize_orientation(raw_orientation, sample_dcm)
 
     # 加载图像
     image_2d = _load_image_2d(preview_file, is_3d, preview_idx, orientation)
@@ -790,32 +867,20 @@ def _generate_single_preview(
     # 应用窗宽窗位
     image_2d = apply_windowing(image_2d, file_dcm, modality)
     
-    # 计算纵横比
+    # 计算纵横比（仅对2D X射线图像需要调整）
+    # 对于从3D volume提取的切片，像素本身已经反映真实物理尺寸，无需调整
     aspect_ratio = None
-    try:
-        dcm_for_spacing = file_dcm if file_dcm is not None else sample_dcm
-        if dcm_for_spacing is not None:
-            pixel_spacing = getattr(dcm_for_spacing, 'PixelSpacing', None)
-            spacing_between = getattr(dcm_for_spacing, 'SpacingBetweenSlices', None)
-            slice_thickness = getattr(dcm_for_spacing, 'SliceThickness', None)
-            if modality == 'MR':
-                slice_spacing = max(spacing_between, slice_thickness)
-            else:
-                slice_spacing = float(slice_thickness + spacing_between or 1.0)
-            if pixel_spacing and len(pixel_spacing) >= 2:
-                pixel_spacing = [float(pixel_spacing[0]), float(pixel_spacing[1])]
-                if is_3d:
-                    # 因为我们总是提取与原始DICOM相同方位的切片，
-                    # 所以切片的面内像素间距总是由 PixelSpacing 决定。
-                    # 无论是 AX, COR 还是 SAG，纵横比都应该是 PixelSpacing 的比值。
-                    # DICOM PixelSpacing 是 [row_spacing, col_spacing]
-                    # 对应于图像的 [height_spacing, width_spacing]
-                    aspect_ratio = pixel_spacing[0] / max(pixel_spacing[1], 1e-6)
-                else:
-                    # 2D图像：直接使用像素间距计算
-                    aspect_ratio = pixel_spacing[0] / max(pixel_spacing[1], 1e-6)
-    except Exception:
-        aspect_ratio = None
+    if not is_3d:
+        try:
+            dcm_for_spacing = file_dcm if file_dcm is not None else sample_dcm
+            if dcm_for_spacing is not None:
+                pixel_spacing = getattr(dcm_for_spacing, 'PixelSpacing', None)
+                if pixel_spacing and len(pixel_spacing) >= 2:
+                    # 2D图像：PixelSpacing = [row_spacing, col_spacing]
+                    # 如果 row_spacing != col_spacing，需要调整纵横比
+                    aspect_ratio = float(pixel_spacing[0]) / max(float(pixel_spacing[1]), 1e-6)
+        except Exception:
+            aspect_ratio = None
     
     # 应用纵横比调整
     image_2d = resize_with_aspect(image_2d, aspect_ratio)
