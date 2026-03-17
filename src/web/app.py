@@ -968,6 +968,15 @@ def process_single_task(task):
         # 获取参数
         accession_number = task.parameters['accession_number']
         options = task.parameters.get('options', {})
+
+        # 获取过滤参数
+        modality_filter = options.get('modality_filter')
+        min_series_files = options.get('min_series_files')
+        if min_series_files is not None:
+            try:
+                min_series_files = int(min_series_files)
+            except (ValueError, TypeError):
+                min_series_files = None
         
         task.update_status('running', 15, 'Preparing process')
         task.add_log(f"Start processing AccessionNumber: {accession_number}")
@@ -990,11 +999,21 @@ def process_single_task(task):
         # 检查取消标志
         task.check_cancellation("before_query")
         
-        # 先查询是否存在数据
+        # 先查询是否存在数据（应用过滤条件）
         try:
-            series_metadata = task_client._query_series_metadata(accession_number)
+            series_metadata = task_client._query_series_metadata(
+                accession_number,
+                modality_filter=modality_filter,
+                min_series_files=min_series_files
+            )
             if not series_metadata:
-                raise Exception(f"AccessionNumber not found in PACS: {accession_number}")
+                filter_info = []
+                if modality_filter:
+                    filter_info.append(f"Modality filter: {modality_filter}")
+                if min_series_files:
+                    filter_info.append(f"Min files: {min_series_files}")
+                filter_str = f" ({', '.join(filter_info)})" if filter_info else ""
+                raise Exception(f"No series found in PACS for AccessionNumber: {accession_number}{filter_str}")
             task.add_log(f"Found {len(series_metadata)} Series")
         except Exception as e:
             task.add_log(f"Query failed: {str(e)}", 'error')
@@ -1014,7 +1033,9 @@ def process_single_task(task):
                 keep_zip=options.get('keep_zip', True),
                 keep_extracted=options.get('keep_extracted', False),
                 output_format=options.get('output_format', 'nifti'),
-                parallel_pipeline=False  # 禁用并行流水线，使用单线程顺序处理
+                parallel_pipeline=False,  # 禁用并行流水线，使用单线程顺序处理
+                modality_filter=modality_filter,
+                min_series_files=min_series_files
             )
             
             if results and results.get('success'):
@@ -1092,8 +1113,21 @@ def process_batch_task(task):
     task_client = None  # 初始化变量
     try:
         accession_numbers = task.parameters['accession_numbers']
-        options = task.parameters['options']
-        
+        options = task.parameters.get('options', {})
+
+        # 获取过滤参数
+        modality_filter = options.get('modality_filter')
+        min_series_files = options.get('min_series_files')
+        if min_series_files is not None:
+            try:
+                min_series_files = int(min_series_files)
+            except (ValueError, TypeError):
+                min_series_files = None
+        if modality_filter:
+            task.add_log(f"Modality filter: {modality_filter}")
+        if min_series_files:
+            task.add_log(f"Min series files: {min_series_files}")
+
         # 去重处理，保持顺序
         seen = set()
         unique_accession_numbers = []
@@ -1101,7 +1135,7 @@ def process_batch_task(task):
             if acc and acc not in seen:
                 seen.add(acc)
                 unique_accession_numbers.append(acc)
-        
+
         if len(unique_accession_numbers) < len(accession_numbers):
             task.add_log(f"Removed {len(accession_numbers) - len(unique_accession_numbers)} duplicates, {len(unique_accession_numbers)} unique studies to process")
         
@@ -1163,7 +1197,9 @@ def process_batch_task(task):
                     auto_organize=options.get('auto_organize', True),
                     auto_metadata=options.get('auto_metadata', True),
                     output_format=options.get('output_format', 'nifti'),
-                    parallel_pipeline=False  # 禁用并行流水线，使用单线程顺序处理
+                    parallel_pipeline=False,  # 禁用并行流水线，使用单线程顺序处理
+                    modality_filter=modality_filter,
+                    min_series_files=min_series_files
                 )
                 results.append(result)
                 task.add_log(f'{accno} Process completed')

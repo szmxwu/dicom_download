@@ -190,20 +190,34 @@ def main(cli_args=None):
         parser.add_argument("accession", help="AccessionNumber (例如: Z25043000836)")
         parser.add_argument("--output_dir", default="./downloads", help="下载结果存放目录")
         parser.add_argument("--format", choices=['nifti', 'npz'], default='nifti', help="输出格式 (nifti 或 npz)")
+        parser.add_argument("--modality", default=None, help="模态过滤，如 MR, CT (可逗号分隔多个)")
+        parser.add_argument("--min_files", type=int, default=None, help="最小序列文件数，少于该值的序列将被跳过")
         args = parser.parse_args()
     else:
         args = cli_args
 
-    print(f"🚀 启动任务: AccessionNumber={args.accession}, 格式={args.format}")
+    filter_info = []
+    if args.modality:
+        filter_info.append(f"Modality={args.modality}")
+    if args.min_files:
+        filter_info.append(f"MinFiles={args.min_files}")
+    filter_str = f" ({', '.join(filter_info)})" if filter_info else ""
+    print(f"🚀 启动任务: AccessionNumber={args.accession}, 格式={args.format}{filter_str}")
 
     # 步骤1: 提交任务
+    options = {
+        "output_format": args.format,
+        "auto_organize": True,
+        "auto_metadata": True
+    }
+    if args.modality:
+        options["modality_filter"] = args.modality
+    if args.min_files:
+        options["min_series_files"] = args.min_files
+
     payload = {
         "accession_number": args.accession,
-        "options": {
-            "output_format": args.format,
-            "auto_organize": True,
-            "auto_metadata": True
-        }
+        "options": options
     }
 
     # 提交任务，带重试机制
@@ -506,7 +520,7 @@ def save_progress(output_dir, completed_set, timings_dict=None, quality_records=
         print(f"[!] 无法保存进度: {e}")
 
 
-def download_list(acc_list, output_dir="./downloads", fmt='nifti'):
+def download_list(acc_list, output_dir="./downloads", fmt='nifti', modality=None, min_files=None):
     """批量下载多个 AccessionNumber 的结果，并支持断点续传。
 
     进度记录保存在 output_dir/.download_progress.json，程序在每次成功下载后更新该文件。
@@ -524,6 +538,14 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti'):
     if missing_quality:
         save_progress(output_dir, completed, timings, quality_records)
 
+    filter_info = []
+    if modality:
+        filter_info.append(f"Modality={modality}")
+    if min_files:
+        filter_info.append(f"MinFiles={min_files}")
+    if filter_info:
+        tqdm.write(f"[i] 过滤条件: {', '.join(filter_info)}")
+
     for accession in tqdm(acc_list):
         if str(accession) in completed:
             tqdm.write(f"\n--- 跳过（已完成） AccessionNumber: {accession} ---")
@@ -532,7 +554,9 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti'):
         main_args = argparse.Namespace(
             accession=str(accession),
             output_dir=output_dir,
-            format=fmt
+            format=fmt,
+            modality=modality,
+            min_files=min_files
         )
         # 计时并执行
         start_t = time.time()

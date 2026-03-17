@@ -88,14 +88,28 @@
                                                 <span class="input-group-text">
                                                     <i class="fas fa-barcode"></i>
                                                 </span>
-                                                <input type="text" class="form-control" id="accessionNumber" 
+                                                <input type="text" class="form-control" id="accessionNumber"
                                                        placeholder="e.g.: M25053000056" maxlength="50">
-                                                <button class="btn btn-outline-secondary" type="button" 
+                                                <button class="btn btn-outline-secondary" type="button"
                                                         onclick="clearInput('accessionNumber')">
                                                     <i class="fas fa-times"></i>
                                                 </button>
                                             </div>
                                             <div class="form-text" data-i18n="enter_accession_number">Please enter the AccessionNumber of the study to process</div>
+                                        </div>
+                                        <div class="row mb-3">
+                                            <div class="col-md-6">
+                                                <label for="modalityFilter" class="form-label" data-i18n="modality_filter">Modality Filter (Optional)</label>
+                                                <input type="text" class="form-control" id="modalityFilter"
+                                                       placeholder="e.g.: MR, CT" maxlength="20">
+                                                <div class="form-text" data-i18n="modality_filter_help">Filter by modality, e.g. MR, CT (comma separated)</div>
+                                            </div>
+                                            <div class="col-md-6">
+                                                <label for="minSeriesFiles" class="form-label" data-i18n="min_series_files">Min Series Files (Optional)</label>
+                                                <input type="number" class="form-control" id="minSeriesFiles"
+                                                       placeholder="e.g.: 10" min="0" max="10000">
+                                                <div class="form-text" data-i18n="min_series_files_help">Skip series with fewer files than this</div>
+                                            </div>
                                         </div>
                                         <button type="button" class="btn btn-primary btn-lg" onclick="startSingleProcess()">
                                             <i class="fas fa-play"></i> <span data-i18n="start_process">Start Process</span>
@@ -113,9 +127,23 @@
                                         </h5>
                                         <div class="mb-3">
                                             <label for="batchAccessionNumbers" class="form-label" data-i18n="accession_number_list">AccessionNumber List</label>
-                                            <textarea class="form-control" id="batchAccessionNumbers" rows="6" 
+                                            <textarea class="form-control" id="batchAccessionNumbers" rows="6"
                                                      placeholder="Enter one AccessionNumber per line, e.g.:&#10;M25053000056&#10;M25053000057&#10;M25053000058"></textarea>
                                             <div class="form-text" data-i18n="batch_input_help">Enter one AccessionNumber per line, the system will process them sequentially</div>
+                                        </div>
+                                        <div class="row mb-3">
+                                            <div class="col-md-6">
+                                                <label for="batchModalityFilter" class="form-label" data-i18n="modality_filter">Modality Filter (Optional)</label>
+                                                <input type="text" class="form-control" id="batchModalityFilter"
+                                                       placeholder="e.g.: MR, CT" maxlength="20">
+                                                <div class="form-text" data-i18n="modality_filter_help">Filter by modality, e.g. MR, CT (comma separated)</div>
+                                            </div>
+                                            <div class="col-md-6">
+                                                <label for="batchMinSeriesFiles" class="form-label" data-i18n="min_series_files">Min Series Files (Optional)</label>
+                                                <input type="number" class="form-control" id="batchMinSeriesFiles"
+                                                       placeholder="e.g.: 10" min="0" max="10000">
+                                                <div class="form-text" data-i18n="min_series_files_help">Skip series with fewer files than this</div>
+                                            </div>
                                         </div>
                                         <div class="d-flex gap-2">
                                             <button type="button" class="btn btn-primary btn-lg" onclick="startBatchProcess()">

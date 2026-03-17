@@ -932,10 +932,20 @@ class DICOMProcessor {
         }
 
         const options = this.getProcessingOptions();
-        
+
+        // 添加过滤参数
+        const modalityFilter = document.getElementById('modalityFilter')?.value?.trim();
+        const minSeriesFiles = document.getElementById('minSeriesFiles')?.value;
+        if (modalityFilter) {
+            options.modality_filter = modalityFilter;
+        }
+        if (minSeriesFiles && parseInt(minSeriesFiles) > 0) {
+            options.min_series_files = parseInt(minSeriesFiles);
+        }
+
         try {
             console.log('发送处理请求:', { accession_number: accessionNumber, options });
-            
+
             const response = await fetch('/api/process/single', {
                 method: 'POST',
                 headers: {
@@ -998,7 +1008,17 @@ class DICOMProcessor {
 
         this.isProcessing = true;
         const options = this.getProcessingOptions();
-        
+
+        // 添加批量过滤参数
+        const modalityFilter = document.getElementById('batchModalityFilter')?.value?.trim();
+        const minSeriesFiles = document.getElementById('batchMinSeriesFiles')?.value;
+        if (modalityFilter) {
+            options.modality_filter = modalityFilter;
+        }
+        if (minSeriesFiles && parseInt(minSeriesFiles) > 0) {
+            options.min_series_files = parseInt(minSeriesFiles);
+        }
+
         try {
             const response = await fetch('/api/process/batch', {
                 method: 'POST',
