@@ -239,21 +239,27 @@ class DICOMDownloadClient:
             logger.error(f"PACS connection error: {e}")
             return False
     
-    def _query_series_metadata(self, accession_number):
-        """查询PACS获取Series元数据"""
+    def _query_series_metadata(self, accession_number, modality_filter=None, min_series_files=None):
+        """查询PACS获取Series元数据
+
+        Args:
+            accession_number: 检查号
+            modality_filter: 可选，模态过滤（如 'MR', 'CT'）
+            min_series_files: 可选，最小序列文件数，少于该值的序列将被过滤
+        """
         series_metadata = []
-        
+
         try:
             assoc = self.ae.associate(
                 self.pacs_config['PACS_IP'],
                 self.pacs_config['PACS_PORT'],
                 ae_title=self.pacs_config['CALLED_AET']
             )
-            
+
             if not assoc.is_established:
                 print("❌ Cannot build PACS connection")
                 return []
-            
+
             try:
                 # 查询Study
                 study_ds = Dataset()
@@ -263,10 +269,10 @@ class DICOMDownloadClient:
                 study_ds.PatientID = ""
                 study_ds.PatientName = ""
                 study_ds.StudyDate = ""
-                
+
                 print(f"🔍 Query AccessionNumber: {accession_number}")
                 responses = assoc.send_c_find(study_ds, StudyRootQueryRetrieveInformationModelFind)
-                
+
                 studies = {}
                 for (status, identifier) in responses:
                     if status and status.Status in [0xFF00, 0xFF01]:
@@ -278,11 +284,11 @@ class DICOMDownloadClient:
                                 'StudyDate': str(identifier.StudyDate) if hasattr(identifier, 'StudyDate') else '',
                                 'AccessionNumber': accession_number
                             }
-                
+
                 if not studies:
                     print(f"⚠️  Can't Find AccessionNumber: {accession_number}")
                     return []
-                
+
                 # 查询每个Study的Series
                 for study_uid, study_info in studies.items():
                     series_ds = Dataset()
@@ -292,38 +298,110 @@ class DICOMDownloadClient:
                     series_ds.SeriesNumber = ""
                     series_ds.SeriesDescription = ""
                     series_ds.Modality = ""
-                    
+
                     responses = assoc.send_c_find(series_ds, StudyRootQueryRetrieveInformationModelFind)
-                    
+
                     for (status, identifier) in responses:
                         if status and status.Status in [0xFF00, 0xFF01]:
                             if identifier and hasattr(identifier, 'SeriesInstanceUID'):
+                                series_modality = str(identifier.Modality) if hasattr(identifier, 'Modality') else ''
+
+                                # Modality 过滤
+                                if modality_filter:
+                                    # 支持逗号分隔的多个模态，如 "MR,CT"
+                                    allowed_modalities = [m.strip().upper() for m in modality_filter.split(',')]
+                                    if series_modality.upper() not in allowed_modalities:
+                                        continue
+
                                 series_info = dict(study_info)
                                 series_info.update({
                                     'StudyInstanceUID': study_uid,
                                     'SeriesInstanceUID': str(identifier.SeriesInstanceUID),
                                     'SeriesNumber': str(identifier.SeriesNumber) if hasattr(identifier, 'SeriesNumber') else '0',
                                     'SeriesDescription': str(identifier.SeriesDescription) if hasattr(identifier, 'SeriesDescription') else 'Unknown',
-                                    'Modality': str(identifier.Modality) if hasattr(identifier, 'Modality') else ''
+                                    'Modality': series_modality
                                 })
                                 series_metadata.append(series_info)
-                
+
+                # 如果设置了最小文件数过滤，查询每个Series的Instance数量
+                # 注意：只对3D模态（CT/MR等）应用此过滤，2D模态（DX/DR等）跳过
+                if min_series_files and min_series_files > 0:
+                    # 定义3D模态列表（这些模态通常有多个切片文件）
+                    volume_modalities = {'CT', 'MR', 'MRI', 'PT', 'NM', 'US'}
+
+                    filtered_metadata = []
+                    for series_info in series_metadata:
+                        series_uid = series_info.get('SeriesInstanceUID')
+                        study_uid = series_info.get('StudyInstanceUID')
+                        series_modality = series_info.get('Modality', '').upper()
+
+                        # 只对3D模态应用文件数过滤
+                        if series_modality not in volume_modalities:
+                            filtered_metadata.append(series_info)
+                            continue
+
+                        # 查询该Series的Instance数量
+                        instance_ds = Dataset()
+                        instance_ds.QueryRetrieveLevel = "SERIES"
+                        instance_ds.StudyInstanceUID = study_uid
+                        instance_ds.SeriesInstanceUID = series_uid
+                        instance_ds.NumberOfSeriesRelatedInstances = ""
+
+                        responses = assoc.send_c_find(instance_ds, StudyRootQueryRetrieveInformationModelFind)
+
+                        instance_count = 0
+                        for (status, identifier) in responses:
+                            if status and status.Status in [0xFF00, 0xFF01]:
+                                if identifier and hasattr(identifier, 'NumberOfSeriesRelatedInstances'):
+                                    try:
+                                        instance_count = int(identifier.NumberOfSeriesRelatedInstances)
+                                    except (ValueError, TypeError):
+                                        instance_count = 0
+                                    break
+
+                        if instance_count >= min_series_files:
+                            series_info['NumberOfSeriesRelatedInstances'] = instance_count
+                            filtered_metadata.append(series_info)
+                        else:
+                            print(f"   ⚠️  Filtered out Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
+                                  f"{instance_count} files < {min_series_files} min")
+
+                    series_metadata = filtered_metadata
+
                 print(f"📊 Find {len(series_metadata)} Series")
-                
+                if modality_filter:
+                    print(f"   (Modality filter: {modality_filter})")
+                if min_series_files and min_series_files > 0:
+                    print(f"   (Min files filter: {min_series_files})")
+
             finally:
                 assoc.release()
-                
+
         except Exception as e:
             print(f"❌ Query metadata failed: {e}")
-        
+
         return series_metadata
     
-    def download_study(self, accession_number, output_dir=".", custom_folder_name=None, on_series_downloaded=None):
-        """Download Study data (directly from PACS, no ZIP generation)"""
+    def download_study(self, accession_number, output_dir=".", custom_folder_name=None,
+                       on_series_downloaded=None, modality_filter=None, min_series_files=None):
+        """Download Study data (directly from PACS, no ZIP generation)
+
+        Args:
+            accession_number: 检查号
+            output_dir: 输出目录
+            custom_folder_name: 自定义文件夹名
+            on_series_downloaded: 下载完成回调
+            modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
+            min_series_files: 可选，最小序列文件数
+        """
         print(f"🔍 Downloading AccessionNumber: {accession_number}")
-        
-        # 查询Series信息
-        series_metadata = self._query_series_metadata(accession_number)
+
+        # 查询Series信息（应用过滤条件）
+        series_metadata = self._query_series_metadata(
+            accession_number,
+            modality_filter=modality_filter,
+            min_series_files=min_series_files
+        )
         if not series_metadata:
             print(f"❌ No data found for: {accession_number}")
             return None
@@ -1043,11 +1121,29 @@ class DICOMDownloadClient:
     def process_complete_workflow(self, accession_number, base_output_dir="./downloads",
                                 auto_extract=True, auto_organize=True, auto_metadata=True,
                                 keep_zip=True, keep_extracted=False, output_format='nifti',
-                                parallel_pipeline=True):
-        """完整的工作流程：下载 -> 整理 -> 转换 -> 提取元数据"""
+                                parallel_pipeline=True, modality_filter=None, min_series_files=None):
+        """完整的工作流程：下载 -> 整理 -> 转换 -> 提取元数据
+
+        Args:
+            accession_number: 检查号
+            base_output_dir: 基础输出目录
+            auto_extract: 自动解压（兼容性参数）
+            auto_organize: 自动整理文件
+            auto_metadata: 自动提取元数据
+            keep_zip: 保留ZIP文件（兼容性参数）
+            keep_extracted: 保留解压后的原始文件
+            output_format: 输出格式（'nifti' 或 'npz'）
+            parallel_pipeline: 是否使用并行流水线
+            modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
+            min_series_files: 可选，最小序列文件数，少于该值的序列将被跳过
+        """
         print(f"\n{'='*80}")
         print(f"🚀 Starting full DICOM processing workflow")
         print(f"📋 AccessionNumber: {accession_number}")
+        if modality_filter:
+            print(f"🔍 Modality filter: {modality_filter}")
+        if min_series_files:
+            print(f"📊 Min series files: {min_series_files}")
         print(f"{'='*80}")
         
         # 确保输出目录存在
@@ -1078,7 +1174,9 @@ class DICOMDownloadClient:
                 download_path = self.download_study(
                     accession_number,
                     base_output_dir,
-                    on_series_downloaded=_on_series_downloaded
+                    on_series_downloaded=_on_series_downloaded,
+                    modality_filter=modality_filter,
+                    min_series_files=min_series_files
                 )
                 download_dir_holder['path'] = download_path
             finally:
@@ -1137,7 +1235,12 @@ class DICOMDownloadClient:
                 print("❌ Download failed, workflow terminated")
                 return None
         else:
-            download_dir = self.download_study(accession_number, base_output_dir)
+            download_dir = self.download_study(
+                accession_number,
+                base_output_dir,
+                modality_filter=modality_filter,
+                min_series_files=min_series_files
+            )
             if not download_dir:
                 print("❌ Download failed, workflow terminated")
                 return None
