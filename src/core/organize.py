@@ -5,12 +5,16 @@ DICOM 文件组织模块
 提供 DICOM 文件的整理、分类和组织功能，支持按序列（Series）组织文件。
 """
 
+import logging
 import os
 import shutil
 import time
 import json
 import hashlib
 from typing import Dict, List, Any, Optional, Tuple
+
+# Create logger for organize module - use DICOMApp to match Flask app logging
+logger = logging.getLogger('DICOMApp')
 
 
 def compute_file_checksum(filepath: str, algorithm: str = 'md5') -> Optional[str]:
@@ -29,7 +33,8 @@ def organize_dicom_files(
     client,
     extract_dir: str,
     organized_dir: Optional[str] = None,
-    output_format: str = 'nifti'
+    output_format: str = 'nifti',
+    min_series_files: Optional[int] = None
 ) -> Tuple[str, Dict[str, Any]]:
     """
     组织 DICOM 文件并按序列分类
@@ -42,6 +47,7 @@ def organize_dicom_files(
         extract_dir: 源目录路径，包含未组织的 DICOM 文件
         organized_dir: 目标组织目录路径，默认为 extract_dir/organized
         output_format: 输出格式，可选 'nifti'、'npz' 或 None
+        min_series_files: 可选，最小文件数验证，实际文件数少于此值则跳过
 
     Returns:
         Tuple[str, Dict]: (组织后的目录路径, 序列信息字典)
@@ -62,9 +68,14 @@ def organize_dicom_files(
 
     os.makedirs(organized_dir, exist_ok=True)
 
-    print(f"📋 Organizing DICOM files (format: {output_format})...")
-    print(f"📂 Source directory: {extract_dir}")
-    print(f"📂 Organized directory: {organized_dir}")
+    logger.info(f"📋 Organizing DICOM files (format: {output_format})...")
+    logger.info(f"📂 Source directory: {extract_dir}")
+    logger.info(f"📂 Organized directory: {organized_dir}")
+    logger.info(f"📊 Min series files filter: {min_series_files}")
+
+    # 等待文件系统稳定
+    logger.info("⏳ Waiting for file system to stabilize before organizing...")
+    time.sleep(1.0)
 
     series_info: Dict[str, Any] = {}
     processed_files = 0
@@ -80,7 +91,9 @@ def organize_dicom_files(
 
         # 收集当前序列的所有 DICOM 文件
         dicom_files: List[str] = []
-        for file in os.listdir(series_path):
+        files_in_dir = os.listdir(series_path)
+        logger.info(f"   📂 Series {series_folder}: found {len(files_in_dir)} files")
+        for file in files_in_dir:
             filepath = os.path.join(series_path, file)
             if os.path.isfile(filepath) and client._is_dicom_file(filepath):
                 normalized_path = filepath
@@ -96,6 +109,28 @@ def organize_dicom_files(
                 dicom_files.append(normalized_path)
 
         if dicom_files:
+            # 整理阶段验证：检查实际文件数是否满足最小要求
+            # 注意：只对3D模态（CT/MR等）应用此验证，2D模态（DX/DR等）跳过
+            if min_series_files and min_series_files > 0:
+                volume_modalities = {'CT', 'MR', 'MRI', 'PT', 'NM', 'US'}
+                # 获取模态用于判断
+                check_modality = ''
+                try:
+                    import pydicom
+                    temp_dcm = pydicom.dcmread(dicom_files[0], force=True, stop_before_pixels=True)
+                    check_modality = str(getattr(temp_dcm, 'Modality', '')).upper()
+                except Exception:
+                    check_modality = ''
+
+                if check_modality in volume_modalities or not check_modality:
+                    actual_count = len(dicom_files)
+                    logger.info(f"   📊 Series {series_folder}: {actual_count} DICOM files, modality={check_modality}")
+                    if actual_count < min_series_files:
+                        logger.warning(f"   🚫 Series {series_folder} filtered during organize: "
+                              f"{actual_count} files < {min_series_files} min "
+                              f"(PACS reported count may be unreliable)")
+                        continue
+
             processed_files += len(dicom_files)
             sample_dcm = None
             modality = ''
@@ -131,15 +166,9 @@ def organize_dicom_files(
 
     print(f"✅ DICOM organization complete! Processed {processed_files} files")
 
-    # 将处理后的序列移动到目标目录
-    for series_folder, info in series_info.items():
-        src_path = info['path']
-        dst_path = os.path.join(organized_dir, series_folder)
-        if src_path != dst_path:
-            shutil.move(src_path, dst_path)
-            info['path'] = dst_path
-
-    return organized_dir, series_info
+    # P0: 原地处理 - 不再移动到 organized 子目录
+    # 文件已经在按序列组织的目录中，直接返回原目录
+    return extract_dir, series_info
 
 
 def process_single_series(
@@ -148,7 +177,8 @@ def process_single_series(
     series_folder: str,
     organized_dir: str,
     output_format: str = 'nifti',
-    use_cached_metadata: bool = True  # P3: 优先使用缓存的元数据
+    use_cached_metadata: bool = True,  # P3: 优先使用缓存的元数据
+    min_series_files: Optional[int] = None  # 最小文件数验证
 ) -> Optional[Dict[str, Any]]:
     """
     处理单个序列目录并移动到组织目录
@@ -160,6 +190,7 @@ def process_single_series(
         organized_dir: 目标组织目录
         output_format: 输出格式，可选 'nifti'、'npz'
         use_cached_metadata: 是否优先使用下载阶段缓存的元数据
+        min_series_files: 可选，最小文件数验证，实际文件数少于此值则跳过
 
     Returns:
         Optional[Dict]: 序列信息字典，处理失败时返回 None
@@ -256,6 +287,30 @@ def process_single_series(
     if not dicom_files:
         return None
 
+    # 整理阶段验证：检查实际文件数是否满足最小要求
+    # 注意：只对3D模态（CT/MR等）应用此验证，2D模态（DX/DR等）跳过
+    if min_series_files and min_series_files > 0:
+        volume_modalities = {'CT', 'MR', 'MRI', 'PT', 'NM', 'US'}
+
+        # 从缓存或文件中获取模态
+        check_modality = ''
+        if cached_metadata and use_cached_metadata:
+            check_modality = cached_metadata.get('modality', '').upper()
+
+        if check_modality in volume_modalities or not check_modality:
+            actual_count = len(dicom_files)
+            if actual_count < min_series_files:
+                print(f"   🚫 Series {series_folder} filtered during organize: "
+                      f"{actual_count} files < {min_series_files} min "
+                      f"(PACS reported count may be unreliable)")
+                # 清理锁文件
+                try:
+                    if os.path.exists(lock_file):
+                        os.remove(lock_file)
+                except Exception:
+                    pass
+                return None
+
     # P3: 如果有缓存的模态信息，直接使用，避免重新读取DICOM
     sample_dcm = None
     modality = ''
@@ -315,17 +370,11 @@ def process_single_series(
     elif output_format == 'npz':
         client._convert_to_npz(series_path, series_folder)
 
-    # 移动到目标目录
-    os.makedirs(organized_dir, exist_ok=True)
-    dst_path = os.path.join(organized_dir, series_folder)
-    if series_path != dst_path:
-        try:
-            shutil.move(series_path, dst_path)
-        except Exception:
-            dst_path = series_path
+    # P0: 原地处理 - 不再移动到 organized 子目录
+    # 文件已经在正确的位置，直接返回原路径
 
     return {
-        'path': dst_path,
+        'path': series_path,
         'file_count': len(dicom_files),
         'files': dicom_files
     }
