@@ -19,6 +19,20 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# Flask/Jinja2 3.0+ 兼容性修复
+# 在导入 Flask 之前先修复所有兼容性问题
+try:
+    from markupsafe import Markup, escape
+    import sys
+    # 创建 jinja2 模块的兼容性层
+    import jinja2
+    jinja2.Markup = Markup
+    jinja2.escape = escape
+    sys.modules['jinja2'].Markup = Markup
+    sys.modules['jinja2'].escape = escape
+except ImportError:
+    pass
+
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
 import time
@@ -972,12 +986,13 @@ def process_single_task(task):
         # 获取过滤参数
         modality_filter = options.get('modality_filter')
         min_series_files = options.get('min_series_files')
+        exclude_derived = options.get('exclude_derived', True)  # 默认启用衍生序列过滤
         if min_series_files is not None:
             try:
                 min_series_files = int(min_series_files)
             except (ValueError, TypeError):
                 min_series_files = None
-        
+
         task.update_status('running', 15, 'Preparing process')
         task.add_log(f"Start processing AccessionNumber: {accession_number}")
         
@@ -1004,7 +1019,8 @@ def process_single_task(task):
             series_metadata = task_client._query_series_metadata(
                 accession_number,
                 modality_filter=modality_filter,
-                min_series_files=min_series_files
+                min_series_files=min_series_files,
+                exclude_derived=exclude_derived
             )
             if not series_metadata:
                 filter_info = []
@@ -1012,6 +1028,8 @@ def process_single_task(task):
                     filter_info.append(f"Modality filter: {modality_filter}")
                 if min_series_files:
                     filter_info.append(f"Min files: {min_series_files}")
+                if exclude_derived:
+                    filter_info.append(f"Exclude derived")
                 filter_str = f" ({', '.join(filter_info)})" if filter_info else ""
                 raise Exception(f"No series found in PACS for AccessionNumber: {accession_number}{filter_str}")
             task.add_log(f"Found {len(series_metadata)} Series")
@@ -1035,7 +1053,8 @@ def process_single_task(task):
                 output_format=options.get('output_format', 'nifti'),
                 parallel_pipeline=False,  # 禁用并行流水线，使用单线程顺序处理
                 modality_filter=modality_filter,
-                min_series_files=min_series_files
+                min_series_files=min_series_files,
+                exclude_derived=exclude_derived
             )
             
             if results and results.get('success'):
@@ -1118,6 +1137,7 @@ def process_batch_task(task):
         # 获取过滤参数
         modality_filter = options.get('modality_filter')
         min_series_files = options.get('min_series_files')
+        exclude_derived = options.get('exclude_derived', True)  # 默认启用衍生序列过滤
         if min_series_files is not None:
             try:
                 min_series_files = int(min_series_files)
@@ -1127,6 +1147,8 @@ def process_batch_task(task):
             task.add_log(f"Modality filter: {modality_filter}")
         if min_series_files:
             task.add_log(f"Min series files: {min_series_files}")
+        if exclude_derived:
+            task.add_log(f"Exclude derived series: enabled")
 
         # 去重处理，保持顺序
         seen = set()
@@ -1199,7 +1221,8 @@ def process_batch_task(task):
                     output_format=options.get('output_format', 'nifti'),
                     parallel_pipeline=False,  # 禁用并行流水线，使用单线程顺序处理
                     modality_filter=modality_filter,
-                    min_series_files=min_series_files
+                    min_series_files=min_series_files,
+                    exclude_derived=exclude_derived
                 )
                 results.append(result)
                 task.add_log(f'{accno} Process completed')
