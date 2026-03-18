@@ -1199,6 +1199,64 @@ def _generate_3d_triplane_preview(
         slice_sagittal = apply_windowing(slice_sagittal, sample_dcm, modality)
         slice_coronal = apply_windowing(slice_coronal, sample_dcm, modality)
 
+        # 获取各方向的实际层数，用于判断原始采集方向
+        if preview_file.endswith(('.nii', '.nii.gz')):
+            n_axial = volume.shape[2]  # Z方向层数
+            n_sagittal = volume.shape[0]  # X方向层数
+            n_coronal = volume.shape[1]  # Y方向层数
+        else:  # npz
+            n_axial = volume.shape[0]  # Z方向层数
+            n_sagittal = volume.shape[2]  # X方向层数
+            n_coronal = volume.shape[1]  # Y方向层数
+
+        # 判断原始采集方向：层数最少的方向是扫描层厚方向（原始采集方向）
+        layer_counts = {'axial': n_axial, 'sagittal': n_sagittal, 'coronal': n_coronal}
+        original_orientation = min(layer_counts, key=layer_counts.get)
+        original_slices = layer_counts[original_orientation]
+
+        # 从NIfTI header获取体素尺寸
+        try:
+            voxel_sizes = img.header.get_zooms()[:3]  # (dx, dy, dz) in mm
+            dx, dy, dz = voxel_sizes[0], voxel_sizes[1], voxel_sizes[2]
+        except Exception:
+            # 如果无法获取，从层厚推断
+            st = slice_thickness if slice_thickness else 1.0
+            dx = dy = dz = st
+
+        # 计算各方向的物理尺寸 (mm)
+        phys_x = n_sagittal * dx  # 左右方向
+        phys_y = n_coronal * dy   # 前后方向（可能是层厚方向）
+        phys_z = n_axial * dz     # 头足方向
+
+        # 调整纵横比：只对重建方向（非原始方向）进行调整
+        def adjust_aspect_ratio(slice_img, phys_width, phys_height):
+            """根据物理尺寸调整图像纵横比"""
+            h, w = slice_img.shape
+            current_aspect = w / h
+            target_aspect = phys_width / phys_height
+
+            # 如果纵横比接近，不需要调整
+            if abs(current_aspect - target_aspect) / target_aspect < 0.1:
+                return slice_img
+
+            # 计算调整后的尺寸，保持物理纵横比
+            if current_aspect < target_aspect:
+                new_w = int(h * target_aspect)
+                new_h = h
+            else:
+                new_w = w
+                new_h = int(w / target_aspect)
+
+            pil_img = Image.fromarray(slice_img)
+            pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+            return np.array(pil_img)
+
+        # 注意：经过transpose后，各方向切片已经呈现真实物理纵横比
+        # Axial (横断位): 宽=phys_x, 高=phys_y (对于冠状位扫描，phys_y很小，所以图像很扁)
+        # Sagittal (矢状位): 宽=phys_y, 高=phys_z (对于冠状位扫描，phys_y很小，所以图像很窄)
+        # Coronal (冠状位): 宽=phys_x, 高=phys_z (原始采集方向，通常是正方形)
+        # 不需要额外调整纵横比，直接显示真实比例
+
         # 转换为RGB用于绘制彩色文字
         slice_axial_rgb = np.stack([slice_axial, slice_axial, slice_axial], axis=2)
         slice_sagittal_rgb = np.stack([slice_sagittal, slice_sagittal, slice_sagittal], axis=2)
@@ -1207,41 +1265,30 @@ def _generate_3d_triplane_preview(
         # 获取层厚信息
         slice_thickness = _get_slice_thickness(sample_dcm)
         thickness_text = f"ST: {slice_thickness:.2f}mm" if slice_thickness else "ST: N/A"
-        count_text = f"Slices: {total_slices}"
+        count_text = f"Slices: {original_slices}"
 
-        # 添加文字标注
-        h, w = slice_axial.shape[:2]
-        text_y = 10
+        # 绘制标签：只在原始方向标注层数和层厚
+        def draw_orientation_label(img, orientation_name, is_original):
+            """绘制方位标签"""
+            img[:85, :, :] = 0
+            if is_original:
+                img = _draw_text_on_image(img, f"{orientation_name} ({original_slices})",
+                                          (10, 10), font_size=20, color=(255, 255, 0))
+                img = _draw_text_on_image(img, thickness_text, (10, 40),
+                                          font_size=16, color=(255, 255, 255))
+                img = _draw_text_on_image(img, count_text, (10, 65),
+                                          font_size=16, color=(255, 255, 255))
+            else:
+                img = _draw_text_on_image(img, orientation_name, (10, 10),
+                                          font_size=20, color=(255, 255, 0))
+            return img
 
-        slice_axial_rgb = _draw_text_on_image(
-            slice_axial_rgb, "AXIAL", (10, text_y), font_size=24, color=(255, 255, 0)
-        )
-        slice_axial_rgb = _draw_text_on_image(
-            slice_axial_rgb, thickness_text, (10, text_y + 30), font_size=16, color=(255, 255, 255)
-        )
-        slice_axial_rgb = _draw_text_on_image(
-            slice_axial_rgb, count_text, (10, text_y + 55), font_size=16, color=(255, 255, 255)
-        )
-
-        slice_sagittal_rgb = _draw_text_on_image(
-            slice_sagittal_rgb, "SAGITTAL", (10, text_y), font_size=24, color=(255, 255, 0)
-        )
-        slice_sagittal_rgb = _draw_text_on_image(
-            slice_sagittal_rgb, thickness_text, (10, text_y + 30), font_size=16, color=(255, 255, 255)
-        )
-        slice_sagittal_rgb = _draw_text_on_image(
-            slice_sagittal_rgb, count_text, (10, text_y + 55), font_size=16, color=(255, 255, 255)
-        )
-
-        slice_coronal_rgb = _draw_text_on_image(
-            slice_coronal_rgb, "CORONAL", (10, text_y), font_size=24, color=(255, 255, 0)
-        )
-        slice_coronal_rgb = _draw_text_on_image(
-            slice_coronal_rgb, thickness_text, (10, text_y + 30), font_size=16, color=(255, 255, 255)
-        )
-        slice_coronal_rgb = _draw_text_on_image(
-            slice_coronal_rgb, count_text, (10, text_y + 55), font_size=16, color=(255, 255, 255)
-        )
+        slice_axial_rgb = draw_orientation_label(slice_axial_rgb, "AXIAL",
+                                                  original_orientation == 'axial')
+        slice_sagittal_rgb = draw_orientation_label(slice_sagittal_rgb, "SAGITTAL",
+                                                     original_orientation == 'sagittal')
+        slice_coronal_rgb = draw_orientation_label(slice_coronal_rgb, "CORONAL",
+                                                    original_orientation == 'coronal')
 
         # 统一三个视图的大小
         max_h = max(slice_axial_rgb.shape[0], slice_sagittal_rgb.shape[0], slice_coronal_rgb.shape[0])

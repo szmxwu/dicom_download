@@ -227,11 +227,25 @@ def main(cli_args=None):
     # 提交任务，带重试机制
     max_retries = 3
     retry_delay = 2
-    
+    queue_full_retry_delay = 10  # 队列满时的重试间隔
+
     for attempt in range(max_retries):
         try:
             print(f"[*] 正在提交任务 (尝试 {attempt + 1}/{max_retries})...")
             response = requests.post(API_SINGLE, json=payload, timeout=REQUEST_TIMEOUT)
+
+            # 处理队列满的情况 (HTTP 503)
+            if response.status_code == 503:
+                error_msg = response.json().get('error', 'Task queue is full')
+                print(f"[!] 服务器队列已满: {error_msg}")
+                if attempt < max_retries - 1:
+                    print(f"[*] 等待 {queue_full_retry_delay} 秒后重试...")
+                    time.sleep(queue_full_retry_delay)
+                    continue
+                else:
+                    print(f"[!] 已达到最大重试次数，服务器队列已满，请稍后重试")
+                    return False
+
             if response.status_code != 200:
                 print(f"[!] 提交任务失败 ({response.status_code}): {response.text}")
                 if attempt < max_retries - 1:
@@ -239,8 +253,13 @@ def main(cli_args=None):
                     continue
                 return False
 
-            task_id = response.json().get('task_id')
-            print(f"[+] 任务已启动，ID: {task_id}")
+            data = response.json()
+            task_id = data.get('task_id')
+            status = data.get('status', 'started')
+            if status == 'queued':
+                print(f"[+] 任务已加入队列，ID: {task_id} (等待中...)")
+            else:
+                print(f"[+] 任务已启动，ID: {task_id}")
             break
         except requests.exceptions.ConnectionError as e:
             print(f"[!] 连接失败 (尝试 {attempt + 1}/{max_retries}): {e}")

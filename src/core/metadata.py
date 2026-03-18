@@ -24,6 +24,7 @@ DICOM 元数据提取模块。
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -32,6 +33,9 @@ import pandas as pd
 import pydicom
 
 from src.core.qc import ImageQualityResult, assess_converted_file_quality as _default_assess_file_qc, assess_series_quality_converted as _default_assess_series_qc
+
+# Create logger for metadata module - use DICOMApp to match Flask app logging
+logger = logging.getLogger('DICOMApp')
 
 
 def _extract_quality_value(result: Union[ImageQualityResult, int]) -> Tuple[int, str]:
@@ -108,16 +112,22 @@ def extract_dicom_metadata(
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         output_excel = os.path.join(os.path.dirname(organized_dir), f"dicom_metadata_{timestamp}.xlsx")
 
-    print("📊 Extracting DICOM metadata...")
+    logger.info("📊 Extracting DICOM metadata...")
+    logger.info(f"   Organized dir: {organized_dir}")
 
     all_metadata: List[Dict] = []
 
-    for series_folder in os.listdir(organized_dir):
+    # List all series folders (skip 'organized' subdirectory if exists - legacy compatibility)
+    series_folders = [f for f in os.listdir(organized_dir)
+                      if os.path.isdir(os.path.join(organized_dir, f)) and f != 'organized']
+    logger.info(f"   Found {len(series_folders)} series folders: {series_folders}")
+
+    for series_folder in series_folders:
         series_path = os.path.join(organized_dir, series_folder)
         if not os.path.isdir(series_path):
             continue
 
-        print(f"📂 Processing series: {series_folder}")
+        logger.info(f"📂 Processing series: {series_folder}")
 
         converted_files, _ = get_converted_files(series_path)
 
@@ -239,6 +249,7 @@ def extract_dicom_metadata(
 
             # Fallback: only if no cache or cache failed to load
             if not cache_loaded:
+                logger.warning(f"     ⚠️  No DICOM files found in {series_folder}, trying NIfTI fallback")
                 nifti_files = [f for f in os.listdir(series_path) if f.endswith(('.nii.gz', '.nii'))]
                 if nifti_files:
                     metadata = {
@@ -248,6 +259,9 @@ def extract_dicom_metadata(
                         'TotalFilesInSeries': 1
                     }
                     all_metadata.append(metadata)
+                    print(f"     ✅ Added NIfTI fallback for {series_folder}")
+                else:
+                    print(f"     ❌ No NIfTI files either in {series_folder}")
                 continue
 
         try:
@@ -369,11 +383,12 @@ def extract_dicom_metadata(
                 all_metadata.append(metadata)
 
         except Exception as e:
-            print(f"     ❌ Failed processing series: {e}")
+            logger.error(f"     ❌ Failed processing series: {e}")
             continue
 
     if not all_metadata:
-        print("❌ No metadata extracted")
+        logger.error(f"❌ No metadata extracted from {organized_dir}")
+        logger.error(f"   Series folders found: {len(series_folders)}")
         return None
 
     try:
@@ -446,5 +461,7 @@ def extract_dicom_metadata(
         return output_excel
 
     except Exception as e:
-        print(f"❌ Failed saving Excel file: {e}")
+        logger.error(f"❌ Failed saving Excel file: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return None

@@ -215,6 +215,9 @@ class DICOMProcessor {
                 'start_process_failed': 'Failed to start process',
                 'network_error': 'Network Error: ',
                 'process_started': 'Process task started',
+                'process_queued': 'Task queued, waiting...',
+                'batch_process_queued': 'Batch task queued, waiting...',
+                'upload_process_queued': 'Upload task queued, waiting...',
                 'enter_accession_number_list_error': 'Please enter AccessionNumber list',
                 'no_valid_accession_number': 'No valid AccessionNumber',
                 'start_batch_process_failed': 'Failed to start batch process',
@@ -236,7 +239,44 @@ class DICOMProcessor {
                 'system_normal_html': '<i class="fas fa-circle"></i> System Normal',
                 'system_abnormal_html': '<i class="fas fa-exclamation-triangle"></i> System Abnormal',
                 'connection_lost_html': '<i class="fas fa-wifi"></i> Connection Lost',
-                'connection_error': 'Connection Error'
+                'connection_error': 'Connection Error',
+                'monitoring': 'Monitoring',
+                'system_monitoring': 'System Monitoring',
+                'disk_usage': 'Disk Usage',
+                'memory_usage': 'Memory Usage',
+                'cpu_usage': 'CPU Usage',
+                'pacs_status': 'PACS Status',
+                'used': 'Used',
+                'available': 'Available',
+                'cores': 'Cores',
+                'checking': 'Checking...',
+                'task_statistics': 'Task Statistics',
+                'total': 'Total',
+                'running': 'Running',
+                'pending': 'Pending',
+                'completed': 'Completed',
+                'failed': 'Failed',
+                'cancelled': 'Cancelled',
+                'active_tasks_detail': 'Active Tasks',
+                'progress': 'Progress',
+                'current_step': 'Current Step',
+                'elapsed_time': 'Elapsed',
+                'action': 'Action',
+                'no_active_tasks': 'No active tasks',
+                'directory_usage': 'Directory Usage',
+                'recent_completed': 'Recent Completed',
+                'no_recent_tasks': 'No recent tasks',
+                'auto_refresh': 'Auto',
+                'stop_auto_refresh': 'Stop',
+                'cancel': 'Cancel',
+                'seconds_ago': 'seconds ago',
+                'minutes_ago': 'minutes ago',
+                'hours_ago': 'hours ago',
+                'log_files': 'Log Files',
+                'download_log': 'Download Log',
+                'no_log_files': 'No log files',
+                'file_size': 'Size',
+                'modified_time': 'Modified'
             },
             'zh': {
                 'app_title': 'DICOM处理系统',
@@ -341,6 +381,9 @@ class DICOMProcessor {
                 'start_process_failed': '启动处理失败',
                 'network_error': '网络错误: ',
                 'process_started': '处理任务已启动',
+                'process_queued': '任务已加入队列，等待中...',
+                'batch_process_queued': '批量任务已加入队列，等待中...',
+                'upload_process_queued': '上传任务已加入队列，等待中...',
                 'enter_accession_number_list_error': '请输入AccessionNumber列表',
                 'no_valid_accession_number': '没有有效的AccessionNumber',
                 'start_batch_process_failed': '启动批量处理失败',
@@ -362,7 +405,44 @@ class DICOMProcessor {
                 'system_normal_html': '<i class="fas fa-circle"></i> 系统正常',
                 'system_abnormal_html': '<i class="fas fa-exclamation-triangle"></i> 系统异常',
                 'connection_lost_html': '<i class="fas fa-wifi"></i> 连接中断',
-                'connection_error': '无法连接'
+                'connection_error': '无法连接',
+                'monitoring': '监控',
+                'system_monitoring': '系统监控',
+                'disk_usage': '磁盘使用',
+                'memory_usage': '内存使用',
+                'cpu_usage': 'CPU使用',
+                'pacs_status': 'PACS状态',
+                'used': '已用',
+                'available': '可用',
+                'cores': '核心',
+                'checking': '检查中...',
+                'task_statistics': '任务统计',
+                'total': '总数',
+                'running': '运行中',
+                'pending': '等待中',
+                'completed': '已完成',
+                'failed': '失败',
+                'cancelled': '已取消',
+                'active_tasks_detail': '活跃任务',
+                'progress': '进度',
+                'current_step': '当前步骤',
+                'elapsed_time': '已运行',
+                'action': '操作',
+                'no_active_tasks': '无活跃任务',
+                'directory_usage': '目录使用',
+                'recent_completed': '近期完成',
+                'no_recent_tasks': '无近期任务',
+                'auto_refresh': '自动',
+                'stop_auto_refresh': '停止',
+                'cancel': '取消',
+                'seconds_ago': '秒前',
+                'minutes_ago': '分钟前',
+                'hours_ago': '小时前',
+                'log_files': '日志文件',
+                'download_log': '下载日志',
+                'no_log_files': '无日志文件',
+                'file_size': '大小',
+                'modified_time': '修改时间'
             }
         };
 
@@ -518,6 +598,24 @@ class DICOMProcessor {
         const historyTab = document.getElementById('history-tab');
         if (historyTab) {
             historyTab.addEventListener('shown.bs.tab', () => this.loadTaskHistory());
+        }
+
+        // 监控标签页事件
+        const monitoringTab = document.getElementById('monitoring-tab');
+        if (monitoringTab) {
+            monitoringTab.addEventListener('shown.bs.tab', () => {
+                this.loadMonitoringData();
+                // 自动开启自动刷新
+                if (!this.monitoringAutoRefreshInterval) {
+                    this.toggleAutoRefresh();
+                }
+            });
+            // 离开监控页面时停止自动刷新
+            monitoringTab.addEventListener('hidden.bs.tab', () => {
+                if (this.monitoringAutoRefreshInterval) {
+                    this.toggleAutoRefresh();
+                }
+            });
         }
 
         const historyPageSize = document.getElementById('historyPageSize');
@@ -975,16 +1073,24 @@ class DICOMProcessor {
 
             const data = await response.json();
             console.log('处理响应:', data);
-            
+
             if (response.ok) {
-                this.currentTask = { 
-                    id: data.task_id, 
+                const isQueued = data.status === 'queued';
+                this.currentTask = {
+                    id: data.task_id,
                     type: 'single',
-                    status: 'running'
+                    status: isQueued ? 'pending' : 'running'
                 };
                 this.showProgressCard();
                 this.subscribeToTask(data.task_id);
-                this.showSuccess(this.translations[this.currentLang]['process_started']);
+                if (isQueued) {
+                    this.showSuccess(this.translations[this.currentLang]['process_queued'] || 'Task queued, waiting...');
+                } else {
+                    this.showSuccess(this.translations[this.currentLang]['process_started']);
+                }
+            } else if (response.status === 503) {
+                // 队列满
+                this.showError((data.error || 'Task queue is full') + '. Please try again later.');
             } else {
                 this.showError(data.error || this.translations[this.currentLang]['start_process_failed']);
             }
@@ -1052,16 +1158,24 @@ class DICOMProcessor {
             });
 
             const data = await response.json();
-            
+
             if (response.ok) {
-                this.currentTask = { 
-                    id: data.task_id, 
+                const isQueued = data.status === 'queued';
+                this.currentTask = {
+                    id: data.task_id,
                     type: 'batch',
-                    status: 'running'
+                    status: isQueued ? 'pending' : 'running'
                 };
                 this.showProgressCard();
                 this.subscribeToTask(data.task_id);
-                this.showSuccess(`${this.translations[this.currentLang]['batch_process_started']} (${accessionNumbers.length})`);
+                if (isQueued) {
+                    this.showSuccess(`${this.translations[this.currentLang]['batch_process_queued'] || 'Batch task queued'} (${accessionNumbers.length})`);
+                } else {
+                    this.showSuccess(`${this.translations[this.currentLang]['batch_process_started']} (${accessionNumbers.length})`);
+                }
+            } else if (response.status === 503) {
+                // 队列满
+                this.showError((data.error || 'Task queue is full') + '. Please try again later.');
             } else {
                 this.showError(data.error || this.translations[this.currentLang]['start_batch_process_failed']);
             }
@@ -1103,16 +1217,24 @@ class DICOMProcessor {
             });
 
             const data = await response.json();
-            
+
             if (response.ok) {
-                this.currentTask = { 
-                    id: data.task_id, 
+                const isQueued = data.status === 'queued';
+                this.currentTask = {
+                    id: data.task_id,
                     type: 'upload',
-                    status: 'running'
+                    status: isQueued ? 'pending' : 'running'
                 };
                 this.showProgressCard();
                 this.subscribeToTask(data.task_id);
-                this.showSuccess(this.translations[this.currentLang]['upload_process_started']);
+                if (isQueued) {
+                    this.showSuccess(this.translations[this.currentLang]['upload_process_queued'] || 'Upload task queued, waiting...');
+                } else {
+                    this.showSuccess(this.translations[this.currentLang]['upload_process_started']);
+                }
+            } else if (response.status === 503) {
+                // 队列满
+                this.showError((data.error || 'Task queue is full') + '. Please try again later.');
             } else {
                 this.showError(data.error || this.translations[this.currentLang]['start_upload_failed']);
             }
@@ -1799,6 +1921,309 @@ class DICOMProcessor {
         div.textContent = text;
         return div.innerHTML;
     }
+
+    // ==================== 监控页面功能 ====================
+
+    // 加载监控数据
+    async loadMonitoringData() {
+        try {
+            const response = await fetch('/api/system/monitoring');
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            const data = await response.json();
+            this.updateMonitoringUI(data);
+
+            // 更新最后更新时间
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString();
+            const lastUpdateEl = document.getElementById('lastUpdateTime');
+            if (lastUpdateEl) {
+                lastUpdateEl.textContent = timeStr;
+            }
+        } catch (error) {
+            console.error('加载监控数据失败:', error);
+        }
+    }
+
+    // 更新监控页面UI
+    updateMonitoringUI(data) {
+        const t = this.translations[this.currentLang];
+
+        // 更新磁盘使用
+        if (data.disk && !data.disk.error) {
+            const diskPercent = data.disk.percent_used || 0;
+            const diskBar = document.getElementById('diskProgressBar');
+            if (diskBar) {
+                diskBar.style.width = `${diskPercent}%`;
+                diskBar.className = `progress-bar ${diskPercent > 90 ? 'bg-danger' : diskPercent > 70 ? 'bg-warning' : 'bg-primary'}`;
+            }
+            const diskUsedEl = document.getElementById('diskUsed');
+            if (diskUsedEl) diskUsedEl.textContent = data.disk.used_gb || '--';
+            const diskTotalEl = document.getElementById('diskTotal');
+            if (diskTotalEl) diskTotalEl.textContent = data.disk.total_gb || '--';
+            const diskFreeEl = document.getElementById('diskFree');
+            if (diskFreeEl) diskFreeEl.textContent = `${t['available'] || 'Free'}: ${data.disk.free_gb || '--'} GB`;
+        }
+
+        // 更新内存使用
+        if (data.memory && !data.memory.error) {
+            const memPercent = data.memory.percent_used || 0;
+            const memBar = document.getElementById('memoryProgressBar');
+            if (memBar) {
+                memBar.style.width = `${memPercent}%`;
+            }
+            const memUsedEl = document.getElementById('memoryUsed');
+            if (memUsedEl) memUsedEl.textContent = memPercent;
+            const memAvailableEl = document.getElementById('memoryAvailable');
+            if (memAvailableEl) memAvailableEl.textContent = data.memory.available_gb || '--';
+        }
+
+        // 更新CPU使用
+        if (data.cpu && !data.cpu.error) {
+            const cpuPercentEl = document.getElementById('cpuPercent');
+            if (cpuPercentEl) cpuPercentEl.textContent = `${data.cpu.percent || '--'}%`;
+            const cpuCoresEl = document.getElementById('cpuCores');
+            if (cpuCoresEl) cpuCoresEl.textContent = data.cpu.count || '--';
+        }
+
+        // 更新PACS状态
+        if (data.pacs_connection) {
+            const pacsBadge = document.getElementById('pacsStatusBadge');
+            if (pacsBadge) {
+                if (data.pacs_connection.connected) {
+                    pacsBadge.innerHTML = `<span class="badge bg-success"><i class="fas fa-check"></i> ${t['normal'] || 'Normal'}</span>`;
+                } else {
+                    pacsBadge.innerHTML = `<span class="badge bg-danger"><i class="fas fa-times"></i> ${t['error'] || 'Error'}</span>`;
+                }
+            }
+            const pacsSummary = document.getElementById('pacsConfigSummary');
+            if (pacsSummary && data.pacs_connection.config) {
+                const cfg = data.pacs_connection.config;
+                pacsSummary.textContent = `${cfg.called_aet} @ ${cfg.pacs_ip}:${cfg.pacs_port}`;
+            }
+        }
+
+        // 更新任务统计
+        if (data.task_summary) {
+            const statTotal = document.getElementById('statTotal');
+            if (statTotal) statTotal.textContent = data.task_summary.total || 0;
+            const statRunning = document.getElementById('statRunning');
+            if (statRunning) statRunning.textContent = data.task_summary.running || 0;
+            const statPending = document.getElementById('statPending');
+            if (statPending) statPending.textContent = data.task_summary.pending || 0;
+            const statCompleted = document.getElementById('statCompleted');
+            if (statCompleted) statCompleted.textContent = data.task_summary.completed || 0;
+            const statFailed = document.getElementById('statFailed');
+            if (statFailed) statFailed.textContent = data.task_summary.failed || 0;
+            const statCancelled = document.getElementById('statCancelled');
+            if (statCancelled) statCancelled.textContent = data.task_summary.cancelled || 0;
+        }
+
+        // 更新活跃任务列表
+        this.updateActiveTasksTable(data.active_tasks || [], t);
+
+        // 更新目录使用
+        this.updateDirectoryUsage(data.directories || {}, t);
+
+        // 更新近期完成任务
+        this.updateRecentCompletedTable(data.recent_completed || [], t);
+
+        // 更新日志文件列表
+        this.updateLogFilesTable(data.log_files || [], t);
+    }
+
+    // 更新活跃任务表格
+    updateActiveTasksTable(tasks, t) {
+        const tbody = document.getElementById('activeTasksBody');
+        if (!tbody) return;
+
+        if (tasks.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted">${t['no_active_tasks'] || 'No active tasks'}</td></tr>`;
+            return;
+        }
+
+        tbody.innerHTML = tasks.map(task => {
+            const elapsed = task.elapsed_seconds ? this.formatElapsedTime(task.elapsed_seconds) : '--';
+            const progressBar = `
+                <div class="progress" style="height: 6px;">
+                    <div class="progress-bar" role="progressbar" style="width: ${task.progress || 0}%"></div>
+                </div>
+                <small>${task.progress || 0}%</small>
+            `;
+            const statusBadge = task.status === 'running'
+                ? '<span class="badge bg-primary">Running</span>'
+                : '<span class="badge bg-warning">Pending</span>';
+
+            let taskInfo = '';
+            if (task.type === 'single' && task.parameters.accession_number) {
+                taskInfo = `<small class="text-muted">${this.escapeHtml(task.parameters.accession_number)}</small>`;
+            } else if (task.type === 'batch' && task.parameters.batch_count) {
+                taskInfo = `<small class="text-muted">${task.parameters.batch_count} items</small>`;
+            }
+
+            return `
+                <tr>
+                    <td><small>${task.task_id.substring(0, 8)}...</small></td>
+                    <td>${task.type}${taskInfo ? '<br>' + taskInfo : ''}</td>
+                    <td>${statusBadge}</td>
+                    <td>${progressBar}</td>
+                    <td><small>${this.escapeHtml(task.current_step || '--')}</small></td>
+                    <td><small>${elapsed}</small></td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-danger" onclick="cancelTaskById('${task.task_id}')">
+                            <i class="fas fa-stop"></i> ${t['cancel'] || 'Cancel'}
+                        </button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    // 更新目录使用显示
+    updateDirectoryUsage(directories, t) {
+        const container = document.getElementById('directoryUsageContainer');
+        if (!container) return;
+
+        const dirNames = {
+            'results': { icon: 'fa-folder', color: 'primary', label: 'Results' },
+            'uploads': { icon: 'fa-upload', color: 'info', label: 'Uploads' },
+            'temp': { icon: 'fa-temp', color: 'warning', label: 'Temp' },
+            'logs': { icon: 'fa-file-alt', color: 'secondary', label: 'Logs' }
+        };
+
+        let html = '';
+        for (const [key, info] of Object.entries(directories)) {
+            const config = dirNames[key] || { icon: 'fa-folder', color: 'secondary', label: key };
+            html += `
+                <div class="col-md-3 col-sm-6 mb-3">
+                    <div class="d-flex align-items-center">
+                        <i class="fas ${config.icon} fa-2x text-${config.color} me-2"></i>
+                        <div>
+                            <div class="small text-muted">${config.label}</div>
+                            <div class="fw-bold">${info.size_gb} GB</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        container.innerHTML = html || `<div class="col-12 text-muted text-center">${t['no_data'] || 'No data'}</div>`;
+    }
+
+    // 更新近期完成任务表格
+    updateRecentCompletedTable(tasks, t) {
+        const tbody = document.getElementById('recentCompletedBody');
+        if (!tbody) return;
+
+        if (tasks.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">${t['no_recent_tasks'] || 'No recent tasks'}</td></tr>`;
+            return;
+        }
+
+        const statusColors = {
+            'completed': 'success',
+            'failed': 'danger',
+            'cancelled': 'secondary'
+        };
+
+        tbody.innerHTML = tasks.map(task => {
+            const statusColor = statusColors[task.status] || 'secondary';
+            const duration = task.elapsed_seconds ? this.formatElapsedTime(task.elapsed_seconds) : '--';
+
+            return `
+                <tr>
+                    <td><small>${task.task_id.substring(0, 8)}...</small></td>
+                    <td>${task.type}</td>
+                    <td><span class="badge bg-${statusColor}">${task.status}</span></td>
+                    <td>${duration}</td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    // 更新日志文件列表
+    updateLogFilesTable(logFiles, t) {
+        const tbody = document.getElementById('logFilesBody');
+        if (!tbody) return;
+
+        if (logFiles.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">${t['no_log_files'] || 'No log files'}</td></tr>`;
+            return;
+        }
+
+        tbody.innerHTML = logFiles.map(log => {
+            const modifiedDate = new Date(log.modified * 1000).toLocaleString();
+            return `
+                <tr>
+                    <td><small>${this.escapeHtml(log.name)}</small></td>
+                    <td><small>${log.size_mb} MB</small></td>
+                    <td><small>${modifiedDate}</small></td>
+                    <td>
+                        <a href="/api/logs/download/${encodeURIComponent(log.name)}" class="btn btn-sm btn-outline-primary" download>
+                            <i class="fas fa-download"></i> ${t['download_log'] || 'Download'}
+                        </a>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    // 格式化已运行时间
+    formatElapsedTime(seconds) {
+        if (seconds < 60) {
+            return `${Math.floor(seconds)}s`;
+        } else if (seconds < 3600) {
+            return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+        } else {
+            const hours = Math.floor(seconds / 3600);
+            const mins = Math.floor((seconds % 3600) / 60);
+            return `${hours}h ${mins}m`;
+        }
+    }
+
+    // 切换自动刷新
+    toggleAutoRefresh() {
+        if (this.monitoringAutoRefreshInterval) {
+            clearInterval(this.monitoringAutoRefreshInterval);
+            this.monitoringAutoRefreshInterval = null;
+            const icon = document.getElementById('autoRefreshIcon');
+            const text = document.getElementById('autoRefreshText');
+            if (icon) icon.className = 'fas fa-play';
+            if (text) text.textContent = this.translations[this.currentLang]['auto_refresh'] || 'Auto';
+        } else {
+            this.loadMonitoringData();
+            this.monitoringAutoRefreshInterval = setInterval(() => {
+                this.loadMonitoringData();
+            }, 5000);
+            const icon = document.getElementById('autoRefreshIcon');
+            const text = document.getElementById('autoRefreshText');
+            if (icon) icon.className = 'fas fa-pause';
+            if (text) text.textContent = this.translations[this.currentLang]['stop_auto_refresh'] || 'Stop';
+        }
+    }
+
+    // 取消指定任务
+    async cancelTaskById(taskId) {
+        const t = this.translations[this.currentLang];
+        if (confirm(t['confirm_cancel_task'] || 'Are you sure you want to cancel this task?')) {
+            try {
+                const response = await fetch(`/api/task/${taskId}/cancel`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    this.showSuccess(t['task_cancelled'] || 'Task cancelled');
+                    this.loadMonitoringData();
+                } else {
+                    const data = await response.json();
+                    this.showError(data.error || t['cancel_task_failed'] || 'Failed to cancel task');
+                }
+            } catch (error) {
+                this.showError((t['network_error'] || 'Network error: ') + error.message);
+            }
+        }
+    }
 }
 
 // 全局函数（供HTML调用）
@@ -1846,4 +2271,8 @@ function resetAllOptions() {
 
 function exportSettings() {
     processor.exportSettings();
+}
+
+function cancelTaskById(taskId) {
+    processor.cancelTaskById(taskId);
 }

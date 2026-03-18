@@ -408,7 +408,7 @@ class DICOMDownloadClient:
             
             if assoc.is_established:
                 assoc.release()
-                logger.info("PACS connection status: OK")
+                logger.debug("PACS connection status: OK")
                 return True
             else:
                 logger.warning("Unable to connect to PACS")
@@ -480,6 +480,7 @@ class DICOMDownloadClient:
                     series_ds.SeriesDescription = ""
                     series_ds.Modality = ""
                     series_ds.ImageType = ""  # 用于区分原始/派生图像
+                    series_ds.SliceThickness = ""  # 用于过滤定位像(层厚为NA的)
 
                     responses = assoc.send_c_find(series_ds, StudyRootQueryRetrieveInformationModelFind)
 
@@ -533,8 +534,9 @@ class DICOMDownloadClient:
                                 })
                                 series_metadata.append(series_info)
 
-                # 如果设置了最小文件数过滤，查询每个Series的Instance数量
+                # 如果设置了最小文件数过滤，查询每个Series的Instance数量和层厚
                 # 注意：只对3D模态（CT/MR等）应用此过滤，2D模态（DX/DR等）跳过
+                # 同时过滤掉层厚为NA的序列（通常是定位像/Scout/Topogram）
                 if min_series_files and min_series_files > 0:
                     # 定义3D模态列表（这些模态通常有多个切片文件）
                     volume_modalities = {'CT', 'MR', 'MRI', 'PT', 'NM', 'US'}
@@ -550,16 +552,18 @@ class DICOMDownloadClient:
                             filtered_metadata.append(series_info)
                             continue
 
-                        # 查询该Series的Instance数量
+                        # 查询该Series的Instance数量和层厚
                         instance_ds = Dataset()
                         instance_ds.QueryRetrieveLevel = "SERIES"
                         instance_ds.StudyInstanceUID = study_uid
                         instance_ds.SeriesInstanceUID = series_uid
                         instance_ds.NumberOfSeriesRelatedInstances = ""
+                        instance_ds.SliceThickness = ""
 
                         responses = assoc.send_c_find(instance_ds, StudyRootQueryRetrieveInformationModelFind)
 
                         instance_count = 0
+                        slice_thickness = None
                         for (status, identifier) in responses:
                             if status and status.Status in [0xFF00, 0xFF01]:
                                 if identifier and hasattr(identifier, 'NumberOfSeriesRelatedInstances'):
@@ -567,10 +571,27 @@ class DICOMDownloadClient:
                                         instance_count = int(identifier.NumberOfSeriesRelatedInstances)
                                     except (ValueError, TypeError):
                                         instance_count = 0
-                                    break
+                                # 获取层厚信息
+                                if identifier and hasattr(identifier, 'SliceThickness'):
+                                    try:
+                                        st = identifier.SliceThickness
+                                        if st is not None and str(st).strip():
+                                            slice_thickness = float(st)
+                                    except (ValueError, TypeError):
+                                        slice_thickness = None
+                                break
+
+                        # 检查层厚是否有效（过滤定位像）
+                        # 注意：只有当SliceThickness明确存在且无效(<=0)时才过滤
+                        # 如果PACS没有返回该字段，则不过滤（保留到整理阶段通过实际文件数验证）
+                        if slice_thickness is not None and slice_thickness <= 0:
+                            logger.info(f"   🚫 Filtered out Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
+                                  f"SliceThickness={slice_thickness} (likely a scout/localizer)")
+                            continue
 
                         if instance_count >= min_series_files:
                             series_info['NumberOfSeriesRelatedInstances'] = instance_count
+                            series_info['SliceThickness'] = slice_thickness
                             filtered_metadata.append(series_info)
                         else:
                             logger.info(f"   ⚠️  Filtered out Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
@@ -580,11 +601,11 @@ class DICOMDownloadClient:
 
                 logger.info(f"📊 Find {len(series_metadata)} Series (after filtering)")
                 if modality_filter:
-                    logger.info(f"   (Modality filter: {modality_filter})")
+                    logger.debug(f"   (Modality filter: {modality_filter})")
                 if min_series_files and min_series_files > 0:
-                    logger.info(f"   (Min files filter: {min_series_files})")
+                    logger.debug(f"   (Min files filter: {min_series_files})")
                 if exclude_derived:
-                    logger.info(f"   (Derived series filtered by keywords: {DERIVED_SERIES_KEYWORDS})")
+                    logger.debug(f"   (Derived series filtered by keywords: {DERIVED_SERIES_KEYWORDS})")
 
         except ConnectionError as e:
             logger.error(f"❌ Failed to establish PACS connection: {e}")
@@ -637,9 +658,11 @@ class DICOMDownloadClient:
         # P3: 存储状态，包括校验和信息
         storage_state = {
             'current_path': '',
+            'current_series_uid': '',  # 当前处理的SeriesInstanceUID
             'files_received': 0,
             'current_series_files': set(),  # 当前序列接收的文件
-            'failed_files': []  # 失败的文件记录
+            'failed_files': [],  # 失败的文件记录
+            'series_uid_to_dir': {}  # SeriesInstanceUID到目录的映射，避免竞态条件
         }
 
         def handle_store(event):
@@ -654,14 +677,45 @@ class DICOMDownloadClient:
                     logger.error("❌ Received dataset without SOPInstanceUID")
                     return 0xA701
 
+                # P0: 使用 SeriesInstanceUID 查找对应的目录，避免竞态条件
+                # 不能使用 storage_state['current_path']，因为它可能被下一个Series的循环修改
+                series_instance_uid = None
+                try:
+                    series_instance_uid = dataset.SeriesInstanceUID
+                except AttributeError:
+                    # SeriesInstanceUID 属性不存在，尝试从文件元数据获取
+                    logger.warning(f"⚠️  Dataset has no SeriesInstanceUID attribute, SOPInstanceUID={sop_instance_uid[:20]}...")
+                    # 使用当前路径作为fallback
+                    series_dir = storage_state['current_path']
+                except Exception as e:
+                    logger.error(f"❌ Failed to get SeriesInstanceUID from dataset: {e}, SOPInstanceUID={sop_instance_uid[:20]}...")
+                    return 0xA701
+
+                if series_instance_uid:
+                    series_dir = storage_state['series_uid_to_dir'].get(series_instance_uid)
+                    if not series_dir:
+                        # 如果找不到映射，使用当前路径作为fallback（兼容旧行为）
+                        series_dir = storage_state['current_path']
+                        available_uids = list(storage_state['series_uid_to_dir'].keys())
+                        logger.warning(f"⚠️  No directory mapping for Series UID {str(series_instance_uid)[:30]}..., "
+                                       f"available mappings: {len(available_uids)}, "
+                                       f"using current_path: {series_dir}")
+                else:
+                    # 没有 SeriesInstanceUID，使用当前路径
+                    series_dir = storage_state['current_path']
+
                 filename = f"{sop_instance_uid}.dcm"
-                filepath = os.path.join(storage_state['current_path'], filename)
+                filepath = os.path.join(series_dir, filename)
 
                 # 确保目录存在
-                os.makedirs(storage_state['current_path'], exist_ok=True)
+                os.makedirs(series_dir, exist_ok=True)
 
                 # 保存文件
-                dataset.save_as(filepath, write_like_original=False)
+                try:
+                    dataset.save_as(filepath, write_like_original=False)
+                except Exception as e:
+                    logger.error(f"❌ Failed to save dataset to {filepath}: {e}")
+                    return 0xA700
 
                 # P3: 验证文件完整性（文件可读且大小合理）
                 if os.path.exists(filepath):
@@ -682,8 +736,9 @@ class DICOMDownloadClient:
                     storage_state['files_received'] += 1
                     self.download_stats.total_bytes += file_size
 
-                    if storage_state['files_received'] % 10 == 0:
-                        logger.info(f"   Received {storage_state['files_received']} files...")
+                    # 记录前5个文件和每10个文件
+                    if storage_state['files_received'] <= 5 or storage_state['files_received'] % 10 == 0:
+                        logger.info(f"   Received {storage_state['files_received']} files... (last: {filename[:40]}... in {os.path.basename(series_dir)})")
                 else:
                     logger.error(f"❌ File {filepath} not found after save")
                     return 0xA700
@@ -724,7 +779,15 @@ class DICOMDownloadClient:
                         series_uid = series.get('SeriesInstanceUID')
                         series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
 
+                        # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
+                        # 这避免了竞态条件：C-STORE可能在下一个Series的循环开始后才到达
+                        if series_uid:
+                            storage_state['series_uid_to_dir'][series_uid] = series_dir
+                            logger.debug(f"   Registered series_uid mapping: {series_uid[:20]}... -> {series_dir}")
+                        else:
+                            logger.warning(f"   Series {series_num} has no SeriesInstanceUID, cannot register mapping")
                         storage_state['current_path'] = series_dir
+                        storage_state['current_series_uid'] = series_uid
                         storage_state['current_series_files'] = set()  # 重置当前序列文件集合
 
                         try:
@@ -813,7 +876,10 @@ class DICOMDownloadClient:
                             series_desc = series_info.get('SeriesDescription', 'Unknown')
                             series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
 
+                            # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
+                            storage_state['series_uid_to_dir'][series_uid] = series_dir
                             storage_state['current_path'] = series_dir
+                            storage_state['current_series_uid'] = series_uid
                             storage_state['current_series_files'] = set()
 
                             logger.info(f"🔄 Retrying Series {series_num}...")
@@ -1059,16 +1125,65 @@ class DICOMDownloadClient:
         except:
             return False
     
+    def _wait_for_files_stable(self, directory, timeout=30, interval=0.5):
+        """等待目录中的文件大小稳定（不再增长）
+
+        Args:
+            directory: 要检查的目录
+            timeout: 最大等待时间（秒）
+            interval: 检查间隔（秒）
+        """
+        start_time = time.time()
+        prev_sizes = {}
+        stable_count = 0
+        required_stable_checks = 3  # 需要连续3次检查都稳定
+
+        while time.time() - start_time < timeout:
+            current_sizes = {}
+            total_files = 0
+
+            try:
+                for root, dirs, files in os.walk(directory):
+                    for file in files:
+                        if file.endswith('.dcm') or file.endswith('.dcm'):
+                            filepath = os.path.join(root, file)
+                            try:
+                                size = os.path.getsize(filepath)
+                                current_sizes[filepath] = size
+                                total_files += 1
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning(f"   ⚠️ Error checking file sizes: {e}")
+                break
+
+            # 检查文件大小是否稳定
+            if current_sizes == prev_sizes and total_files > 0:
+                stable_count += 1
+                if stable_count >= required_stable_checks:
+                    logger.info(f"   ✅ File system stable: {total_files} files ready")
+                    return
+            else:
+                stable_count = 0
+                if total_files > 0:
+                    logger.debug(f"   ⏳ File system changing: {total_files} files, waiting...")
+
+            prev_sizes = current_sizes.copy()
+            time.sleep(interval)
+
+        logger.warning(f"   ⚠️ File system stability timeout after {timeout}s")
+
     def _sanitize_folder_name(self, name):
         """清理文件夹名称，移除或替换Windows和dcm2niix不兼容的字符"""
         if not name:
             return "Unknown"
-        
+
         name = str(name)
-        
-        # 1. 替换Windows非法字符
-        name = re.sub(r'[<>"/\\|?*]', '_', name)
-        
+
+        # 1. 替换Windows非法字符 (包括冒号:和方括号[])
+        name = re.sub(r'[<>"/\\|?*:]', '_', name)
+        name = re.sub(r'[\[\]]', '_', name)
+
         # 2. 替换可能导致dcm2niix问题的字符组合
         # 点+空格（如 "303. X Elbow" -> "303_X Elbow"）
         name = re.sub(r'\.\s+', '_', name)
@@ -1076,26 +1191,28 @@ class DICOMDownloadClient:
         name = re.sub(r'\s+', '_', name)
         # 多个连续点转为单个
         name = re.sub(r'\.+', '.', name)
-        
+        # 多个连续下划线转为单个
+        name = re.sub(r'_+', '_', name)
+
         # 3. 移除首尾的特殊字符
         name = name.strip('. _')
-        
+
         # 4. 长度限制
         if len(name) > 50:
             name = name[:50]
-        
+
         # 5. 确保不以点开头或结尾（Windows问题）
         name = name.strip('.')
-        
+
         return name if name else "Unknown"
     
-    def organize_dicom_files(self, extract_dir, organized_dir=None, output_format='nifti'):
+    def organize_dicom_files(self, extract_dir, organized_dir=None, output_format='nifti', min_series_files=None):
         """按Series整理DICOM文件并转换为指定格式 (nifti 或 npz)"""
-        return organize_dicom_files_impl(self, extract_dir, organized_dir, output_format)
+        return organize_dicom_files_impl(self, extract_dir, organized_dir, output_format, min_series_files=min_series_files)
 
-    def _process_single_series(self, series_path, series_folder, organized_dir, output_format='nifti'):
-        """处理单个Series目录：统计、转换并移动到 organized_dir。"""
-        return process_single_series_impl(self, series_path, series_folder, organized_dir, output_format)
+    def _process_single_series(self, series_path, series_folder, output_format='nifti', min_series_files=None):
+        """处理单个Series目录：统计、转换（原地处理，不再移动到 organized_dir）。"""
+        return process_single_series_impl(self, series_path, series_folder, output_format, min_series_files=min_series_files)
     
     def convert_dicom_to_nifti(self, series_dir, series_name):
         """将DICOM序列转换为NIfTI格式"""
@@ -1552,7 +1669,7 @@ class DICOMDownloadClient:
         except Exception:
             num_converters = 2
 
-        def _organize_worker(organized_dir_local, fmt):
+        def _organize_worker(fmt):
             watchdog.update_activity()  # P2: 更新看门狗活动
             while True:
                 try:
@@ -1570,7 +1687,7 @@ class DICOMDownloadClient:
                     break
                 series_dir, series_folder = item
                 try:
-                    info = self._process_single_series(series_dir, series_folder, organized_dir_local, fmt)
+                    info = self._process_single_series(series_dir, series_folder, fmt, min_series_files=min_series_files)
                     if info:
                         with series_lock:
                             series_info[series_folder] = info
@@ -1581,9 +1698,7 @@ class DICOMDownloadClient:
                     series_queue.task_done()
 
         if parallel_pipeline and auto_organize:
-            organized_dir = os.path.join(base_output_dir, f"{accession_number}_organized")
-            os.makedirs(organized_dir, exist_ok=True)
-
+            # P0: 原地处理 - 不再创建 organized 子目录
             # P2: 启动看门狗
             watchdog.start()
 
@@ -1591,7 +1706,7 @@ class DICOMDownloadClient:
             # spawn multiple organizers
             organizer_threads = []
             for _ in range(num_converters):
-                t = threading.Thread(target=_organize_worker, args=(organized_dir, output_format), daemon=True)
+                t = threading.Thread(target=_organize_worker, args=(output_format,), daemon=True)
                 t.start()
                 organizer_threads.append(t)
 
@@ -1635,14 +1750,20 @@ class DICOMDownloadClient:
         if auto_organize:
             # 步骤2: 整理DICOM文件
             logger.info(f"\n📁 Step 2: Organize DICOM files by series (format: {output_format})")
+            # P0: 原地处理 - organized_dir 就是 download_dir
+            organized_dir = download_dir
             if parallel_pipeline:
-                # 使用流水线整理结果
-                organized_dir = os.path.join(base_output_dir, f"{accession_number}_organized")
+                # 使用流水线整理结果 - 原地处理，文件已经在正确的位置
                 results['organized_dir'] = organized_dir
                 results['series_info'] = series_info
             else:
-                organized_dir, series_info = self.organize_dicom_files(download_dir, output_format=output_format)
-                if not organized_dir:
+                # 等待文件系统稳定（确保所有下载的文件已完全写入磁盘）
+                logger.info("   ⏳ Waiting for file system to stabilize...")
+                time.sleep(2.0)
+                # 检查下载目录中的文件状态
+                self._wait_for_files_stable(download_dir)
+                _, series_info = self.organize_dicom_files(download_dir, output_format=output_format, min_series_files=min_series_files)
+                if not series_info:
                     logger.error("❌ File organization failed, workflow terminated")
                     return results
                 results['organized_dir'] = organized_dir
@@ -1652,12 +1773,18 @@ class DICOMDownloadClient:
                 # 步骤3: 提取元数据 (独立线程)
                 logger.info(f"\n📊 Step 3: Extract DICOM metadata")
                 excel_name = f"dicom_metadata_{accession_number}.xlsx"
-                excel_path = os.path.join(os.path.dirname(organized_dir), excel_name)
+                excel_path = os.path.join(organized_dir, excel_name)
 
                 excel_holder = {'path': None}
 
                 def _metadata_worker():
-                    excel_holder['path'] = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
+                    try:
+                        excel_holder['path'] = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
+                    except Exception as e:
+                        logger.error(f"❌ Metadata extraction error: {e}")
+                        import traceback
+                        logger.error(f"Traceback: {traceback.format_exc()}")
+                        excel_holder['path'] = None
 
                 metadata_thread = threading.Thread(target=_metadata_worker, daemon=True)
                 metadata_thread.start()
