@@ -191,6 +191,12 @@ class DICOMProcessor {
                 'use_default_fields': 'Use Default Fields',
                 'upload_custom_config': 'Upload Custom Config',
                 'upload_json_help': 'Upload JSON format field list',
+                'modality_filter': 'Modality Filter (Optional)',
+                'modality_filter_help': 'Filter by modality, e.g. MR, CT (comma separated)',
+                'min_series_files': 'Min Series Files (Optional)',
+                'min_series_files_help': 'Skip series with fewer files than this',
+                'exclude_derived': 'Exclude derived series (MPR, MIP, VR, etc.)',
+                'exclude_derived_help': 'Automatically filter out MPR, MIP, 3D VR, and other derived series',
                 'quick_actions': 'Quick Actions',
                 'reset_options': 'Reset Options',
                 'export_config': 'Export Config',
@@ -311,6 +317,12 @@ class DICOMProcessor {
                 'use_default_fields': '使用默认字段',
                 'upload_custom_config': '上传自定义配置',
                 'upload_json_help': '上传JSON格式的字段列表',
+                'modality_filter': '模态过滤 (可选)',
+                'modality_filter_help': '按模态过滤，如 MR, CT (逗号分隔)',
+                'min_series_files': '最小序列文件数 (可选)',
+                'min_series_files_help': '跳过文件数少于此值的序列',
+                'exclude_derived': '排除衍生序列 (MPR, MIP, VR 等)',
+                'exclude_derived_help': '自动过滤 MPR、MIP、3D VR 等衍生序列',
                 'quick_actions': '快速操作',
                 'reset_options': '重置选项',
                 'export_config': '导出配置',
@@ -936,11 +948,15 @@ class DICOMProcessor {
         // 添加过滤参数
         const modalityFilter = document.getElementById('modalityFilter')?.value?.trim();
         const minSeriesFiles = document.getElementById('minSeriesFiles')?.value;
+        const excludeDerived = document.getElementById('excludeDerived')?.checked;
         if (modalityFilter) {
             options.modality_filter = modalityFilter;
         }
         if (minSeriesFiles && parseInt(minSeriesFiles) > 0) {
             options.min_series_files = parseInt(minSeriesFiles);
+        }
+        if (excludeDerived !== false) {
+            options.exclude_derived = true;
         }
 
         try {
@@ -1012,11 +1028,15 @@ class DICOMProcessor {
         // 添加批量过滤参数
         const modalityFilter = document.getElementById('batchModalityFilter')?.value?.trim();
         const minSeriesFiles = document.getElementById('batchMinSeriesFiles')?.value;
+        const excludeDerived = document.getElementById('batchExcludeDerived')?.checked;
         if (modalityFilter) {
             options.modality_filter = modalityFilter;
         }
         if (minSeriesFiles && parseInt(minSeriesFiles) > 0) {
             options.min_series_files = parseInt(minSeriesFiles);
+        }
+        if (excludeDerived !== false) {
+            options.exclude_derived = true;
         }
 
         try {

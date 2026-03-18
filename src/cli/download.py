@@ -191,7 +191,8 @@ def main(cli_args=None):
         parser.add_argument("--output_dir", default="./downloads", help="下载结果存放目录")
         parser.add_argument("--format", choices=['nifti', 'npz'], default='nifti', help="输出格式 (nifti 或 npz)")
         parser.add_argument("--modality", default=None, help="模态过滤，如 MR, CT (可逗号分隔多个)")
-        parser.add_argument("--min_files", type=int, default=None, help="最小序列文件数，少于该值的序列将被跳过")
+        parser.add_argument("--min_files", type=int, default=10, help="最小序列文件数，少于该值的序列将被跳过 (默认: 10)")
+        parser.add_argument("--include_derived", action="store_true", help="包含衍生序列 (MPR, MIP, VR等)，默认会过滤掉")
         args = parser.parse_args()
     else:
         args = cli_args
@@ -201,6 +202,8 @@ def main(cli_args=None):
         filter_info.append(f"Modality={args.modality}")
     if args.min_files:
         filter_info.append(f"MinFiles={args.min_files}")
+    if not args.include_derived:
+        filter_info.append("ExcludeDerived")
     filter_str = f" ({', '.join(filter_info)})" if filter_info else ""
     print(f"🚀 启动任务: AccessionNumber={args.accession}, 格式={args.format}{filter_str}")
 
@@ -208,7 +211,8 @@ def main(cli_args=None):
     options = {
         "output_format": args.format,
         "auto_organize": True,
-        "auto_metadata": True
+        "auto_metadata": True,
+        "exclude_derived": not args.include_derived  # 默认True（过滤衍生序列）
     }
     if args.modality:
         options["modality_filter"] = args.modality
@@ -520,7 +524,7 @@ def save_progress(output_dir, completed_set, timings_dict=None, quality_records=
         print(f"[!] 无法保存进度: {e}")
 
 
-def download_list(acc_list, output_dir="./downloads", fmt='nifti', modality=None, min_files=None):
+def download_list(acc_list, output_dir="./downloads", fmt='nifti', modality=None, min_files=10, exclude_derived=True):
     """批量下载多个 AccessionNumber 的结果，并支持断点续传。
 
     进度记录保存在 output_dir/.download_progress.json，程序在每次成功下载后更新该文件。
@@ -543,6 +547,8 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti', modality=None
         filter_info.append(f"Modality={modality}")
     if min_files:
         filter_info.append(f"MinFiles={min_files}")
+    if exclude_derived:
+        filter_info.append("ExcludeDerived")
     if filter_info:
         tqdm.write(f"[i] 过滤条件: {', '.join(filter_info)}")
 
@@ -556,7 +562,8 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti', modality=None
             output_dir=output_dir,
             format=fmt,
             modality=modality,
-            min_files=min_files
+            min_files=min_files,
+            include_derived=not exclude_derived
         )
         # 计时并执行
         start_t = time.time()

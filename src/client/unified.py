@@ -413,15 +413,17 @@ class DICOMDownloadClient:
             logger.error(f"PACS connection error: {e}")
             return False
     
-    def _query_series_metadata(self, accession_number, modality_filter=None, min_series_files=None):
+    def _query_series_metadata(self, accession_number, modality_filter=None, min_series_files=None, exclude_derived=True):
         """查询PACS获取Series元数据
 
         Args:
             accession_number: 检查号
             modality_filter: 可选，模态过滤（如 'MR', 'CT'）
             min_series_files: 可选，最小序列文件数，少于该值的序列将被过滤
+            exclude_derived: 是否排除衍生序列（MPR, MIP, VR等），默认True
         """
         series_metadata = []
+
 
         # P1: 使用上下文管理器确保连接释放，P0: 带重试机制
         try:
@@ -454,6 +456,16 @@ class DICOMDownloadClient:
                     logger.warning(f"⚠️  Can't Find AccessionNumber: {accession_number}")
                     return []
 
+                # 定义衍生序列关键词（用于过滤人工重建序列）
+                DERIVED_SERIES_KEYWORDS = [
+                    'MPR', 'MIP', 'MINIP', 'SSD', 'VRT', 'VR',
+                    'CPR', 'CURVED', '3D', 'THICK',
+                    'SCOUT', 'TOPOGRAM', 'SURVEY',
+                    'REF', 'REFERENCE', 'LOC','Batch',
+                    'AVERAGE', 'SUM', 'REFORMAT',
+                    'PROJECTION', 'RAYSUM',
+                ]
+
                 # 查询每个Study的Series
                 for study_uid, study_info in studies.items():
                     series_ds = Dataset()
@@ -463,6 +475,7 @@ class DICOMDownloadClient:
                     series_ds.SeriesNumber = ""
                     series_ds.SeriesDescription = ""
                     series_ds.Modality = ""
+                    series_ds.ImageType = ""  # 用于区分原始/派生图像
 
                     responses = assoc.send_c_find(series_ds, StudyRootQueryRetrieveInformationModelFind)
 
@@ -478,12 +491,40 @@ class DICOMDownloadClient:
                                     if series_modality.upper() not in allowed_modalities:
                                         continue
 
+                                series_desc = str(identifier.SeriesDescription) if hasattr(identifier, 'SeriesDescription') else ''
+
+                                # 过滤衍生序列：检查ImageType是否为DERIVED
+                                is_derived = False
+                                if exclude_derived:
+                                    image_type = getattr(identifier, 'ImageType', None)
+                                    if image_type:
+                                        # ImageType可能是列表或字符串
+                                        image_type_str = ' '.join(image_type) if isinstance(image_type, (list, tuple)) else str(image_type)
+                                        if 'DERIVED' in image_type_str.upper() or 'SECONDARY' in image_type_str.upper():
+                                            is_derived = True
+                                            logger.debug(f"   Filtered by ImageType (DERIVED): {series_desc}")
+
+                                    # 过滤衍生序列：检查SeriesDescription关键词
+                                    if not is_derived and series_desc:
+                                        desc_upper = series_desc.upper()
+                                        # 特殊处理：纯数字3D（如 "3D"）或作为单词的一部分
+                                        for keyword in DERIVED_SERIES_KEYWORDS:
+                                            # 使用单词边界匹配，避免误判（如 "MP" 匹配 "MPR"）
+                                            if keyword in desc_upper:
+                                                is_derived = True
+                                                logger.debug(f"   Filtered by keyword '{keyword}': {series_desc}")
+                                                break
+
+                                    if is_derived:
+                                        logger.info(f"   🚫 Filtered derived series: {series_desc}")
+                                        continue
+
                                 series_info = dict(study_info)
                                 series_info.update({
                                     'StudyInstanceUID': study_uid,
                                     'SeriesInstanceUID': str(identifier.SeriesInstanceUID),
                                     'SeriesNumber': str(identifier.SeriesNumber) if hasattr(identifier, 'SeriesNumber') else '0',
-                                    'SeriesDescription': str(identifier.SeriesDescription) if hasattr(identifier, 'SeriesDescription') else 'Unknown',
+                                    'SeriesDescription': series_desc if series_desc else 'Unknown',
                                     'Modality': series_modality
                                 })
                                 series_metadata.append(series_info)
@@ -533,11 +574,13 @@ class DICOMDownloadClient:
 
                     series_metadata = filtered_metadata
 
-                logger.info(f"📊 Find {len(series_metadata)} Series")
+                logger.info(f"📊 Find {len(series_metadata)} Series (after filtering)")
                 if modality_filter:
                     logger.info(f"   (Modality filter: {modality_filter})")
                 if min_series_files and min_series_files > 0:
                     logger.info(f"   (Min files filter: {min_series_files})")
+                if exclude_derived:
+                    logger.info(f"   (Derived series filtered by keywords: {DERIVED_SERIES_KEYWORDS})")
 
         except ConnectionError as e:
             logger.error(f"❌ Failed to establish PACS connection: {e}")
@@ -548,7 +591,8 @@ class DICOMDownloadClient:
         return series_metadata
     
     def download_study(self, accession_number, output_dir=".", custom_folder_name=None,
-                       on_series_downloaded=None, modality_filter=None, min_series_files=None):
+                       on_series_downloaded=None, modality_filter=None, min_series_files=None,
+                       exclude_derived=True):
         """Download Study data (directly from PACS, no ZIP generation)
 
         Args:
@@ -558,6 +602,7 @@ class DICOMDownloadClient:
             on_series_downloaded: 下载完成回调
             modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
             min_series_files: 可选，最小序列文件数
+            exclude_derived: 是否排除衍生序列，默认True
         """
         logger.info(f"🔍 Downloading AccessionNumber: {accession_number}")
 
@@ -565,7 +610,8 @@ class DICOMDownloadClient:
         series_metadata = self._query_series_metadata(
             accession_number,
             modality_filter=modality_filter,
-            min_series_files=min_series_files
+            min_series_files=min_series_files,
+            exclude_derived=exclude_derived
         )
         if not series_metadata:
             logger.error(f"❌ No data found for: {accession_number}")
@@ -1404,8 +1450,23 @@ class DICOMDownloadClient:
     def process_complete_workflow(self, accession_number, base_output_dir="./downloads",
                                 auto_extract=True, auto_organize=True, auto_metadata=True,
                                 keep_zip=True, keep_extracted=False, output_format='nifti',
-                                parallel_pipeline=True, modality_filter=None, min_series_files=None):
+                                parallel_pipeline=True, modality_filter=None, min_series_files=None,
+                                exclude_derived=True):
         """完整的工作流程：下载 -> 整理 -> 转换 -> 提取元数据
+
+        Args:
+            accession_number: 检查号
+            base_output_dir: 基础输出目录
+            auto_extract: 自动解压（兼容性参数）
+            auto_organize: 自动整理文件
+            auto_metadata: 自动提取元数据
+            keep_zip: 保留ZIP文件（兼容性参数）
+            keep_extracted: 保留解压后的原始文件
+            output_format: 输出格式（'nifti' 或 'npz'）
+            parallel_pipeline: 是否使用并行流水线
+            modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
+            min_series_files: 可选，最小序列文件数，少于该值的序列将被跳过
+            exclude_derived: 是否排除衍生序列，默认True
 
         Args:
             accession_number: 检查号
@@ -1427,6 +1488,8 @@ class DICOMDownloadClient:
             logger.info(f"🔍 Modality filter: {modality_filter}")
         if min_series_files:
             logger.info(f"📊 Min series files: {min_series_files}")
+        if exclude_derived:
+            logger.info(f"🚫 Exclude derived series: enabled")
         logger.info(f"{'='*80}")
 
         # 确保输出目录存在
@@ -1463,7 +1526,8 @@ class DICOMDownloadClient:
                     base_output_dir,
                     on_series_downloaded=_on_series_downloaded,
                     modality_filter=modality_filter,
-                    min_series_files=min_series_files
+                    min_series_files=min_series_files,
+                    exclude_derived=exclude_derived
                 )
                 download_dir_holder['path'] = download_path
             finally:
@@ -1543,7 +1607,8 @@ class DICOMDownloadClient:
                 accession_number,
                 base_output_dir,
                 modality_filter=modality_filter,
-                min_series_files=min_series_files
+                min_series_files=min_series_files,
+                exclude_derived=exclude_derived
             )
             if not download_dir:
                 logger.error("❌ Download failed, workflow terminated")

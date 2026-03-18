@@ -13,7 +13,7 @@ import logging
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
 import nibabel as nib
@@ -229,7 +229,7 @@ def is_segmentation_mask(
     pixel_data: np.ndarray,
     bright_threshold: float = 0.05,
     max_components_threshold: int = 10
-) -> tuple[bool, dict]:
+) -> Tuple[bool, Dict]:
     """
     检测图像是否为分割图/掩码（从PNG质量检测迁移）
 

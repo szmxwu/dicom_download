@@ -196,3 +196,5 @@ upload_tests
 download
 QWEN.md
 CLAUDE.md
+offline_packages
+*.zip
