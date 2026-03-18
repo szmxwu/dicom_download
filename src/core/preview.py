@@ -11,8 +11,8 @@ import re
 import json
 import numpy as np
 import nibabel as nib
-from PIL import Image
-from typing import Tuple, Optional, Callable
+from PIL import Image, ImageDraw, ImageFont
+from typing import Tuple, Optional, Callable, List
 from dotenv import load_dotenv
 
 
@@ -902,6 +902,389 @@ def _generate_single_preview(
     return preview_path
 
 
+def _get_slice_thickness(dcm) -> Optional[float]:
+    """
+    从DICOM对象获取层厚信息
+
+    Args:
+        dcm: pydicom Dataset 对象
+
+    Returns:
+        float: 层厚(mm)，失败时返回 None
+    """
+    try:
+        if dcm is None:
+            return None
+
+        # 优先使用 SliceThickness
+        thickness = getattr(dcm, 'SliceThickness', None)
+        if thickness is not None:
+            return float(thickness)
+
+        # 备选：使用 SpacingBetweenSlices
+        spacing = getattr(dcm, 'SpacingBetweenSlices', None)
+        if spacing is not None:
+            return float(spacing)
+
+        return None
+    except Exception:
+        return None
+
+
+def _draw_text_on_image(
+    img: np.ndarray,
+    text: str,
+    position: Tuple[int, int],
+    font_size: int = 20,
+    color: Tuple[int, int, int] = (255, 255, 255),
+    shadow_color: Tuple[int, int, int] = (0, 0, 0)
+) -> np.ndarray:
+    """
+    在图像上绘制文字（带阴影效果）
+
+    Args:
+        img: 输入图像数组
+        text: 要绘制的文字
+        position: 文字位置 (x, y)
+        font_size: 字体大小
+        color: 文字颜色
+        shadow_color: 阴影颜色
+
+    Returns:
+        np.ndarray: 绘制文字后的图像
+    """
+    try:
+        pil_img = Image.fromarray(img).convert('RGB')
+        draw = ImageDraw.Draw(pil_img)
+
+        # 尝试加载字体，失败则使用默认字体
+        try:
+            # 尝试常见字体路径
+            font_paths = [
+                '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+                '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+                '/System/Library/Fonts/Helvetica.ttc',
+                'C:/Windows/Fonts/arial.ttf',
+            ]
+            font = None
+            for fp in font_paths:
+                if os.path.exists(fp):
+                    font = ImageFont.truetype(fp, font_size)
+                    break
+            if font is None:
+                font = ImageFont.load_default()
+        except Exception:
+            font = ImageFont.load_default()
+
+        x, y = position
+
+        # 绘制阴影
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx != 0 or dy != 0:
+                    draw.text((x + dx, y + dy), text, font=font, fill=shadow_color)
+
+        # 绘制主文字
+        draw.text((x, y), text, font=font, fill=color)
+
+        return np.array(pil_img)
+    except Exception:
+        return img
+
+
+def _load_3d_volume(
+    preview_file: str,
+    modality: str,
+    sample_dcm
+) -> Optional[np.ndarray]:
+    """
+    加载3D体积数据
+
+    Args:
+        preview_file: 图像文件路径
+        modality: 模态类型
+        sample_dcm: 样本DICOM对象
+
+    Returns:
+        3D体积数据 (Z, Y, X) 或 (X, Y, Z)，失败时返回None
+    """
+    try:
+        if preview_file.endswith('.npz'):
+            with np.load(preview_file) as npz:
+                if 'data' in npz.files:
+                    data = npz['data']
+                elif npz.files:
+                    data = npz[npz.files[0]]
+                else:
+                    return None
+            return data.astype(np.float32) if data.ndim == 3 else None
+
+        elif preview_file.endswith(('.nii', '.nii.gz')):
+            img = nib.load(preview_file)
+
+            # 处理4D+数据，提取第一个volume
+            if len(img.shape) > 3:
+                try:
+                    slicer = (slice(None), slice(None), slice(None)) + (0,) * (len(img.shape) - 3)
+                    data = np.asarray(img.dataobj[slicer])
+                    while data.ndim > 3:
+                        data = data[..., 0]
+                    img = nib.Nifti1Image(data, img.affine)
+                except Exception:
+                    pass
+
+            try:
+                img_canonical = nib.as_closest_canonical(img)
+                data = img_canonical.get_fdata()
+            except Exception:
+                # 兜底处理
+                try:
+                    data = np.asarray(img.get_fdata())
+                except Exception:
+                    return None
+
+            # 防御性处理
+            while data.ndim > 3:
+                data = data[..., 0]
+
+            return data.astype(np.float32) if data.ndim == 3 else None
+
+        return None
+    except Exception:
+        return None
+
+
+def _extract_orthogonal_slices(
+    data: np.ndarray,
+    orientation: str = 'AX'
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    从3D体积提取三个正交切片的中间层面
+
+    Args:
+        data: 3D体积数据
+        orientation: 扫描方位
+
+    Returns:
+        Tuple: (axial_slice, sagittal_slice, coronal_slice)
+    """
+    try:
+        if data.ndim != 3:
+            # 返回空白图像
+            blank = np.zeros((128, 128), dtype=np.float32)
+            return blank, blank, blank
+
+        # 获取中间层面索引
+        mid_x = data.shape[0] // 2
+        mid_y = data.shape[1] // 2
+        mid_z = data.shape[2] // 2
+
+        # 提取三个正交切片
+        # 注意：根据数据格式不同，切片方向可能需要调整
+
+        # Axial (横断位): 通常沿Z轴
+        axial = data[:, :, mid_z]
+
+        # Sagittal (矢状位): 通常沿X轴
+        sagittal = data[mid_x, :, :]
+
+        # Coronal (冠状位): 通常沿Y轴
+        coronal = data[:, mid_y, :]
+
+        return axial, sagittal, coronal
+    except Exception:
+        blank = np.zeros((128, 128), dtype=np.float32)
+        return blank, blank, blank
+
+
+def _generate_3d_triplane_preview(
+    preview_file: str,
+    series_dir: str,
+    series_name: str,
+    sample_dcm,
+    modality: str,
+    sanitize_folder_name: Callable[[str], str]
+) -> Optional[str]:
+    """
+    生成3D三视图预览图（横断、矢状、冠状位）
+
+    Args:
+        preview_file: 输入图像文件路径
+        series_dir: 输出目录
+        series_name: 序列名称
+        sample_dcm: 样本DICOM对象
+        modality: 模态类型
+        sanitize_folder_name: 文件夹名称清理函数
+
+    Returns:
+        生成的预览图路径，失败时返回None
+    """
+    try:
+        # 加载3D体积数据
+        data = _load_3d_volume(preview_file, modality, sample_dcm)
+        if data is None:
+            return None
+
+        # 获取扫描方位
+        raw_orientation = _get_orientation_from_dcm(sample_dcm)
+        orientation = normalize_orientation(raw_orientation, sample_dcm)
+
+        # 加载原始3D数据用于提取三视图（使用nibabel canonical格式）
+        if preview_file.endswith(('.nii', '.nii.gz')):
+            img = nib.load(preview_file)
+            if len(img.shape) > 3:
+                try:
+                    slicer = (slice(None), slice(None), slice(None)) + (0,) * (len(img.shape) - 3)
+                    first_volume = np.asarray(img.dataobj[slicer])
+                    while first_volume.ndim > 3:
+                        first_volume = first_volume[..., 0]
+                    img = nib.Nifti1Image(first_volume, img.affine)
+                except Exception:
+                    pass
+
+            try:
+                img_canonical = nib.as_closest_canonical(img)
+                volume = img_canonical.get_fdata().astype(np.float32)
+            except Exception:
+                volume = np.asarray(img.get_fdata()).astype(np.float32)
+
+            while volume.ndim > 3:
+                volume = volume[..., 0]
+
+            # canonical volume is (X, Y, Z)
+            # X: Left->Right, Y: Posterior->Anterior, Z: Inferior->Superior
+            mid_x = volume.shape[0] // 2
+            mid_y = volume.shape[1] // 2
+            mid_z = volume.shape[2] // 2
+
+            # 提取三个正交切片的中间层面
+            # Axial (横断位): Z轴中间
+            slice_axial = volume[:, :, mid_z]
+            slice_axial = np.transpose(slice_axial, (1, 0))[::-1, ::-1]
+
+            # Sagittal (矢状位): X轴中间
+            slice_sagittal = volume[mid_x, :, :]
+            slice_sagittal = np.transpose(slice_sagittal, (1, 0))[::-1, ::-1]
+
+            # Coronal (冠状位): Y轴中间
+            slice_coronal = volume[:, mid_y, :]
+            slice_coronal = np.transpose(slice_coronal, (1, 0))[::-1, ::-1]
+
+        elif preview_file.endswith('.npz'):
+            with np.load(preview_file) as npz:
+                if 'data' in npz.files:
+                    volume = npz['data'].astype(np.float32)
+                elif npz.files:
+                    volume = npz[npz.files[0]].astype(np.float32)
+                else:
+                    return None
+
+            # npz data is saved as (Z, Y, X)
+            mid_z = volume.shape[0] // 2
+            mid_y = volume.shape[1] // 2
+            mid_x = volume.shape[2] // 2
+
+            # 提取三个正交切片的中间层面
+            slice_axial = volume[mid_z, :, :]
+            slice_sagittal = volume[:, :, mid_x]
+            slice_coronal = volume[:, mid_y, :]
+        else:
+            return None
+
+        # 获取总层数
+        total_slices = volume.shape[2] if preview_file.endswith(('.nii', '.nii.gz')) else volume.shape[0]
+
+        # 应用窗宽窗位
+        slice_axial = apply_windowing(slice_axial, sample_dcm, modality)
+        slice_sagittal = apply_windowing(slice_sagittal, sample_dcm, modality)
+        slice_coronal = apply_windowing(slice_coronal, sample_dcm, modality)
+
+        # 转换为RGB用于绘制彩色文字
+        slice_axial_rgb = np.stack([slice_axial, slice_axial, slice_axial], axis=2)
+        slice_sagittal_rgb = np.stack([slice_sagittal, slice_sagittal, slice_sagittal], axis=2)
+        slice_coronal_rgb = np.stack([slice_coronal, slice_coronal, slice_coronal], axis=2)
+
+        # 获取层厚信息
+        slice_thickness = _get_slice_thickness(sample_dcm)
+        thickness_text = f"ST: {slice_thickness:.2f}mm" if slice_thickness else "ST: N/A"
+        count_text = f"Slices: {total_slices}"
+
+        # 添加文字标注
+        h, w = slice_axial.shape[:2]
+        text_y = 10
+
+        slice_axial_rgb = _draw_text_on_image(
+            slice_axial_rgb, "AXIAL", (10, text_y), font_size=24, color=(255, 255, 0)
+        )
+        slice_axial_rgb = _draw_text_on_image(
+            slice_axial_rgb, thickness_text, (10, text_y + 30), font_size=16, color=(255, 255, 255)
+        )
+        slice_axial_rgb = _draw_text_on_image(
+            slice_axial_rgb, count_text, (10, text_y + 55), font_size=16, color=(255, 255, 255)
+        )
+
+        slice_sagittal_rgb = _draw_text_on_image(
+            slice_sagittal_rgb, "SAGITTAL", (10, text_y), font_size=24, color=(255, 255, 0)
+        )
+        slice_sagittal_rgb = _draw_text_on_image(
+            slice_sagittal_rgb, thickness_text, (10, text_y + 30), font_size=16, color=(255, 255, 255)
+        )
+        slice_sagittal_rgb = _draw_text_on_image(
+            slice_sagittal_rgb, count_text, (10, text_y + 55), font_size=16, color=(255, 255, 255)
+        )
+
+        slice_coronal_rgb = _draw_text_on_image(
+            slice_coronal_rgb, "CORONAL", (10, text_y), font_size=24, color=(255, 255, 0)
+        )
+        slice_coronal_rgb = _draw_text_on_image(
+            slice_coronal_rgb, thickness_text, (10, text_y + 30), font_size=16, color=(255, 255, 255)
+        )
+        slice_coronal_rgb = _draw_text_on_image(
+            slice_coronal_rgb, count_text, (10, text_y + 55), font_size=16, color=(255, 255, 255)
+        )
+
+        # 统一三个视图的大小
+        max_h = max(slice_axial_rgb.shape[0], slice_sagittal_rgb.shape[0], slice_coronal_rgb.shape[0])
+        max_w = max(slice_axial_rgb.shape[1], slice_sagittal_rgb.shape[1], slice_coronal_rgb.shape[1])
+
+        def resize_to_canvas(img, target_h, target_w):
+            """将图像缩放到目标尺寸并居中放置"""
+            h, w = img.shape[:2]
+            # 计算缩放比例，保持纵横比
+            scale = min(target_h / h, target_w / w)
+            new_h, new_w = int(h * scale), int(w * scale)
+
+            pil_img = Image.fromarray(img)
+            pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+            resized = np.array(pil_img)
+
+            # 创建画布并居中放置
+            canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            top = (target_h - new_h) // 2
+            left = (target_w - new_w) // 2
+            canvas[top:top + new_h, left:left + new_w] = resized
+            return canvas
+
+        slice_axial_resized = resize_to_canvas(slice_axial_rgb, max_h, max_w)
+        slice_sagittal_resized = resize_to_canvas(slice_sagittal_rgb, max_h, max_w)
+        slice_coronal_resized = resize_to_canvas(slice_coronal_rgb, max_h, max_w)
+
+        # 水平拼接三个视图
+        triplane = np.concatenate([slice_axial_resized, slice_sagittal_resized, slice_coronal_resized], axis=1)
+
+        # 保存预览图
+        base_name = sanitize_folder_name(series_name)
+        preview_name = f"{base_name}_preview.png"
+        preview_path = os.path.join(series_dir, preview_name)
+
+        Image.fromarray(triplane).save(preview_path)
+        return preview_path
+
+    except Exception as e:
+        print(f"❌ Error generating 3D triplane preview: {str(e)}")
+        return None
+
+
 def generate_series_preview(
     series_dir: str,
     series_name: str,
@@ -985,29 +1368,38 @@ def generate_series_preview(
             return generated_previews[0] if generated_previews else None
             
         else:
-            # 3D模态或单张2D图像：只生成一张预览图
+            # 3D模态或单张2D图像
             if is_2d_xray or len(output_files) > 1:
+                # 2D X射线多张图像：使用单张预览
                 preview_idx = len(output_files) // 2
                 preview_file = output_files[preview_idx]
                 is_3d = False
+
+                preview_path = _generate_single_preview(
+                    preview_file=preview_file,
+                    preview_idx=preview_idx,
+                    is_3d=is_3d,
+                    series_dir=series_dir,
+                    series_name=series_name,
+                    sample_dcm=sample_dcm,
+                    modality=modality,
+                    sanitize_folder_name=sanitize_folder_name,
+                    output_suffix=""
+                )
+                return preview_path
             else:
-                preview_idx = 0
+                # 3D模态：生成三视图预览
                 preview_file = output_files[0]
-                is_3d = True
-            
-            preview_path = _generate_single_preview(
-                preview_file=preview_file,
-                preview_idx=preview_idx,
-                is_3d=is_3d,
-                series_dir=series_dir,
-                series_name=series_name,
-                sample_dcm=sample_dcm,
-                modality=modality,
-                sanitize_folder_name=sanitize_folder_name,
-                output_suffix=""
-            )
-            
-            return preview_path
+
+                preview_path = _generate_3d_triplane_preview(
+                    preview_file=preview_file,
+                    series_dir=series_dir,
+                    series_name=series_name,
+                    sample_dcm=sample_dcm,
+                    modality=modality,
+                    sanitize_folder_name=sanitize_folder_name
+                )
+                return preview_path
             
     except Exception:
         return None

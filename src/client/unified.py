@@ -269,6 +269,10 @@ class DICOMDownloadClient:
         # P3: 下载文件校验和缓存 {filepath: checksum}
         self._checksum_cache: Dict[str, str] = {}
         self._checksum_lock = threading.Lock()
+
+    # 类级别的C-MOVE锁：防止多个实例同时启动C-STORE SCP导致端口冲突
+    # C-MOVE协议要求客户端启动SCP服务器接收图像，固定端口无法支持并发
+    _cmove_lock = threading.Lock()
     
     def _load_keywords(self, tags_dir="dicom_tags"):
         """加载不同模态的DICOM字段列表"""
@@ -463,7 +467,7 @@ class DICOMDownloadClient:
                     'SCOUT', 'TOPOGRAM', 'SURVEY',
                     'REF', 'REFERENCE', 'LOC','Batch',
                     'AVERAGE', 'SUM', 'REFORMAT',
-                    'PROJECTION', 'RAYSUM',
+                    'PROJECTION', 'RAYSUM','KEY'
                 ]
 
                 # 查询每个Study的Series
@@ -689,108 +693,115 @@ class DICOMDownloadClient:
                 logger.error(f"❌ Failed saving DICOM file: {e}", exc_info=True)
                 return 0xA700
 
-        # 启动C-STORE SCP
-        ae_scp = AE(ae_title=self.pacs_config['CALLING_AET'])
-        ae_scp.supported_contexts = AllStoragePresentationContexts
-        ae_scp.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+        # P0: 使用类级别的锁确保C-MOVE操作串行化
+        # C-MOVE协议需要启动C-STORE SCP服务器接收图像，固定端口无法支持并发
+        # 如果两个任务同时使用同一端口，会导致图像混杂到错误的目录
+        logger.info(f"🔒 Acquiring C-MOVE lock for {accession_number}...")
+        with DICOMDownloadClient._cmove_lock:
+            logger.info(f"🔓 C-MOVE lock acquired for {accession_number}, starting download...")
 
-        server = ae_scp.start_server(
-            ('', self.pacs_config['CALLING_PORT']),
-            block=False,
-            evt_handlers=[(evt.EVT_C_STORE, handle_store)]
-        )
+            # 启动C-STORE SCP
+            ae_scp = AE(ae_title=self.pacs_config['CALLING_AET'])
+            ae_scp.supported_contexts = AllStoragePresentationContexts
+            ae_scp.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
 
-        # P0: 跟踪失败的序列以便重试
-        failed_series = []
+            server = ae_scp.start_server(
+                ('', self.pacs_config['CALLING_PORT']),
+                block=False,
+                evt_handlers=[(evt.EVT_C_STORE, handle_store)]
+            )
 
-        try:
-            # P1: 使用上下文管理器管理关联
-            with AssociationManager(self.ae, self.pacs_config) as assoc:
-                # 下载每个Series（P0: 失败隔离）
-                for i, series in enumerate(series_metadata):
-                    series_num = series.get('SeriesNumber', f'Series{i+1}')
-                    series_desc = series.get('SeriesDescription', 'Unknown')
-                    series_uid = series.get('SeriesInstanceUID')
-                    series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
+            # P0: 跟踪失败的序列以便重试
+            failed_series = []
 
-                    storage_state['current_path'] = series_dir
-                    storage_state['current_series_files'] = set()  # 重置当前序列文件集合
+            try:
+                # P1: 使用上下文管理器管理关联
+                with AssociationManager(self.ae, self.pacs_config) as assoc:
+                    # 下载每个Series（P0: 失败隔离）
+                    for i, series in enumerate(series_metadata):
+                        series_num = series.get('SeriesNumber', f'Series{i+1}')
+                        series_desc = series.get('SeriesDescription', 'Unknown')
+                        series_uid = series.get('SeriesInstanceUID')
+                        series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
 
-                    try:
-                        logger.info(f"📥 Downloading series {i+1}/{len(series_metadata)}: {series_num} - {series_desc}")
+                        storage_state['current_path'] = series_dir
+                        storage_state['current_series_files'] = set()  # 重置当前序列文件集合
 
-                        # 当磁盘空间达到高水位时，暂停下载以等待转换/清理
                         try:
-                            self._wait_for_disk_low(output_path)
-                        except Exception:
-                            pass
+                            logger.info(f"📥 Downloading series {i+1}/{len(series_metadata)}: {series_num} - {series_desc}")
 
-                        # 发送C-MOVE请求
-                        move_ds = Dataset()
-                        move_ds.QueryRetrieveLevel = 'SERIES'
-                        move_ds.StudyInstanceUID = series['StudyInstanceUID']
-                        move_ds.SeriesInstanceUID = series_uid
-
-                        logger.info(f"   Sending C-MOVE request for Series {series_num}...")
-
-                        # 报告下载进度
-                        if callable(self.download_progress_callback):
+                            # 当磁盘空间达到高水位时，暂停下载以等待转换/清理
                             try:
-                                progress_pct = 40 + int((i / len(series_metadata)) * 40)
-                                self.download_progress_callback(i + 1, len(series_metadata), series_desc, progress_pct)
-                            except Exception as cb_e:
-                                logger.warning(f"   Progress callback error: {cb_e}")
+                                self._wait_for_disk_low(output_path)
+                            except Exception:
+                                pass
 
-                        responses = assoc.send_c_move(
-                            move_ds,
-                            self.pacs_config['CALLING_AET'],
-                            query_model=StudyRootQueryRetrieveInformationModelMove
-                        )
+                            # 发送C-MOVE请求
+                            move_ds = Dataset()
+                            move_ds.QueryRetrieveLevel = 'SERIES'
+                            move_ds.StudyInstanceUID = series['StudyInstanceUID']
+                            move_ds.SeriesInstanceUID = series_uid
 
-                        # 跟踪C-MOVE响应状态
-                        move_status = None
-                        error_messages = []
-                        for (status, identifier) in responses:
-                            if status:
-                                move_status = status.Status
-                                if status.Status == 0x0000:
-                                    logger.info(f"   Series {series_num} C-MOVE completed successfully")
-                                    self.download_stats.completed_series += 1
-                                elif status.Status != 0xFF00:  # 0xFF00 是Pending状态
-                                    error_msg = f"0x{status.Status:04X}"
-                                    error_messages.append(error_msg)
-                                    logger.warning(f"   Series {series_num} C-MOVE status: {error_msg}")
+                            logger.info(f"   Sending C-MOVE request for Series {series_num}...")
 
-                        if move_status is None:
-                            logger.warning(f"   ⚠️  Series {series_num}: No C-MOVE response received (timeout or network issue)")
-                            raise TimeoutError(f"No C-MOVE response for series {series_num}")
+                            # 报告下载进度
+                            if callable(self.download_progress_callback):
+                                try:
+                                    progress_pct = 40 + int((i / len(series_metadata)) * 40)
+                                    self.download_progress_callback(i + 1, len(series_metadata), series_desc, progress_pct)
+                                except Exception as cb_e:
+                                    logger.warning(f"   Progress callback error: {cb_e}")
 
-                        # 检查是否有错误状态
-                        if error_messages and move_status != 0x0000:
-                            raise RuntimeError(f"C-MOVE failed with status: {error_messages[-1]}")
+                            responses = assoc.send_c_move(
+                                move_ds,
+                                self.pacs_config['CALLING_AET'],
+                                query_model=StudyRootQueryRetrieveInformationModelMove
+                            )
 
-                        time.sleep(0.5)  # 短暂延迟，让文件写入完成
+                            # 跟踪C-MOVE响应状态
+                            move_status = None
+                            error_messages = []
+                            for (status, identifier) in responses:
+                                if status:
+                                    move_status = status.Status
+                                    if status.Status == 0x0000:
+                                        logger.info(f"   Series {series_num} C-MOVE completed successfully")
+                                        self.download_stats.completed_series += 1
+                                    elif status.Status != 0xFF00:  # 0xFF00 是Pending状态
+                                        error_msg = f"0x{status.Status:04X}"
+                                        error_messages.append(error_msg)
+                                        logger.warning(f"   Series {series_num} C-MOVE status: {error_msg}")
 
-                        # 通知外部：该Series下载完成
-                        if callable(on_series_downloaded):
-                            try:
-                                on_series_downloaded(series_dir, series)
-                            except Exception as e:
-                                logger.warning(f"⚠️  Series callback failed: {e}")
+                            if move_status is None:
+                                logger.warning(f"   ⚠️  Series {series_num}: No C-MOVE response received (timeout or network issue)")
+                                raise TimeoutError(f"No C-MOVE response for series {series_num}")
 
-                    except Exception as e:
-                        # P0: 失败隔离 - 记录错误但继续处理下一个序列
-                        logger.error(f"❌ Series {series_num} download failed: {e}")
-                        self.failed_series_tracker.add(series_uid, series, e)
-                        failed_series.append(series)
-                        self.download_stats.failed_series += 1
-                        self.download_stats.errors.append({
-                            'series': series_num,
-                            'error': str(e),
-                            'timestamp': time.time()
-                        })
-                        # 继续处理下一个序列，不中断整个下载流程
-                        continue
+                            # 检查是否有错误状态
+                            if error_messages and move_status != 0x0000:
+                                raise RuntimeError(f"C-MOVE failed with status: {error_messages[-1]}")
+
+                            time.sleep(0.5)  # 短暂延迟，让文件写入完成
+
+                            # 通知外部：该Series下载完成
+                            if callable(on_series_downloaded):
+                                try:
+                                    on_series_downloaded(series_dir, series)
+                                except Exception as e:
+                                    logger.warning(f"⚠️  Series callback failed: {e}")
+
+                        except Exception as e:
+                            # P0: 失败隔离 - 记录错误但继续处理下一个序列
+                            logger.error(f"❌ Series {series_num} download failed: {e}")
+                            self.failed_series_tracker.add(series_uid, series, e)
+                            failed_series.append(series)
+                            self.download_stats.failed_series += 1
+                            self.download_stats.errors.append({
+                                'series': series_num,
+                                'error': str(e),
+                                'timestamp': time.time()
+                            })
+                            # 继续处理下一个序列，不中断整个下载流程
+                            continue
 
                 # P0: 尝试重试失败的序列
                 retryable = self.failed_series_tracker.get_retryable_series()
@@ -834,14 +845,14 @@ class DICOMDownloadClient:
                         except Exception as e:
                             logger.error(f"❌ Series {series_info.get('SeriesNumber')} retry failed: {e}")
 
-        except ConnectionError as e:
-            logger.error(f"❌ Failed to establish PACS connection: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Download error: {e}", exc_info=True)
-            return None
-        finally:
-            server.shutdown()
+            except ConnectionError as e:
+                logger.error(f"❌ Failed to establish PACS connection: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"❌ Download error: {e}", exc_info=True)
+                return None
+            finally:
+                server.shutdown()
 
         # 打印下载统计
         stats_summary = self.download_stats.get_summary()
