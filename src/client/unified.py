@@ -465,9 +465,9 @@ class DICOMDownloadClient:
                     'MPR', 'MIP', 'MINIP', 'SSD', 'VRT', 'VR',
                     'CPR', 'CURVED', '3D', 'THICK',
                     'SCOUT', 'TOPOGRAM', 'SURVEY',
-                    'REF', 'REFERENCE', 'LOC','Batch',
+                    'REF', 'REFERENCE', 'LOC', 'BATCH',
                     'AVERAGE', 'SUM', 'REFORMAT',
-                    'PROJECTION', 'RAYSUM','KEY','ROI'
+                    'PROJECTION', 'RAYSUM', 'KEY', 'ROI'
                 ]
 
                 # 查询每个Study的Series
