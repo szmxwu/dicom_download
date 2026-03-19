@@ -16,6 +16,34 @@ from typing import Dict, List, Any, Optional, Tuple
 # Create logger for organize module - use DICOMApp to match Flask app logging
 logger = logging.getLogger('DICOMApp')
 
+# 衍生序列关键词（与 unified.py 中的 PACS 查询阶段保持一致）
+DERIVED_SERIES_KEYWORDS = [
+    'MPR', 'MIP', 'MINIP', 'SSD', 'VRT', 'VR',
+    'CPR', 'CURVED', '3D', 'THICK',
+    'SCOUT', 'TOPOGRAM', 'SURVEY',
+    'REF', 'REFERENCE', 'LOC', 'Batch',
+    'AVERAGE', 'SUM', 'REFORMAT',
+    'PROJECTION', 'RAYSUM', 'KEY', 'ROI'
+]
+
+
+def _is_derived_series(series_desc: str, image_type=None) -> bool:
+    """检查是否为衍生序列（MPR/MIP/3D重建等）。
+
+    基于实际 DICOM 文件中的 SeriesDescription 和 ImageType 进行判断，
+    用于弥补 PACS 查询阶段 SeriesDescription 不完整导致的漏判。
+    """
+    if image_type:
+        image_type_str = ' '.join(image_type) if isinstance(image_type, (list, tuple)) else str(image_type)
+        if 'DERIVED' in image_type_str.upper() or 'SECONDARY' in image_type_str.upper():
+            return True
+    if series_desc:
+        desc_upper = series_desc.upper()
+        for keyword in DERIVED_SERIES_KEYWORDS:
+            if keyword in desc_upper:
+                return True
+    return False
+
 
 def compute_file_checksum(filepath: str, algorithm: str = 'md5') -> Optional[str]:
     """计算文件校验和"""
@@ -109,6 +137,18 @@ def organize_dicom_files(
                 dicom_files.append(normalized_path)
 
         if dicom_files:
+            # 整理阶段二次过滤衍生序列（从实际 DICOM 文件验证，PACS 返回的 SeriesDescription 可能不完整）
+            try:
+                import pydicom
+                _hdr = pydicom.dcmread(dicom_files[0], force=True, stop_before_pixels=True)
+                _desc = str(getattr(_hdr, 'SeriesDescription', '') or '')
+                _itype = getattr(_hdr, 'ImageType', None)
+                if _is_derived_series(_desc, _itype):
+                    logger.info(f"   🚫 Filtered derived series (organize stage): '{_desc}' ({series_folder})")
+                    continue
+            except Exception:
+                pass
+
             # 整理阶段验证：检查实际文件数是否满足最小要求
             # 注意：只对3D模态（CT/MR等）应用此验证，2D模态（DX/DR等）跳过
             if min_series_files and min_series_files > 0:
@@ -286,6 +326,23 @@ def process_single_series(
 
     if not dicom_files:
         return None
+
+    # 整理阶段二次过滤衍生序列（从实际 DICOM 文件验证，PACS 返回的 SeriesDescription 可能不完整）
+    try:
+        import pydicom as _pd
+        _hdr = _pd.dcmread(dicom_files[0], force=True, stop_before_pixels=True)
+        _desc = str(getattr(_hdr, 'SeriesDescription', '') or '')
+        _itype = getattr(_hdr, 'ImageType', None)
+        if _is_derived_series(_desc, _itype):
+            logger.info(f"   🚫 Filtered derived series (organize stage): '{_desc}' ({series_folder})")
+            try:
+                if os.path.exists(lock_file):
+                    os.remove(lock_file)
+            except Exception:
+                pass
+            return None
+    except Exception:
+        pass
 
     # 整理阶段验证：检查实际文件数是否满足最小要求
     # 注意：只对3D模态（CT/MR等）应用此验证，2D模态（DX/DR等）跳过

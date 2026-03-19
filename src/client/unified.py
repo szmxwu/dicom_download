@@ -467,7 +467,7 @@ class DICOMDownloadClient:
                     'SCOUT', 'TOPOGRAM', 'SURVEY',
                     'REF', 'REFERENCE', 'LOC','Batch',
                     'AVERAGE', 'SUM', 'REFORMAT',
-                    'PROJECTION', 'RAYSUM','KEY'
+                    'PROJECTION', 'RAYSUM','KEY','ROI'
                 ]
 
                 # 查询每个Study的Series
