@@ -21,7 +21,7 @@ DERIVED_SERIES_KEYWORDS = [
     'MPR', 'MIP', 'MINIP', 'SSD', 'VRT', 'VR',
     'CPR', 'CURVED', '3D', 'THICK',
     'SCOUT', 'TOPOGRAM', 'SURVEY',
-    'REF', 'REFERENCE', 'LOC', 'Batch',
+    'REF', 'REFERENCE', 'LOC', 'BATCH',
     'AVERAGE', 'SUM', 'REFORMAT',
     'PROJECTION', 'RAYSUM', 'KEY', 'ROI'
 ]
