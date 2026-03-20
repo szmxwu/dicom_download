@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Callable, Any, Tuple
 from types import SimpleNamespace
+from src.core.constants import DERIVED_SERIES_KEYWORDS
 from src.core.metadata import extract_dicom_metadata as extract_dicom_metadata_impl
 from src.core.organize import organize_dicom_files as organize_dicom_files_impl
 from src.core.organize import process_single_series as process_single_series_impl
@@ -459,16 +460,6 @@ class DICOMDownloadClient:
                 if not studies:
                     logger.warning(f"⚠️  Can't Find AccessionNumber: {accession_number}")
                     return []
-
-                # 定义衍生序列关键词（用于过滤人工重建序列）
-                DERIVED_SERIES_KEYWORDS = [
-                    'MPR', 'MIP', 'MINIP', 'SSD', 'VRT', 'VR',
-                    'CPR', 'CURVED', '3D', 'THICK',
-                    'SCOUT', 'TOPOGRAM', 'SURVEY',
-                    'REF', 'REFERENCE', 'LOC', 'BATCH',
-                    'AVERAGE', 'SUM', 'REFORMAT',
-                    'PROJECTION', 'RAYSUM', 'KEY', 'ROI'
-                ]
 
                 # 查询每个Study的Series
                 for study_uid, study_info in studies.items():

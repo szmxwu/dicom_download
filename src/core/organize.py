@@ -16,15 +16,8 @@ from typing import Dict, List, Any, Optional, Tuple
 # Create logger for organize module - use DICOMApp to match Flask app logging
 logger = logging.getLogger('DICOMApp')
 
-# 衍生序列关键词（与 unified.py 中的 PACS 查询阶段保持一致）
-DERIVED_SERIES_KEYWORDS = [
-    'MPR', 'MIP', 'MINIP', 'SSD', 'VRT', 'VR',
-    'CPR', 'CURVED', '3D', 'THICK',
-    'SCOUT', 'TOPOGRAM', 'SURVEY',
-    'REF', 'REFERENCE', 'LOC', 'BATCH',
-    'AVERAGE', 'SUM', 'REFORMAT',
-    'PROJECTION', 'RAYSUM', 'KEY', 'ROI'
-]
+# 从常量模块导入衍生序列关键词
+from src.core.constants import DERIVED_SERIES_KEYWORDS
 
 
 def _is_derived_series(series_desc: str, image_type=None) -> bool:
