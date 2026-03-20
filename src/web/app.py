@@ -621,6 +621,12 @@ def index():
     """主页面"""
     return render_template('index.html')
 
+@app.route('/api/client/download')
+def download_client_script():
+    """下载 CLI 客户端脚本"""
+    cli_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cli', 'download.py')
+    return send_file(cli_path, as_attachment=True, download_name='download.py', mimetype='text/x-python')
+
 @app.route('/api/process/single', methods=['POST'])
 def process_single():
     """处理单个AccessionNumber"""

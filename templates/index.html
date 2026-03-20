@@ -76,6 +76,12 @@
                                     <i class="fas fa-chart-line"></i> <span data-i18n="monitoring">Monitoring</span>
                                 </button>
                             </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="client-tab" data-bs-toggle="tab"
+                                        data-bs-target="#client-pane" type="button" role="tab">
+                                    <i class="fas fa-terminal"></i> <span data-i18n="cli_client">CLI Client</span>
+                                </button>
+                            </li>
                         </ul>
                     </div>
                     
@@ -512,6 +518,156 @@
                                 <div class="text-muted text-center py-4" id="historyEmpty" style="display: none;">
                                     <span data-i18n="no_history_tasks">No completed tasks yet</span>
                                 </div>
+                            </div>
+
+                            <!-- 客户端 -->
+                            <div class="tab-pane fade" id="client-pane" role="tabpanel">
+                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                    <h5 class="mb-0">
+                                        <i class="fas fa-terminal text-primary"></i>
+                                        <span data-i18n="cli_client_title">Command-line Batch Download Client</span>
+                                    </h5>
+                                    <a href="/api/client/download" class="btn btn-primary btn-sm">
+                                        <i class="fas fa-download"></i>
+                                        <span data-i18n="cli_client">CLI Client</span>
+                                        <code class="ms-1 text-white-50">download.py</code>
+                                    </a>
+                                </div>
+
+                                <!-- 快速开始 -->
+                                <div class="card mb-4">
+                                    <div class="card-header fw-semibold">
+                                        <i class="fas fa-rocket text-success"></i> 快速开始
+                                    </div>
+                                    <div class="card-body">
+                                        <p class="text-muted mb-2">将 <code>download.py</code> 放到任意目录，通过环境变量指定服务器地址后即可使用：</p>
+                                        <pre class="bg-light p-3 rounded"><code># Linux / macOS
+export SERVER_URL="http://&lt;服务器IP&gt;:5005"
+
+# Windows (PowerShell)
+$env:SERVER_URL = "http://&lt;服务器IP&gt;:5005"</code></pre>
+                                        <p class="text-muted mt-2 mb-0 small">默认依赖：<code>requests tqdm pandas openpyxl nibabel pydicom numpy</code>，可通过 <code>pip install</code> 安装。</p>
+                                    </div>
+                                </div>
+
+                                <!-- 依赖安装 -->
+                                <div class="card mb-4">
+                                    <div class="card-header fw-semibold">
+                                        <i class="fas fa-box text-info"></i> 安装依赖
+                                    </div>
+                                    <div class="card-body">
+                                        <pre class="bg-light p-3 rounded mb-0"><code>pip install requests tqdm pandas openpyxl nibabel pydicom numpy</code></pre>
+                                    </div>
+                                </div>
+
+                                <!-- 命令示例 -->
+                                <div class="card mb-4">
+                                    <div class="card-header fw-semibold">
+                                        <i class="fas fa-code text-warning"></i> 命令示例
+                                    </div>
+                                    <div class="card-body">
+
+                                        <h6 class="text-secondary mt-2">1. 下载单个检查</h6>
+                                        <pre class="bg-light p-3 rounded"><code>python download.py Z25043000836</code></pre>
+
+                                        <h6 class="text-secondary mt-3">2. 指定输出目录和格式</h6>
+                                        <pre class="bg-light p-3 rounded"><code>python download.py Z25043000836 --output_dir ./data --format nifti</code></pre>
+
+                                        <h6 class="text-secondary mt-3">3. 批量下载（代码调用，支持断点续传）</h6>
+                                        <pre class="bg-light p-3 rounded"><code>from download import download_list
+import pandas as pd
+
+df = pd.read_excel('input.xlsx')
+acc_list = df['影像号'].tolist()
+
+download_list(
+    acc_list,
+    output_dir='./downloads',
+    fmt='nifti',          # 或 'npz'
+    modality='MR',        # 可选，留空则不过滤模态
+    min_files=10,         # 序列最小文件数
+    exclude_derived=True, # 排除衍生序列（MPR/MIP 等）
+)</code></pre>
+
+                                        <h6 class="text-secondary mt-3">4. 并行模式（生产者-消费者，适合大批量）</h6>
+                                        <pre class="bg-light p-3 rounded"><code>python download.py Z25043000836 --parallel --num-downloaders 3</code></pre>
+                                        <p class="text-muted small mb-0">或在代码中：</p>
+                                        <pre class="bg-light p-3 rounded"><code>download_list(
+    acc_list,
+    output_dir='./downloads',
+    parallel=True,         # 开启生产者-消费者并行
+    num_submitters=2,      # 任务提交线程数
+    num_downloaders=3,     # 下载线程数
+    num_processors=2,      # 解压整理线程数
+)</code></pre>
+
+                                        <h6 class="text-secondary mt-3">5. 恢复 DICOM（从 NIfTI/NPZ 反向还原）</h6>
+                                        <pre class="bg-light p-3 rounded"><code>python download.py Z25043000836 --recover-dicom</code></pre>
+                                        <p class="text-muted small mb-0">恢复后的 DICOM 文件保存在 <code>&lt;output_dir&gt;/&lt;AccessionNumber&gt;/dicom/</code> 子目录下。</p>
+
+                                    </div>
+                                </div>
+
+                                <!-- 参数说明 -->
+                                <div class="card mb-4">
+                                    <div class="card-header fw-semibold">
+                                        <i class="fas fa-list-ul text-secondary"></i> 参数说明
+                                    </div>
+                                    <div class="card-body p-0">
+                                        <div class="table-responsive">
+                                            <table class="table table-sm table-striped mb-0">
+                                                <thead class="table-light">
+                                                    <tr>
+                                                        <th style="width:200px">参数</th>
+                                                        <th style="width:120px">默认值</th>
+                                                        <th>说明</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    <tr><td><code>accession</code></td><td>（必填）</td><td>检查的 AccessionNumber</td></tr>
+                                                    <tr><td><code>--output_dir</code></td><td><code>./downloads</code></td><td>结果保存目录</td></tr>
+                                                    <tr><td><code>--format</code></td><td><code>nifti</code></td><td>输出格式：<code>nifti</code> 或 <code>npz</code></td></tr>
+                                                    <tr><td><code>--modality</code></td><td>不过滤</td><td>模态过滤，如 <code>MR</code>、<code>CT</code>，逗号分隔多个</td></tr>
+                                                    <tr><td><code>--min_files</code></td><td><code>10</code></td><td>序列最小文件数，少于此值的序列将被跳过</td></tr>
+                                                    <tr><td><code>--include_derived</code></td><td>关闭</td><td>包含衍生序列（MPR/MIP/3D 重建等），默认过滤掉</td></tr>
+                                                    <tr><td><code>--recover-dicom</code></td><td>关闭</td><td>根据 meta Excel 将 NIfTI/NPZ 恢复为 DICOM</td></tr>
+                                                    <tr><td><code>--parallel</code></td><td>关闭</td><td>开启生产者-消费者并行下载模式</td></tr>
+                                                    <tr><td><code>--num-submitters</code></td><td><code>2</code></td><td>并行模式：任务提交线程数</td></tr>
+                                                    <tr><td><code>--num-downloaders</code></td><td><code>3</code></td><td>并行模式：下载线程数</td></tr>
+                                                    <tr><td><code>--num-processors</code></td><td><code>2</code></td><td>并行模式：解压整理线程数</td></tr>
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 输出说明 -->
+                                <div class="card mb-3">
+                                    <div class="card-header fw-semibold">
+                                        <i class="fas fa-folder-open text-primary"></i> 输出目录结构
+                                    </div>
+                                    <div class="card-body">
+                                        <pre class="bg-light p-3 rounded mb-2"><code>downloads/
+├── .download_progress.json        # 断点续传进度记录
+├── merged_metadata_YYYYMMDD.xlsx  # 合并后的全量 meta 表格
+├── quality_report.html            # 质量报告
+├── Z25043000836/                  # 按 AccessionNumber 分目录
+│   ├── dicom_metadata_xxx.xlsx    # 序列 meta 信息
+│   ├── xxx.nii.gz                 # NIfTI 文件
+│   ├── preview_xxx.png            # 预览图
+│   └── dicom/                     # --recover-dicom 生成
+│       └── xxx/
+│           ├── slice_0000.dcm
+│           └── ...
+└── Z25043000837/
+    └── ...</code></pre>
+                                        <p class="text-muted small mb-0">
+                                            <i class="fas fa-info-circle"></i>
+                                            断点续传：程序中断后重新运行同一命令，会自动跳过已完成的检查，从上次中断处继续。
+                                        </p>
+                                    </div>
+                                </div>
+
                             </div>
                         </div>
                     </div>

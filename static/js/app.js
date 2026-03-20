@@ -276,7 +276,9 @@ class DICOMProcessor {
                 'download_log': 'Download Log',
                 'no_log_files': 'No log files',
                 'file_size': 'Size',
-                'modified_time': 'Modified'
+                'modified_time': 'Modified',
+                'cli_client': 'CLI Client',
+                'cli_client_title': 'Command-line Batch Download Client'
             },
             'zh': {
                 'app_title': 'DICOM处理系统',
@@ -442,7 +444,9 @@ class DICOMProcessor {
                 'download_log': '下载日志',
                 'no_log_files': '无日志文件',
                 'file_size': '大小',
-                'modified_time': '修改时间'
+                'modified_time': '修改时间',
+                'cli_client': '客户端',
+                'cli_client_title': '命令行批量下载客户端'
             }
         };
 
