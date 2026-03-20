@@ -685,7 +685,7 @@ def main(cli_args=None):
         parser.add_argument("--min_files", type=int, default=10, help="最小序列文件数，少于该值的序列将被跳过 (默认: 10)")
         parser.add_argument("--include_derived", action="store_true", help="包含衍生序列 (MPR, MIP, VR等)，默认会过滤掉")
         parser.add_argument("--recover-dicom", action="store_true", help="根据 meta Excel 恢复 DICOM 文件到 dicom/ 子目录")
-        parser.add_argument("--parallel", action="store_true", help="使用生产者-消费者并行模式（批量下载时推荐）")
+        parser.add_argument("--parallel",default=True ,action="store_true", help="使用生产者-消费者并行模式（批量下载时推荐）")
         parser.add_argument("--num-submitters", type=int, default=2, help="并行模式：任务提交线程数 (默认: 2)")
         parser.add_argument("--num-downloaders", type=int, default=3, help="并行模式：下载线程数 (默认: 3)")
         parser.add_argument("--num-processors", type=int, default=2, help="并行模式：整理线程数 (默认: 2)")
