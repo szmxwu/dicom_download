@@ -1899,11 +1899,108 @@ def handle_subscribe_task(data):
     if task_id in processing_tasks:
         emit('task_subscribed', {'task_id': task_id})
 
+def _ensure_ssl_cert(ssl_dir):
+    """生成或复用自签名 SSL 证书，返回 (cert_path, key_path)。"""
+    import datetime
+    import ipaddress as _ipaddress
+    os.makedirs(ssl_dir, exist_ok=True)
+    cert_path = os.path.join(ssl_dir, 'cert.pem')
+    key_path  = os.path.join(ssl_dir, 'key.pem')
+
+    # 证书存在且未过期（剩余 > 7 天）则直接复用
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.backends import default_backend
+            with open(cert_path, 'rb') as f:
+                cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+            remaining = cert.not_valid_after_utc - datetime.datetime.now(datetime.timezone.utc)
+            if remaining.days > 7:
+                return cert_path, key_path
+        except Exception:
+            pass  # 证书损坏，重新生成
+
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+
+        key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048, backend=default_backend()
+        )
+        with open(key_path, 'wb') as f:
+            f.write(key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, 'dicom-server'),
+        ])
+        san_list = [x509.DNSName('localhost'), x509.DNSName('*')]
+        # 把本机所有网卡 IP 都加入 SAN，避免浏览器 IP 访问时证书不匹配
+        import socket as _socket
+        try:
+            hostname = _socket.gethostname()
+            for addr in _socket.getaddrinfo(hostname, None):
+                ip_str = addr[4][0]
+                try:
+                    san_list.append(x509.IPAddress(_ipaddress.ip_address(ip_str)))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for fixed_ip in ('127.0.0.1', '0.0.0.0'):
+            try:
+                san_list.append(x509.IPAddress(_ipaddress.IPv4Address(fixed_ip)))
+            except Exception:
+                pass
+
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+            .sign(key, hashes.SHA256(), default_backend())
+        )
+        with open(cert_path, 'wb') as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+        logger.info(f"🔒 已生成自签名 SSL 证书: {cert_path}")
+    except Exception as e:
+        logger.error(f"❌ SSL 证书生成失败: {e}")
+        raise
+
+    return cert_path, key_path
+
+
 if __name__ == '__main__':
     logger.info("="*60)
     logger.info("🏥 DICOM处理Web应用启动")
     logger.info("="*60)
-    logger.info("📡 访问地址: http://172.17.250.136:5005")
+
+    enable_https = os.getenv('ENABLE_HTTPS', 'false').lower() in ('true', '1', 'yes')
+    ssl_context = None
+    protocol = 'http'
+    if enable_https:
+        ssl_dir = os.path.join(project_root, 'ssl')
+        try:
+            cert_path, key_path = _ensure_ssl_cert(ssl_dir)
+            ssl_context = (cert_path, key_path)
+            protocol = 'https'
+            logger.info(f"🔒 HTTPS 已启用 (证书: {cert_path})")
+            logger.info("   ⚠️  首次访问时浏览器会提示证书不受信任，点击"高级→继续访问"即可")
+        except Exception as ssl_err:
+            logger.error(f"❌ HTTPS 启动失败，回退为 HTTP: {ssl_err}")
+
+    logger.info(f"📡 访问地址: {protocol}://172.17.250.136:5005")
     
     # 检查DICOM服务连接状态
     try:
@@ -1926,14 +2023,15 @@ if __name__ == '__main__':
     else:
         logger.info("🔐 未配置DICOM登录信息（当前实现无需真实认证）")
     logger.info("🚀 系统已就绪，等待用户请求...")
-    logger.info("📡 测试URL:")
-    logger.info("   - http://localhost:5005")
-    logger.info("   - http://127.0.0.1:5005") 
-    logger.info("   - http://172.17.250.136:5005")
+    logger.info("📡 访问地址:")
+    logger.info(f"   - {protocol}://localhost:5005")
+    logger.info(f"   - {protocol}://127.0.0.1:5005")
+    logger.info(f"   - {protocol}://172.17.250.136:5005")
     logger.info("="*60)
-    
-    # 启动应用，开启调试模式和自动重载
-    socketio.run(app, host='0.0.0.0', port=5005, debug=False, allow_unsafe_werkzeug=True)
+
+    # 启动应用
+    socketio.run(app, host='0.0.0.0', port=5005, debug=False,
+                 allow_unsafe_werkzeug=True, ssl_context=ssl_context)
 
 
 # ========== 衍生序列过滤关键词配置 API ==========
