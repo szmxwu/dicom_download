@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Callable, Any, Tuple
 from types import SimpleNamespace
-from src.core.constants import DERIVED_SERIES_KEYWORDS
+from src.core.constants import get_derived_keywords
 from src.core.metadata import extract_dicom_metadata as extract_dicom_metadata_impl
 from src.core.organize import organize_dicom_files as organize_dicom_files_impl
 from src.core.organize import process_single_series as process_single_series_impl
@@ -504,7 +504,7 @@ class DICOMDownloadClient:
                                     if not is_derived and series_desc:
                                         desc_upper = series_desc.upper()
                                         # 特殊处理：纯数字3D（如 "3D"）或作为单词的一部分
-                                        for keyword in DERIVED_SERIES_KEYWORDS:
+                                        for keyword in get_derived_keywords():
                                             # 使用单词边界匹配，避免误判（如 "MP" 匹配 "MPR"）
                                             if keyword in desc_upper:
                                                 is_derived = True
@@ -580,13 +580,24 @@ class DICOMDownloadClient:
                                   f"SliceThickness={slice_thickness} (likely a scout/localizer)")
                             continue
 
+                        # PACS 返回的实例数可能不可靠（某些 PACS 返回 0 或不准确）
+                        # 策略：如果 PACS 返回的实例数 >= min_files，直接保留
+                        # 如果 < min_files 或为 0，仍然保留，让整理阶段根据实际文件数判断
+                        series_info['NumberOfSeriesRelatedInstances'] = instance_count
+                        series_info['SliceThickness'] = slice_thickness
+
                         if instance_count >= min_series_files:
-                            series_info['NumberOfSeriesRelatedInstances'] = instance_count
-                            series_info['SliceThickness'] = slice_thickness
+                            filtered_metadata.append(series_info)
+                        elif instance_count == 0:
+                            # PACS 返回 0，可能是数据未准备好，保留到整理阶段验证
+                            logger.debug(f"   ⚠️  Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
+                                  f"PACS reports 0 files, will verify during organization")
                             filtered_metadata.append(series_info)
                         else:
-                            logger.info(f"   ⚠️  Filtered out Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
-                                  f"{instance_count} files < {min_series_files} min")
+                            # PACS 返回少量文件，但仍保留，整理阶段会再次验证实际文件数
+                            logger.debug(f"   ⚠️  Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
+                                  f"PACS reports {instance_count} files < {min_series_files}, will verify during organization")
+                            filtered_metadata.append(series_info)
 
                     series_metadata = filtered_metadata
 
@@ -596,7 +607,7 @@ class DICOMDownloadClient:
                 if min_series_files and min_series_files > 0:
                     logger.debug(f"   (Min files filter: {min_series_files})")
                 if exclude_derived:
-                    logger.debug(f"   (Derived series filtered by keywords: {DERIVED_SERIES_KEYWORDS})")
+                    logger.debug(f"   (Derived series filtered by keywords: {get_derived_keywords()})")
 
         except ConnectionError as e:
             logger.error(f"❌ Failed to establish PACS connection: {e}")
@@ -1755,8 +1766,15 @@ class DICOMDownloadClient:
                 self._wait_for_files_stable(download_dir)
                 _, series_info = self.organize_dicom_files(download_dir, output_format=output_format, min_series_files=min_series_files)
                 if not series_info:
-                    logger.error("❌ File organization failed, workflow terminated")
-                    return results
+                    # 区分真正的组织失败 vs 所有序列都被过滤掉
+                    import glob
+                    dicom_files = glob.glob(os.path.join(download_dir, '**', '*.dcm'), recursive=True)
+                    if dicom_files:
+                        logger.error(f"❌ All {len(dicom_files)} DICOM files were filtered out (min_files={min_series_files}). This accession has insufficient data.")
+                        raise ValueError(f"All series filtered out: only {len(dicom_files)} files found, min required is {min_series_files}. This may be a scout/locator scan or incomplete study.")
+                    else:
+                        logger.error("❌ File organization failed: no DICOM files found in download directory")
+                        raise ValueError("File organization failed: no DICOM files found")
                 results['organized_dir'] = organized_dir
                 results['series_info'] = series_info
 

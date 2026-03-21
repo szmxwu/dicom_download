@@ -49,6 +49,7 @@ class DICOMProcessor {
         this.bindEvents();
         this.updateCurrentTime();
         this.loadSystemStatus();
+        this.loadFilterKeywords();
         
         // 防抖包装的方法
         this.debouncedLoadSystemStatus = this.debounce(() => this.loadSystemStatus(), 1000);
@@ -278,7 +279,13 @@ class DICOMProcessor {
                 'file_size': 'Size',
                 'modified_time': 'Modified',
                 'cli_client': 'CLI Client',
-                'cli_client_title': 'Command-line Batch Download Client'
+                'cli_client_title': 'Command-line Batch Download Client',
+                'filter_keywords_config': 'Filter Keywords',
+                'derived_series_keywords': 'Derived Series Keywords',
+                'filter_keywords_help': 'One keyword per line. These keywords are used to filter out derived series (MPR, MIP, etc.).',
+                'save': 'Save',
+                'reset': 'Reset',
+                'filter_keywords_saved': 'Keywords saved. Will take effect on next task.'
             },
             'zh': {
                 'app_title': 'DICOM处理系统',
@@ -446,7 +453,13 @@ class DICOMProcessor {
                 'file_size': '大小',
                 'modified_time': '修改时间',
                 'cli_client': '客户端',
-                'cli_client_title': '命令行批量下载客户端'
+                'cli_client_title': '命令行批量下载客户端',
+                'filter_keywords_config': '过滤关键词',
+                'derived_series_keywords': '衍生序列过滤关键词',
+                'filter_keywords_help': '每行一个关键词。这些关键词用于过滤衍生序列（MPR、MIP等）。',
+                'save': '保存',
+                'reset': '重置',
+                'filter_keywords_saved': '关键词已保存，将在下一个任务时生效'
             }
         };
 
@@ -583,6 +596,18 @@ class DICOMProcessor {
         const testPacsConnectionBtn = document.getElementById('testPacsConnection');
         if (testPacsConnectionBtn) {
             testPacsConnectionBtn.addEventListener('click', () => this.testPacsConnection());
+        }
+
+        // 过滤关键词配置：保存
+        const saveFilterKeywordsBtn = document.getElementById('saveFilterKeywords');
+        if (saveFilterKeywordsBtn) {
+            saveFilterKeywordsBtn.addEventListener('click', () => this.saveFilterKeywords());
+        }
+
+        // 过滤关键词配置：重置
+        const resetFilterKeywordsBtn = document.getElementById('resetFilterKeywords');
+        if (resetFilterKeywordsBtn) {
+            resetFilterKeywordsBtn.addEventListener('click', () => this.resetFilterKeywords());
         }
 
         // 文件拖拽上传
@@ -922,6 +947,86 @@ class DICOMProcessor {
             this.showError(`${this.translations[this.currentLang]['pacs_connection_failed']}: ${error.message}`);
         } finally {
             if (btn) btn.disabled = originalDisabled;
+        }
+    }
+
+    // 加载过滤关键词
+    async loadFilterKeywords() {
+        try {
+            const response = await fetch('/api/filter-keywords');
+            const data = await response.json();
+            if (response.ok) {
+                const textarea = document.getElementById('filterKeywordsTextarea');
+                if (textarea) {
+                    textarea.value = data.keywords.join('\n');
+                }
+            }
+        } catch (error) {
+            console.error('Failed to load filter keywords:', error);
+        }
+    }
+
+    // 保存过滤关键词
+    async saveFilterKeywords() {
+        const textarea = document.getElementById('filterKeywordsTextarea');
+        const statusDiv = document.getElementById('filterKeywordsStatus');
+        if (!textarea) return;
+
+        const keywords = textarea.value.split('\n').map(k => k.trim()).filter(k => k);
+
+        try {
+            const response = await fetch('/api/filter-keywords', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keywords })
+            });
+
+            const data = await response.json();
+            if (response.ok) {
+                if (statusDiv) {
+                    statusDiv.style.display = 'block';
+                    setTimeout(() => { statusDiv.style.display = 'none'; }, 3000);
+                }
+                // 更新textarea为服务器返回的实际值（可能已去重）
+                textarea.value = data.keywords.join('\n');
+            } else {
+                this.showError(data.error || 'Failed to save filter keywords');
+            }
+        } catch (error) {
+            console.error('Failed to save filter keywords:', error);
+            this.showError(`Failed to save filter keywords: ${error.message}`);
+        }
+    }
+
+    // 重置过滤关键词
+    async resetFilterKeywords() {
+        const textarea = document.getElementById('filterKeywordsTextarea');
+        const statusDiv = document.getElementById('filterKeywordsStatus');
+
+        try {
+            const response = await fetch('/api/filter-keywords/reset', {
+                method: 'POST'
+            });
+
+            const data = await response.json();
+            if (response.ok) {
+                if (textarea) {
+                    textarea.value = data.keywords.join('\n');
+                }
+                if (statusDiv) {
+                    statusDiv.style.display = 'block';
+                    statusDiv.innerHTML = '<span class="text-success"><i class="fas fa-check-circle"></i> Reset to default successfully</span>';
+                    setTimeout(() => {
+                        statusDiv.style.display = 'none';
+                        statusDiv.innerHTML = '<span class="text-success"><i class="fas fa-check-circle"></i> <span data-i18n="filter_keywords_saved">Keywords saved. Will take effect on next task.</span></span>';
+                    }, 3000);
+                }
+            } else {
+                this.showError(data.error || 'Failed to reset filter keywords');
+            }
+        } catch (error) {
+            console.error('Failed to reset filter keywords:', error);
+            this.showError(`Failed to reset filter keywords: ${error.message}`);
         }
     }
 

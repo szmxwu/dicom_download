@@ -16,8 +16,8 @@ from typing import Dict, List, Any, Optional, Tuple
 # Create logger for organize module - use DICOMApp to match Flask app logging
 logger = logging.getLogger('DICOMApp')
 
-# 从常量模块导入衍生序列关键词
-from src.core.constants import DERIVED_SERIES_KEYWORDS
+# 从常量模块导入获取当前关键词的函数
+from src.core.constants import get_derived_keywords
 
 
 def _is_derived_series(series_desc: str, image_type=None) -> bool:
@@ -32,7 +32,7 @@ def _is_derived_series(series_desc: str, image_type=None) -> bool:
             return True
     if series_desc:
         desc_upper = series_desc.upper()
-        for keyword in DERIVED_SERIES_KEYWORDS:
+        for keyword in get_derived_keywords():
             if keyword in desc_upper:
                 return True
     return False

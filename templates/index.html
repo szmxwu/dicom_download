@@ -892,6 +892,60 @@ download_list(
                                     </div>
                                 </div>
                             </div>
+
+                            <!-- 衍生序列过滤配置 -->
+                            <div class="accordion-item">
+                                <h2 class="accordion-header" id="headingFilterKeywords">
+                                    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseFilterKeywords" aria-expanded="false" aria-controls="collapseFilterKeywords">
+                                        <span data-i18n="filter_keywords_config">Filter Keywords</span>
+                                    </button>
+                                </h2>
+                                <div id="collapseFilterKeywords" class="accordion-collapse collapse" aria-labelledby="headingFilterKeywords" data-bs-parent="#processOptionsAccordion">
+                                    <div class="accordion-body pt-2">
+                                        <div class="mb-2">
+                                            <label class="form-label small mb-1" data-i18n="derived_series_keywords">Derived Series Keywords</label>
+                                            <textarea class="form-control form-control-sm" id="filterKeywordsTextarea" rows="4" placeholder="MPR\nMIP\n3D\n...">MPR
+MIP
+MINIP
+SSD
+VRT
+VR
+CPR
+CURVED
+3D
+THICK
+SCOUT
+TOPOGRAM
+SURVEY
+REF
+REFERENCE
+LOC
+BATCH
+AVERAGE
+SUM
+REFORMAT
+PROJECTION
+RAYSUM
+KEY
+ROI
+DOSE
+TRACKER</textarea>
+                                            <small class="form-text text-muted" data-i18n="filter_keywords_help">One keyword per line. These keywords are used to filter out derived series (MPR, MIP, etc.).</small>
+                                        </div>
+                                        <div class="d-flex gap-2">
+                                            <button type="button" class="btn btn-primary btn-sm flex-fill" id="saveFilterKeywords">
+                                                <i class="fas fa-save"></i> <span data-i18n="save">Save</span>
+                                            </button>
+                                            <button type="button" class="btn btn-outline-secondary btn-sm flex-fill" id="resetFilterKeywords">
+                                                <i class="fas fa-undo"></i> <span data-i18n="reset">Reset</span>
+                                            </button>
+                                        </div>
+                                        <div class="mt-2 small" id="filterKeywordsStatus" style="display: none;">
+                                            <span class="text-success"><i class="fas fa-check-circle"></i> <span data-i18n="filter_keywords_saved">Keywords saved. Will take effect on next task.</span></span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- 快速操作 -->

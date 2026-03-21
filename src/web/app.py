@@ -51,6 +51,12 @@ import secrets
 # 导入我们的DICOM处理客户端
 from src.client.unified import DICOMDownloadClient
 from src.utils.packaging import create_result_zip
+from src.core.constants import (
+    DEFAULT_DERIVED_SERIES_KEYWORDS,
+    get_derived_keywords,
+    set_derived_keywords,
+    reset_derived_keywords
+)
 
 def get_base_path():
     """获取程序运行时的根目录路径，兼容 PyInstaller 打包"""
@@ -1520,7 +1526,8 @@ def process_single_task(task):
                             results['organized_dir'],
                             task.task_id,
                             app.config['RESULT_FOLDER'],
-                            extra_files=[results.get('excel_file')]
+                            extra_files=[results.get('excel_file')],
+                            include_subdirs=set(results.get('series_info', {}).keys())
                         )
                         results['result_zip'] = zip_path
                         task.add_log(f'Result ZIP created: {zip_path}')
@@ -1835,10 +1842,13 @@ def process_upload_task(task):
             
             task.update_status('running', 95, 'Creating result files')
             task.add_log("Creating result files...")
+            zip_source = organized_dir or result_dir
             zip_path = create_result_zip(
-                result_dir,
+                zip_source,
                 task.task_id,
-                app.config['RESULT_FOLDER']
+                app.config['RESULT_FOLDER'],
+                extra_files=[excel_file],
+                include_subdirs=set(series_info.keys())
             )
 
             task.result = {
@@ -1924,3 +1934,58 @@ if __name__ == '__main__':
     
     # 启动应用，开启调试模式和自动重载
     socketio.run(app, host='0.0.0.0', port=5005, debug=False, allow_unsafe_werkzeug=True)
+
+
+# ========== 衍生序列过滤关键词配置 API ==========
+
+@app.route('/api/filter-keywords', methods=['GET'])
+def get_filter_keywords():
+    """获取当前生效的衍生序列过滤关键词列表。"""
+    return jsonify({
+        'keywords': get_derived_keywords(),
+        'default_keywords': DEFAULT_DERIVED_SERIES_KEYWORDS,
+        'count': len(get_derived_keywords())
+    })
+
+
+@app.route('/api/filter-keywords', methods=['POST'])
+def set_filter_keywords():
+    """设置衍生序列过滤关键词列表（立即生效，影响后续所有新任务）。"""
+    data = request.json or {}
+    keywords = data.get('keywords')
+
+    if not isinstance(keywords, list):
+        return jsonify({'error': 'keywords must be a list of strings'}), 400
+
+    # 验证所有元素都是字符串且非空
+    validated = []
+    for k in keywords:
+        if isinstance(k, str) and k.strip():
+            validated.append(k.strip().upper())
+
+    if not validated:
+        return jsonify({'error': 'At least one valid keyword is required'}), 400
+
+    # 设置新的关键词（会自动去重）
+    set_derived_keywords(validated)
+    new_keywords = get_derived_keywords()
+    logger.info(f"📝 过滤关键词已更新: {new_keywords}")
+
+    return jsonify({
+        'message': 'Filter keywords updated successfully',
+        'keywords': new_keywords,
+        'count': len(new_keywords)
+    })
+
+
+@app.route('/api/filter-keywords/reset', methods=['POST'])
+def reset_filter_keywords():
+    """重置过滤关键词为系统默认值。"""
+    reset_derived_keywords()
+    keywords = get_derived_keywords()
+    logger.info(f"📝 过滤关键词已重置为默认值")
+    return jsonify({
+        'message': 'Filter keywords reset to default',
+        'keywords': keywords,
+        'count': len(keywords)
+    })
