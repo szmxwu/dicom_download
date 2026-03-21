@@ -626,7 +626,10 @@ class DICOMProcessor {
 
         const historyTab = document.getElementById('history-tab');
         if (historyTab) {
-            historyTab.addEventListener('shown.bs.tab', () => this.loadTaskHistory());
+            historyTab.addEventListener('shown.bs.tab', () => {
+                this.loadTaskHistory();
+                this.clearProgressAndResult(); // 历史记录页与任务无关，隐藏进度/结果
+            });
         }
 
         // 监控标签页事件
@@ -634,6 +637,7 @@ class DICOMProcessor {
         if (monitoringTab) {
             monitoringTab.addEventListener('shown.bs.tab', () => {
                 this.loadMonitoringData();
+                this.clearProgressAndResult(); // 监控页与任务无关，隐藏进度/结果
                 // 自动开启自动刷新
                 if (!this.monitoringAutoRefreshInterval) {
                     this.toggleAutoRefresh();
@@ -646,6 +650,28 @@ class DICOMProcessor {
                 }
             });
         }
+
+        // 客户端标签页：与任务无关，隐藏进度/结果
+        const clientTab = document.getElementById('client-tab');
+        if (clientTab) {
+            clientTab.addEventListener('shown.bs.tab', () => this.clearProgressAndResult());
+        }
+
+        // 处理类标签页：切换时若没有与当前 tab 对应的运行中/刚完成的任务，则清空进度/结果
+        const processingTabMap = { 'single-tab': 'single', 'batch-tab': 'batch', 'upload-tab': 'upload' };
+        Object.entries(processingTabMap).forEach(([tabId, tabType]) => {
+            const tab = document.getElementById(tabId);
+            if (!tab) return;
+            tab.addEventListener('shown.bs.tab', () => {
+                const taskMatchesTab = this.currentTask && this.currentTask.type === tabType;
+                const isRunning = this.currentTask &&
+                    (this.currentTask.status === 'running' || this.currentTask.status === 'pending');
+                // 仅当没有匹配该 tab 的任务且没有正在运行的任务时才清空
+                if (!taskMatchesTab && !isRunning) {
+                    this.clearProgressAndResult();
+                }
+            });
+        });
 
         const historyPageSize = document.getElementById('historyPageSize');
         if (historyPageSize) {
@@ -1408,6 +1434,14 @@ class DICOMProcessor {
         } else if (data.status === 'failed' || data.status === 'cancelled') {
             this.handleTaskFailed(data.status);
         }
+    }
+
+    // 隐藏并清空进度/结果卡片（切换 tab 时调用）
+    clearProgressAndResult() {
+        const progressCard = document.getElementById('progressCard');
+        const resultCard   = document.getElementById('resultCard');
+        if (progressCard) progressCard.style.display = 'none';
+        if (resultCard)   resultCard.style.display   = 'none';
     }
 
     // 显示进度卡片
