@@ -485,14 +485,23 @@ def assess_image_quality_from_array(
         # 获取百分位阈值
         p_low = thresholds.get('percentile_low', 2.0)
         p_high = thresholds.get('percentile_high', 98.0)
-        
-        p2, p98 = np.percentile(flat, [p_low, p_high])
+
+        # 对于MRI/CT等体积图像，排除背景像素（zeros）以获取准确的组织信号统计
+        # 背景像素是正常存在的，不应计入质量缺陷
+        tissue_flat = flat
+        if modality in ['MR', 'CT']:
+            # 排除零值和接近零的背景像素
+            non_bg_mask = flat > (flat.max() * 0.001)  # 排除低于最大值0.1%的像素
+            if np.sum(non_bg_mask) > flat.size * 0.05:  # 确保至少保留5%的像素
+                tissue_flat = flat[non_bg_mask]
+
+        p2, p98 = np.percentile(tissue_flat, [p_low, p_high])
         dynamic_range = p98 - p2
-        std = float(np.std(flat))
-        unique_ratio = len(np.unique(flat)) / max(1, flat.size)
-        mean_val = float(np.mean(flat))
+        std = float(np.std(tissue_flat))
+        unique_ratio = len(np.unique(tissue_flat)) / max(1, tissue_flat.size)
+        mean_val = float(np.mean(tissue_flat))
         range_eps = max(dynamic_range, 1e-6)
-        
+
         metrics = {
             'dynamic_range': round(dynamic_range, 2),
             'std': round(std, 2),
@@ -501,6 +510,9 @@ def assess_image_quality_from_array(
             'p2': round(p2, 2),
             'p98': round(p98, 2),
             'modality': modality,
+            'background_excluded': modality in ['MR', 'CT'] and tissue_flat.size < flat.size,
+            'original_pixel_count': int(flat.size),
+            'tissue_pixel_count': int(tissue_flat.size),
         }
 
         if dynamic_range <= 0:
@@ -528,12 +540,12 @@ def assess_image_quality_from_array(
             reasons.append(QualityReasons.COMPLEXITY_LOW)
             metrics['unique_ratio_threshold'] = unique_ratio_min
 
-        # 检测过曝和欠曝
+        # 检测过曝和欠曝（基于组织像素，排除背景）
         low_thresh = p2 + 0.01 * range_eps
         high_thresh = p98 - 0.01 * range_eps
-        low_ratio = float(np.mean(flat <= low_thresh))
-        high_ratio = float(np.mean(flat >= high_thresh))
-        
+        low_ratio = float(np.mean(tissue_flat <= low_thresh))
+        high_ratio = float(np.mean(tissue_flat >= high_thresh))
+
         metrics['low_ratio'] = round(low_ratio, 4)
         metrics['high_ratio'] = round(high_ratio, 4)
 
