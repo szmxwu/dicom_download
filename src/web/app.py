@@ -1996,7 +1996,7 @@ if __name__ == '__main__':
             ssl_context = (cert_path, key_path)
             protocol = 'https'
             logger.info(f"🔒 HTTPS 已启用 (证书: {cert_path})")
-            logger.info("   ⚠️  首次访问时浏览器会提示证书不受信任，点击"高级→继续访问"即可")
+            logger.info("   ⚠️  首次访问时浏览器会提示证书不受信任，点击'高级→继续访问'即可")
         except Exception as ssl_err:
             logger.error(f"❌ HTTPS 启动失败，回退为 HTTP: {ssl_err}")
 

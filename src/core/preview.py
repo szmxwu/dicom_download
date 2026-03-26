@@ -185,13 +185,21 @@ def _estimate_window_params(dcm, image_2d: np.ndarray, modality: str) -> Tuple[f
         elif modality == 'MR':
             # MR 根据序列类型选择不同的窗宽窗位策略
             seq_type = _get_mr_sequence_type(dcm)
-            
-            # 计算图像统计信息
-            img_mean = np.mean(img)
-            img_std = np.std(img)
-            img_min = np.min(img)
-            img_max = np.max(img)
-            
+
+            # 排除背景像素（zeros）以获取准确的组织信号统计
+            # MRI图像通常有大量零值背景，这会影响窗宽窗位估计
+            non_zero_mask = img > (img.max() * 0.001)  # 排除低于最大值0.1%的像素
+            if np.sum(non_zero_mask) > img.size * 0.05:  # 确保至少保留5%的像素
+                tissue_img = img[non_zero_mask]
+            else:
+                tissue_img = img
+
+            # 计算图像统计信息（基于组织像素）
+            img_mean = np.mean(tissue_img)
+            img_std = np.std(tissue_img)
+            img_min = np.min(tissue_img)
+            img_max = np.max(tissue_img)
+
             if seq_type == 'T1':
                 # T1: 使用较窄的窗宽突出解剖结构
                 # 基于均值 ± 2*标准差，但限制最小窗宽
@@ -215,11 +223,11 @@ def _estimate_window_params(dcm, image_2d: np.ndarray, modality: str) -> Tuple[f
                 wl = (img_max + img_min) / 2
             else:
                 # 未知 MR 序列：使用自适应方法
-                # 排除极端值后计算窗宽窗位
-                p5, p95 = np.percentile(img, [5, 95])
+                # 基于非零像素计算百分位数，避免背景影响
+                p5, p95 = np.percentile(tissue_img, [5, 95])
                 ww = p95 - p5
                 wl = (p5 + p95) / 2
-            
+
             low = wl - ww / 2.0
             high = wl + ww / 2.0
             
@@ -1214,48 +1222,34 @@ def _generate_3d_triplane_preview(
         original_orientation = min(layer_counts, key=layer_counts.get)
         original_slices = layer_counts[original_orientation]
 
-        # 从NIfTI header获取体素尺寸
+        # 从 canonical NIfTI header 获取体素尺寸（必须用 canonical 图像，轴序已重排）
+        # canonical 体积轴顺序：axis0=X(dx), axis1=Y(dy), axis2=Z(dz)
         try:
-            voxel_sizes = img.header.get_zooms()[:3]  # (dx, dy, dz) in mm
-            dx, dy, dz = voxel_sizes[0], voxel_sizes[1], voxel_sizes[2]
+            canon_zooms = img_canonical.header.get_zooms()[:3]
+            dx = float(canon_zooms[0]) if float(canon_zooms[0]) > 1e-6 else 1.0
+            dy = float(canon_zooms[1]) if float(canon_zooms[1]) > 1e-6 else 1.0
+            dz = float(canon_zooms[2]) if float(canon_zooms[2]) > 1e-6 else 1.0
         except Exception:
-            # 如果无法获取，从层厚推断
-            st = slice_thickness if slice_thickness else 1.0
-            dx = dy = dz = st
+            dx = dy = dz = 1.0
 
-        # 计算各方向的物理尺寸 (mm)
-        phys_x = n_sagittal * dx  # 左右方向
-        phys_y = n_coronal * dy   # 前后方向（可能是层厚方向）
-        phys_z = n_axial * dz     # 头足方向
+        # 体素间距校正：经过 transpose 后各切片的行列方向对应的体素间距：
+        #   Axial   (Y, X) — row_spacing=dy, col_spacing=dx
+        #   Sagittal(Z, Y) — row_spacing=dz, col_spacing=dy  ← 层厚方向在行方向，差异最大
+        #   Coronal (Z, X) — row_spacing=dz, col_spacing=dx  ← 同上
+        # 需要将高度方向按 row_spacing/col_spacing 拉伸以还原真实物理比例。
+        def _scale_height(arr2d, row_sp, col_sp):
+            ratio = row_sp / col_sp
+            if abs(ratio - 1.0) < 0.02:   # 2% 以内视为等向素，不处理
+                return arr2d
+            h, w = arr2d.shape
+            new_h = max(1, int(round(h * ratio)))
+            pil_img = Image.fromarray(arr2d)
+            return np.array(pil_img.resize((w, new_h), Image.BILINEAR))
 
-        # 调整纵横比：只对重建方向（非原始方向）进行调整
-        def adjust_aspect_ratio(slice_img, phys_width, phys_height):
-            """根据物理尺寸调整图像纵横比"""
-            h, w = slice_img.shape
-            current_aspect = w / h
-            target_aspect = phys_width / phys_height
-
-            # 如果纵横比接近，不需要调整
-            if abs(current_aspect - target_aspect) / target_aspect < 0.1:
-                return slice_img
-
-            # 计算调整后的尺寸，保持物理纵横比
-            if current_aspect < target_aspect:
-                new_w = int(h * target_aspect)
-                new_h = h
-            else:
-                new_w = w
-                new_h = int(w / target_aspect)
-
-            pil_img = Image.fromarray(slice_img)
-            pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
-            return np.array(pil_img)
-
-        # 注意：经过transpose后，各方向切片已经呈现真实物理纵横比
-        # Axial (横断位): 宽=phys_x, 高=phys_y (对于冠状位扫描，phys_y很小，所以图像很扁)
-        # Sagittal (矢状位): 宽=phys_y, 高=phys_z (对于冠状位扫描，phys_y很小，所以图像很窄)
-        # Coronal (冠状位): 宽=phys_x, 高=phys_z (原始采集方向，通常是正方形)
-        # 不需要额外调整纵横比，直接显示真实比例
+        if preview_file.endswith(('.nii', '.nii.gz')):
+            slice_axial    = _scale_height(slice_axial,    dy, dx)  # 通常已是等向素
+            slice_sagittal = _scale_height(slice_sagittal, dz, dy)  # 层厚/行间距校正
+            slice_coronal  = _scale_height(slice_coronal,  dz, dx)  # 层厚/行间距校正
 
         # 转换为RGB用于绘制彩色文字
         slice_axial_rgb = np.stack([slice_axial, slice_axial, slice_axial], axis=2)
@@ -1283,14 +1277,9 @@ def _generate_3d_triplane_preview(
                                           font_size=20, color=(255, 255, 0))
             return img
 
-        slice_axial_rgb = draw_orientation_label(slice_axial_rgb, "AXIAL",
-                                                  original_orientation == 'axial')
-        slice_sagittal_rgb = draw_orientation_label(slice_sagittal_rgb, "SAGITTAL",
-                                                     original_orientation == 'sagittal')
-        slice_coronal_rgb = draw_orientation_label(slice_coronal_rgb, "CORONAL",
-                                                    original_orientation == 'coronal')
-
-        # 统一三个视图的大小
+        # 先统一三个视图的大小，再画标签。
+        # 必须先 resize_to_canvas 后画标签：某些方位切片经体素校正后高度很小
+        # （如冠状位扫描的矢状切片可能只有 76px），若先画 85px 的标签区会完全覆盖图像内容。
         max_h = max(slice_axial_rgb.shape[0], slice_sagittal_rgb.shape[0], slice_coronal_rgb.shape[0])
         max_w = max(slice_axial_rgb.shape[1], slice_sagittal_rgb.shape[1], slice_coronal_rgb.shape[1])
 
@@ -1312,9 +1301,17 @@ def _generate_3d_triplane_preview(
             canvas[top:top + new_h, left:left + new_w] = resized
             return canvas
 
-        slice_axial_resized = resize_to_canvas(slice_axial_rgb, max_h, max_w)
+        slice_axial_resized   = resize_to_canvas(slice_axial_rgb,    max_h, max_w)
         slice_sagittal_resized = resize_to_canvas(slice_sagittal_rgb, max_h, max_w)
-        slice_coronal_resized = resize_to_canvas(slice_coronal_rgb, max_h, max_w)
+        slice_coronal_resized  = resize_to_canvas(slice_coronal_rgb,  max_h, max_w)
+
+        # 在统一尺寸的 canvas 上画标签（此时每个 panel 都是 max_h×max_w，足以容纳标签区）
+        slice_axial_resized   = draw_orientation_label(slice_axial_resized,   "AXIAL",
+                                                        original_orientation == 'axial')
+        slice_sagittal_resized = draw_orientation_label(slice_sagittal_resized, "SAGITTAL",
+                                                         original_orientation == 'sagittal')
+        slice_coronal_resized  = draw_orientation_label(slice_coronal_resized,  "CORONAL",
+                                                         original_orientation == 'coronal')
 
         # 水平拼接三个视图
         triplane = np.concatenate([slice_axial_resized, slice_sagittal_resized, slice_coronal_resized], axis=1)

@@ -27,9 +27,16 @@ def _is_derived_series(series_desc: str, image_type=None) -> bool:
     用于弥补 PACS 查询阶段 SeriesDescription 不完整导致的漏判。
     """
     if image_type:
-        image_type_str = ' '.join(image_type) if isinstance(image_type, (list, tuple)) else str(image_type)
-        if 'DERIVED' in image_type_str.upper() or 'SECONDARY' in image_type_str.upper():
-            return True
+        # DICOM ImageType 第一个值才代表像素来源：DERIVED（衍生）或 ORIGINAL（原始采集）。
+        # 第二个值 PRIMARY/SECONDARY 表示采集上下文，与是否为衍生序列无关，
+        # 不能用于过滤（许多正常 MR/CT 序列第二值即为 SECONDARY）。
+        if isinstance(image_type, (list, tuple)):
+            first_val = str(image_type[0]).upper().strip() if image_type else ''
+            if first_val == 'DERIVED':
+                return True
+        else:
+            if 'DERIVED' in str(image_type).upper():
+                return True
     if series_desc:
         desc_upper = series_desc.upper()
         for keyword in get_derived_keywords():

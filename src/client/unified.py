@@ -494,10 +494,16 @@ class DICOMDownloadClient:
                                 if exclude_derived:
                                     image_type = getattr(identifier, 'ImageType', None)
                                     if image_type:
-                                        # ImageType可能是列表或字符串
-                                        image_type_str = ' '.join(image_type) if isinstance(image_type, (list, tuple)) else str(image_type)
-                                        if 'DERIVED' in image_type_str.upper() or 'SECONDARY' in image_type_str.upper():
-                                            is_derived = True
+                                        # ImageType 第一个值才代表像素来源：DERIVED/ORIGINAL。
+                                        # 第二个值 PRIMARY/SECONDARY 是采集上下文，不能用于过滤。
+                                        if isinstance(image_type, (list, tuple)):
+                                            first_val = str(image_type[0]).upper().strip() if image_type else ''
+                                            if first_val == 'DERIVED':
+                                                is_derived = True
+                                        else:
+                                            if 'DERIVED' in str(image_type).upper():
+                                                is_derived = True
+                                        if is_derived:
                                             logger.debug(f"   Filtered by ImageType (DERIVED): {series_desc}")
 
                                     # 过滤衍生序列：检查SeriesDescription关键词
