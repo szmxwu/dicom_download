@@ -24,6 +24,7 @@ DICOM 元数据提取模块。
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -32,6 +33,9 @@ import pandas as pd
 import pydicom
 
 from src.core.qc import ImageQualityResult, assess_converted_file_quality as _default_assess_file_qc, assess_series_quality_converted as _default_assess_series_qc
+
+# Create logger for metadata module - use DICOMApp to match Flask app logging
+logger = logging.getLogger('DICOMApp')
 
 
 def _extract_quality_value(result: Union[ImageQualityResult, int]) -> Tuple[int, str]:
@@ -45,9 +49,13 @@ def _extract_quality_value(result: Union[ImageQualityResult, int]) -> Tuple[int,
         Tuple[int, str]: (质量值 0/1, 原因描述)
     """
     if isinstance(result, ImageQualityResult):
+        reason_desc = result.get_reason_description()
         if result.is_low_quality:
-            return 1, result.get_reason_description()
+            return 1, reason_desc
         else:
+            # 如果不是低质量，但原因描述不是 "Normal"（例如包含修复状态），也返回原因
+            if reason_desc and reason_desc != "Normal":
+                return 0, reason_desc
             return 0, "Normal"
     else:
         # For backward compatibility with int results
@@ -78,7 +86,7 @@ def extract_dicom_metadata(
     get_keywords: Callable[[str], List[str]],
     get_converted_files: Callable[[str], Tuple[List[str], Optional[str]]],
     assess_converted_file_quality: Callable[[str, Optional[str]], Union[ImageQualityResult, int]],
-    assess_series_quality_converted: Callable[[List[str], Optional[str]], Dict],
+    assess_series_quality_converted: Callable[[List[str], Optional[str], Optional[str]], Dict],
     append_mr_cleaned_sheet: Callable[[pd.DataFrame, str], None],
 ) -> Optional[str]:
     """
@@ -94,7 +102,7 @@ def extract_dicom_metadata(
         get_keywords: 回调函数，接收模态字符串（如 'CT', 'MR'），返回要提取的 DICOM 关键字列表
         get_converted_files: 回调函数，接收序列路径，返回 (转换文件列表, 附加信息) 元组
         assess_converted_file_quality: 回调函数，接收(文件路径, 模态)，返回质量评分（0=正常，1=低质量）或 ImageQualityResult
-        assess_series_quality_converted: 回调函数，接收(文件路径列表, 模态)，返回质量汇总字典（包含 low_quality_reason）
+        assess_series_quality_converted: 回调函数，接收(文件路径列表, 模态, 序列目录)，返回质量汇总字典（包含 low_quality_reason）
         append_mr_cleaned_sheet: 回调函数，接收 DataFrame 和 Excel 路径，用于添加 MR 清洗结果
 
     返回:
@@ -104,16 +112,22 @@ def extract_dicom_metadata(
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         output_excel = os.path.join(os.path.dirname(organized_dir), f"dicom_metadata_{timestamp}.xlsx")
 
-    print("📊 Extracting DICOM metadata...")
+    logger.info("📊 Extracting DICOM metadata...")
+    logger.info(f"   Organized dir: {organized_dir}")
 
     all_metadata: List[Dict] = []
 
-    for series_folder in os.listdir(organized_dir):
+    # List all series folders (skip 'organized' subdirectory if exists - legacy compatibility)
+    series_folders = [f for f in os.listdir(organized_dir)
+                      if os.path.isdir(os.path.join(organized_dir, f)) and f != 'organized']
+    logger.info(f"   Found {len(series_folders)} series folders: {series_folders}")
+
+    for series_folder in series_folders:
         series_path = os.path.join(organized_dir, series_folder)
         if not os.path.isdir(series_path):
             continue
 
-        print(f"📂 Processing series: {series_folder}")
+        logger.info(f"📂 Processing series: {series_folder}")
 
         converted_files, _ = get_converted_files(series_path)
 
@@ -126,6 +140,8 @@ def extract_dicom_metadata(
         if not dicom_files:
             cache_path = os.path.join(series_path, "dicom_metadata_cache.json")
             if os.path.exists(cache_path):
+                cache_loaded = False
+                cached_records = []
                 try:
                     with open(cache_path, 'r', encoding='utf-8') as f:
                         cache = json.load(f)
@@ -157,43 +173,96 @@ def extract_dicom_metadata(
                     elif sample_tags and 'AccessionNumber' in sample_tags:
                         accession_number = sample_tags['AccessionNumber']
                     
-                    if read_all:
-                        converted_quality_results = [assess_converted_file_quality(p, cached_modality) for p in converted_files]
+                    # Add QC and fix information - wrap in try/except to not lose tags on QC failure
+                    try:
+                        if read_all:
+                            converted_quality_results = [assess_converted_file_quality(p, cached_modality) for p in converted_files]
+                            for idx, record in enumerate(cached_records):
+                                quality_val, quality_reason = _extract_quality_value(
+                                    converted_quality_results[idx] if idx < len(converted_quality_results) else 1
+                                )
+                                record['Low_quality'] = quality_val
+                                record['Low_quality_reason'] = quality_reason
+                                # Add fix information from detailed results
+                                if idx < len(converted_quality_results):
+                                    detail = converted_quality_results[idx]
+                                    # Handle both ImageQualityResult and dict
+                                    if hasattr(detail, 'metrics'):
+                                        # ImageQualityResult object
+                                        metrics = detail.metrics
+                                        if metrics.get('fixed'):
+                                            record['Fixed'] = 'Yes'
+                                            fixes = metrics.get('fixes_applied', [])
+                                            if isinstance(fixes, list):
+                                                record['Fixes_applied'] = ', '.join(fixes)
+                                            else:
+                                                record['Fixes_applied'] = str(fixes)
+                                    elif isinstance(detail, dict):
+                                        # Dict result
+                                        if detail.get('fixed'):
+                                            record['Fixed'] = 'Yes'
+                                            fixes = detail.get('fixes_applied', [])
+                                            if isinstance(fixes, list):
+                                                record['Fixes_applied'] = ', '.join(fixes)
+                                            else:
+                                                record['Fixes_applied'] = str(fixes)
+                                # Update FileName to converted filename format
+                                if idx < len(converted_files):
+                                    record['FileName'] = _build_converted_filename(accession_number, converted_files[idx])
+                        else:
+                            series_quality_result = assess_series_quality_converted(converted_files, cached_modality, series_path)
+                            series_quality = series_quality_result.get('low_quality', 1)
+                            series_quality_reason = series_quality_result.get('low_quality_reason', '')
+                            if cached_records:
+                                cached_records[0]['Low_quality'] = series_quality
+                                cached_records[0]['Low_quality_reason'] = series_quality_reason
+                                # Add fix information
+                                fixed_count = series_quality_result.get('fixed_count', 0)
+                                if fixed_count > 0:
+                                    cached_records[0]['Fixed_count'] = fixed_count
+                                    cached_records[0]['Fixed_orientation'] = series_quality_result.get('fixed_orientation_count', 0)
+                                    cached_records[0]['Fixed_grayscale'] = series_quality_result.get('fixed_grayscale_count', 0)
+                                # Update SampleFileName to first converted filename for 3D series
+                                if converted_files:
+                                    cached_records[0]['SampleFileName'] = _build_converted_filename(accession_number, converted_files[0])
+                    except Exception as e:
+                        print(f"     ⚠️  QC failed for {series_folder}, but preserving cached tags: {e}")
+                        # Still add the records without QC info
                         for idx, record in enumerate(cached_records):
-                            quality_val, quality_reason = _extract_quality_value(
-                                converted_quality_results[idx] if idx < len(converted_quality_results) else 1
-                            )
-                            record['Low_quality'] = quality_val
-                            record['Low_quality_reason'] = quality_reason
-                            # Update FileName to converted filename format
                             if idx < len(converted_files):
                                 record['FileName'] = _build_converted_filename(accession_number, converted_files[idx])
-                            all_metadata.append(record)
-                    else:
-                        series_quality_result = assess_series_quality_converted(converted_files, cached_modality)
-                        series_quality = series_quality_result.get('low_quality', 1)
-                        series_quality_reason = series_quality_result.get('low_quality_reason', '')
-                        if cached_records:
-                            cached_records[0]['Low_quality'] = series_quality
-                            cached_records[0]['Low_quality_reason'] = series_quality_reason
-                            # Update SampleFileName to first converted filename for 3D series
-                            if converted_files:
-                                cached_records[0]['SampleFileName'] = _build_converted_filename(accession_number, converted_files[0])
-                            all_metadata.append(cached_records[0])
+                    
+                    # Add all cached records to metadata
+                    for record in cached_records:
+                        all_metadata.append(record)
+                    cache_loaded = True
                     continue
-                except Exception:
-                    pass
+                    
+                except Exception as e:
+                    print(f"     ⚠️  Failed to load cache for {series_folder}: {e}")
+                    # If we have cached_records, still use them even if QC failed
+                    if cached_records:
+                        for record in cached_records:
+                            all_metadata.append(record)
+                        cache_loaded = True
+                        continue
 
-            nifti_files = [f for f in os.listdir(series_path) if f.endswith(('.nii.gz', '.nii'))]
-            if nifti_files:
-                metadata = {
-                    'SeriesFolder': series_folder,
-                    'ConvertedToNIfTI': 'Yes',
-                    'NIfTIFile': nifti_files[0],
-                    'TotalFilesInSeries': 1
-                }
-                all_metadata.append(metadata)
-            continue
+            # Fallback: only if no cache or cache failed to load
+            if not cache_loaded:
+                logger.warning(f"     ⚠️  No DICOM files found in {series_folder}, trying NIfTI fallback")
+                nifti_files = [f for f in os.listdir(series_path) if f.endswith(('.nii.gz', '.nii'))]
+                if nifti_files:
+                    metadata = {
+                        'SeriesFolder': series_folder,
+                        'ConvertedToNIfTI': 'Yes',
+                        'NIfTIFile': nifti_files[0],
+                        'TotalFilesInSeries': 1
+                    }
+                    all_metadata.append(metadata)
+                    print(f"     ✅ Added NIfTI fallback for {series_folder}")
+                else:
+                    print(f"     ❌ No NIfTI files either in {series_folder}")
+                continue
 
         try:
             sample_file = dicom_files[0]
@@ -245,6 +314,29 @@ def extract_dicom_metadata(
                     )
                     record['Low_quality'] = quality_val
                     record['Low_quality_reason'] = quality_reason
+                    # Add fix information
+                    if idx < len(converted_quality_results):
+                        detail = converted_quality_results[idx]
+                        # Handle both ImageQualityResult and dict
+                        if hasattr(detail, 'metrics'):
+                            # ImageQualityResult object
+                            metrics = detail.metrics
+                            if metrics.get('fixed'):
+                                record['Fixed'] = 'Yes'
+                                fixes = metrics.get('fixes_applied', [])
+                                if isinstance(fixes, list):
+                                    record['Fixes_applied'] = ', '.join(fixes)
+                                else:
+                                    record['Fixes_applied'] = str(fixes)
+                        elif isinstance(detail, dict):
+                            # Dict result
+                            if detail.get('fixed'):
+                                record['Fixed'] = 'Yes'
+                                fixes = detail.get('fixes_applied', [])
+                                if isinstance(fixes, list):
+                                    record['Fixes_applied'] = ', '.join(fixes)
+                                else:
+                                    record['Fixes_applied'] = str(fixes)
                     # Update FileName to converted filename format: AccessionNumber/filename
                     if idx < len(converted_files):
                         record['FileName'] = _build_converted_filename(accession_number, converted_files[idx])
@@ -276,20 +368,27 @@ def extract_dicom_metadata(
                             metadata[keyword] = ""
                     except Exception:
                         metadata[keyword] = ""
-                series_quality_result = assess_series_quality_converted(converted_files, modality)
+                series_quality_result = assess_series_quality_converted(converted_files, modality, series_path)
                 metadata['Low_quality'] = series_quality_result.get('low_quality', 1)
                 metadata['Low_quality_reason'] = series_quality_result.get('low_quality_reason', '')
+                # Add fix information
+                fixed_count = series_quality_result.get('fixed_count', 0)
+                if fixed_count > 0:
+                    metadata['Fixed_count'] = fixed_count
+                    metadata['Fixed_orientation'] = series_quality_result.get('fixed_orientation_count', 0)
+                    metadata['Fixed_grayscale'] = series_quality_result.get('fixed_grayscale_count', 0)
                 # Update SampleFileName to first converted filename for 3D series
                 if converted_files:
                     metadata['SampleFileName'] = _build_converted_filename(accession_number, converted_files[0])
                 all_metadata.append(metadata)
 
         except Exception as e:
-            print(f"     ❌ Failed processing series: {e}")
+            logger.error(f"     ❌ Failed processing series: {e}")
             continue
 
     if not all_metadata:
-        print("❌ No metadata extracted")
+        logger.error(f"❌ No metadata extracted from {organized_dir}")
+        logger.error(f"   Series folders found: {len(series_folders)}")
         return None
 
     try:
@@ -362,5 +461,7 @@ def extract_dicom_metadata(
         return output_excel
 
     except Exception as e:
-        print(f"❌ Failed saving Excel file: {e}")
+        logger.error(f"❌ Failed saving Excel file: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return None

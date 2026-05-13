@@ -12,13 +12,19 @@ import json
 import time
 import threading
 import zipfile
-from queue import Queue
+from queue import Queue, Empty
 import pandas as pd
 import pydicom
 import re
 import sys
 import logging
+import hashlib
+import socket
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Callable, Any, Tuple
 from types import SimpleNamespace
+from src.core.constants import get_derived_keywords
 from src.core.metadata import extract_dicom_metadata as extract_dicom_metadata_impl
 from src.core.organize import organize_dicom_files as organize_dicom_files_impl
 from src.core.organize import process_single_series as process_single_series_impl
@@ -48,6 +54,165 @@ from pynetdicom.sop_class import (
 from pydicom.dataset import Dataset
 
 logger = logging.getLogger('DICOMApp')
+
+
+# ==================== P0/P1: 健壮性辅助类和函数 ====================
+
+@dataclass
+class DownloadStats:
+    """下载统计信息"""
+    total_series: int = 0
+    completed_series: int = 0
+    failed_series: int = 0
+    total_bytes: int = 0
+    start_time: float = field(default_factory=time.time)
+    errors: List[Dict] = field(default_factory=list)
+
+    def get_summary(self) -> Dict:
+        elapsed = time.time() - self.start_time
+        return {
+            'total_series': self.total_series,
+            'completed_series': self.completed_series,
+            'failed_series': self.failed_series,
+            'total_mb': self.total_bytes / (1024 * 1024),
+            'elapsed_sec': elapsed,
+            'speed_mbps': (self.total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+        }
+
+
+class AssociationManager:
+    """P0: 关联管理器，支持重试和上下文管理"""
+
+    def __init__(self, ae: AE, pacs_config: Dict):
+        self.ae = ae
+        self.pacs_config = pacs_config
+        self.assoc = None
+        self.retry_count = 0
+
+    def connect(self, max_retries: int = 3, base_delay: float = 2.0) -> bool:
+        """P0: 带指数退避的连接重试"""
+        for attempt in range(max_retries):
+            try:
+                self.assoc = self.ae.associate(
+                    self.pacs_config['PACS_IP'],
+                    self.pacs_config['PACS_PORT'],
+                    ae_title=self.pacs_config['CALLED_AET']
+                )
+                if self.assoc.is_established:
+                    self.retry_count = attempt + 1
+                    if attempt > 0:
+                        logger.info(f"PACS connection succeeded after {attempt + 1} attempts")
+                    return True
+                else:
+                    logger.warning(f"Association attempt {attempt + 1}/{max_retries} failed: not established")
+            except Exception as e:
+                logger.error(f"Association attempt {attempt + 1}/{max_retries} error: {e}")
+
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.info(f"Waiting {delay:.1f}s before retry...")
+                time.sleep(delay)
+
+        return False
+
+    def __enter__(self):
+        if not self.connect():
+            raise ConnectionError("Failed to establish PACS association after retries")
+        return self.assoc
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.assoc and self.assoc.is_established:
+            try:
+                self.assoc.release()
+            except Exception as e:
+                logger.warning(f"Error releasing association: {e}")
+
+
+class QueueWatchdog:
+    """P2: 队列看门狗，防止死锁"""
+
+    def __init__(self, queue: Queue, timeout: float = 300.0):
+        self.queue = queue
+        self.timeout = timeout
+        self.last_activity = time.time()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._monitor, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
+
+    def update_activity(self):
+        self.last_activity = time.time()
+
+    def _monitor(self):
+        while not self._stop_event.is_set():
+            time.sleep(5.0)
+            if time.time() - self.last_activity > self.timeout:
+                logger.error(f"Queue watchdog: No activity for {self.timeout}s, potential deadlock detected")
+                # 放入哨兵值来唤醒可能阻塞的 worker
+                try:
+                    self.queue.put(None, timeout=1.0)
+                except:
+                    pass
+
+
+def compute_file_checksum(filepath: str, algorithm: str = 'md5') -> Optional[str]:
+    """P3: 计算文件校验和"""
+    try:
+        hasher = hashlib.new(algorithm)
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception as e:
+        logger.warning(f"Failed to compute checksum for {filepath}: {e}")
+        return None
+
+
+class FailedSeriesTracker:
+    """P0: 失败序列追踪器，支持重试"""
+
+    def __init__(self):
+        self.failed: Dict[str, Dict] = {}
+        self._lock = threading.Lock()
+
+    def add(self, series_uid: str, series_info: Dict, error: Exception):
+        with self._lock:
+            if series_uid not in self.failed:
+                self.failed[series_uid] = {
+                    'info': series_info,
+                    'error': str(error),
+                    'timestamp': time.time(),
+                    'retry_count': 0
+                }
+            else:
+                self.failed[series_uid]['retry_count'] += 1
+                self.failed[series_uid]['error'] = str(error)
+                self.failed[series_uid]['timestamp'] = time.time()
+
+    def should_retry(self, series_uid: str, max_retries: int = 2) -> bool:
+        with self._lock:
+            if series_uid not in self.failed:
+                return False
+            return self.failed[series_uid]['retry_count'] < max_retries
+
+    def get_retryable_series(self, max_retries: int = 2) -> List[Tuple[str, Dict]]:
+        with self._lock:
+            return [(uid, info['info']) for uid, info in self.failed.items()
+                    if info['retry_count'] < max_retries]
+
+    def get_summary(self) -> Dict:
+        with self._lock:
+            return {
+                'total_failed': len(self.failed),
+                'retryable': sum(1 for info in self.failed.values() if info['retry_count'] < 2),
+                'permanent_failures': [uid for uid, info in self.failed.items() if info['retry_count'] >= 2]
+            }
+
 
 def get_base_path():
     """获取程序运行时的根目录路径，兼容 PyInstaller 打包"""
@@ -95,6 +260,20 @@ class DICOMDownloadClient:
         except Exception:
             self._download_high_watermark_gb = 45.0
             self._download_low_watermark_gb = 40.0
+
+        # P0: 下载统计信息
+        self.download_stats = DownloadStats()
+        # P0: 失败序列追踪器
+        self.failed_series_tracker = FailedSeriesTracker()
+        # P1: AE使用锁（防止多线程并发使用同一个AE）
+        self._ae_lock = threading.Lock()
+        # P3: 下载文件校验和缓存 {filepath: checksum}
+        self._checksum_cache: Dict[str, str] = {}
+        self._checksum_lock = threading.Lock()
+
+    # 类级别的C-MOVE锁：防止多个实例同时启动C-STORE SCP导致端口冲突
+    # C-MOVE协议要求客户端启动SCP服务器接收图像，固定端口无法支持并发
+    _cmove_lock = threading.Lock()
     
     def _load_keywords(self, tags_dir="dicom_tags"):
         """加载不同模态的DICOM字段列表"""
@@ -230,7 +409,7 @@ class DICOMDownloadClient:
             
             if assoc.is_established:
                 assoc.release()
-                logger.info("PACS connection status: OK")
+                logger.debug("PACS connection status: OK")
                 return True
             else:
                 logger.warning("Unable to connect to PACS")
@@ -239,22 +418,21 @@ class DICOMDownloadClient:
             logger.error(f"PACS connection error: {e}")
             return False
     
-    def _query_series_metadata(self, accession_number):
-        """查询PACS获取Series元数据"""
+    def _query_series_metadata(self, accession_number, modality_filter=None, min_series_files=None, exclude_derived=True):
+        """查询PACS获取Series元数据
+
+        Args:
+            accession_number: 检查号
+            modality_filter: 可选，模态过滤（如 'MR', 'CT'）
+            min_series_files: 可选，最小序列文件数，少于该值的序列将被过滤
+            exclude_derived: 是否排除衍生序列（MPR, MIP, VR等），默认True
+        """
         series_metadata = []
-        
+
+
+        # P1: 使用上下文管理器确保连接释放，P0: 带重试机制
         try:
-            assoc = self.ae.associate(
-                self.pacs_config['PACS_IP'],
-                self.pacs_config['PACS_PORT'],
-                ae_title=self.pacs_config['CALLED_AET']
-            )
-            
-            if not assoc.is_established:
-                print("❌ Cannot build PACS connection")
-                return []
-            
-            try:
+            with AssociationManager(self.ae, self.pacs_config) as assoc:
                 # 查询Study
                 study_ds = Dataset()
                 study_ds.QueryRetrieveLevel = "STUDY"
@@ -263,10 +441,10 @@ class DICOMDownloadClient:
                 study_ds.PatientID = ""
                 study_ds.PatientName = ""
                 study_ds.StudyDate = ""
-                
-                print(f"🔍 Query AccessionNumber: {accession_number}")
+
+                logger.info(f"🔍 Query AccessionNumber: {accession_number}")
                 responses = assoc.send_c_find(study_ds, StudyRootQueryRetrieveInformationModelFind)
-                
+
                 studies = {}
                 for (status, identifier) in responses:
                     if status and status.Status in [0xFF00, 0xFF01]:
@@ -278,11 +456,11 @@ class DICOMDownloadClient:
                                 'StudyDate': str(identifier.StudyDate) if hasattr(identifier, 'StudyDate') else '',
                                 'AccessionNumber': accession_number
                             }
-                
+
                 if not studies:
-                    print(f"⚠️  Can't Find AccessionNumber: {accession_number}")
+                    logger.warning(f"⚠️  Can't Find AccessionNumber: {accession_number}")
                     return []
-                
+
                 # 查询每个Study的Series
                 for study_uid, study_info in studies.items():
                     series_ds = Dataset()
@@ -292,175 +470,489 @@ class DICOMDownloadClient:
                     series_ds.SeriesNumber = ""
                     series_ds.SeriesDescription = ""
                     series_ds.Modality = ""
-                    
+                    series_ds.ImageType = ""  # 用于区分原始/派生图像
+                    series_ds.SliceThickness = ""  # 用于过滤定位像(层厚为NA的)
+
                     responses = assoc.send_c_find(series_ds, StudyRootQueryRetrieveInformationModelFind)
-                    
+
                     for (status, identifier) in responses:
                         if status and status.Status in [0xFF00, 0xFF01]:
                             if identifier and hasattr(identifier, 'SeriesInstanceUID'):
+                                series_modality = str(identifier.Modality) if hasattr(identifier, 'Modality') else ''
+
+                                # Modality 过滤
+                                if modality_filter:
+                                    # 支持逗号分隔的多个模态，如 "MR,CT"
+                                    allowed_modalities = [m.strip().upper() for m in modality_filter.split(',')]
+                                    if series_modality.upper() not in allowed_modalities:
+                                        continue
+
+                                series_desc = str(identifier.SeriesDescription) if hasattr(identifier, 'SeriesDescription') else ''
+
+                                # 过滤衍生序列：检查ImageType是否为DERIVED
+                                is_derived = False
+                                if exclude_derived:
+                                    image_type = getattr(identifier, 'ImageType', None)
+                                    if image_type:
+                                        # ImageType 第一个值才代表像素来源：DERIVED/ORIGINAL。
+                                        # 第二个值 PRIMARY/SECONDARY 是采集上下文，不能用于过滤。
+                                        if isinstance(image_type, (list, tuple)):
+                                            first_val = str(image_type[0]).upper().strip() if image_type else ''
+                                            if first_val == 'DERIVED':
+                                                is_derived = True
+                                        else:
+                                            if 'DERIVED' in str(image_type).upper():
+                                                is_derived = True
+                                        if is_derived:
+                                            logger.debug(f"   Filtered by ImageType (DERIVED): {series_desc}")
+
+                                    # 过滤衍生序列：检查SeriesDescription关键词
+                                    if not is_derived and series_desc:
+                                        desc_upper = series_desc.upper()
+                                        # 特殊处理：纯数字3D（如 "3D"）或作为单词的一部分
+                                        for keyword in get_derived_keywords():
+                                            # 使用单词边界匹配，避免误判（如 "MP" 匹配 "MPR"）
+                                            if keyword in desc_upper:
+                                                is_derived = True
+                                                logger.debug(f"   Filtered by keyword '{keyword}': {series_desc}")
+                                                break
+
+                                    if is_derived:
+                                        logger.info(f"   🚫 Filtered derived series: {series_desc}")
+                                        continue
+
                                 series_info = dict(study_info)
                                 series_info.update({
                                     'StudyInstanceUID': study_uid,
                                     'SeriesInstanceUID': str(identifier.SeriesInstanceUID),
                                     'SeriesNumber': str(identifier.SeriesNumber) if hasattr(identifier, 'SeriesNumber') else '0',
-                                    'SeriesDescription': str(identifier.SeriesDescription) if hasattr(identifier, 'SeriesDescription') else 'Unknown',
-                                    'Modality': str(identifier.Modality) if hasattr(identifier, 'Modality') else ''
+                                    'SeriesDescription': series_desc if series_desc else 'Unknown',
+                                    'Modality': series_modality
                                 })
                                 series_metadata.append(series_info)
-                
-                print(f"📊 Find {len(series_metadata)} Series")
-                
-            finally:
-                assoc.release()
-                
+
+                # 如果设置了最小文件数过滤，查询每个Series的Instance数量和层厚
+                # 注意：只对3D模态（CT/MR等）应用此过滤，2D模态（DX/DR等）跳过
+                # 同时过滤掉层厚为NA的序列（通常是定位像/Scout/Topogram）
+                if min_series_files and min_series_files > 0:
+                    # 定义3D模态列表（这些模态通常有多个切片文件）
+                    volume_modalities = {'CT', 'MR', 'MRI', 'PT', 'NM', 'US'}
+
+                    filtered_metadata = []
+                    for series_info in series_metadata:
+                        series_uid = series_info.get('SeriesInstanceUID')
+                        study_uid = series_info.get('StudyInstanceUID')
+                        series_modality = series_info.get('Modality', '').upper()
+
+                        # 只对3D模态应用文件数过滤
+                        if series_modality not in volume_modalities:
+                            filtered_metadata.append(series_info)
+                            continue
+
+                        # 查询该Series的Instance数量和层厚
+                        instance_ds = Dataset()
+                        instance_ds.QueryRetrieveLevel = "SERIES"
+                        instance_ds.StudyInstanceUID = study_uid
+                        instance_ds.SeriesInstanceUID = series_uid
+                        instance_ds.NumberOfSeriesRelatedInstances = ""
+                        instance_ds.SliceThickness = ""
+
+                        responses = assoc.send_c_find(instance_ds, StudyRootQueryRetrieveInformationModelFind)
+
+                        instance_count = 0
+                        slice_thickness = None
+                        for (status, identifier) in responses:
+                            if status and status.Status in [0xFF00, 0xFF01]:
+                                if identifier and hasattr(identifier, 'NumberOfSeriesRelatedInstances'):
+                                    try:
+                                        instance_count = int(identifier.NumberOfSeriesRelatedInstances)
+                                    except (ValueError, TypeError):
+                                        instance_count = 0
+                                # 获取层厚信息
+                                if identifier and hasattr(identifier, 'SliceThickness'):
+                                    try:
+                                        st = identifier.SliceThickness
+                                        if st is not None and str(st).strip():
+                                            slice_thickness = float(st)
+                                    except (ValueError, TypeError):
+                                        slice_thickness = None
+                                break
+
+                        # 检查层厚是否有效（过滤定位像）
+                        # 注意：只有当SliceThickness明确存在且无效(<=0)时才过滤
+                        # 如果PACS没有返回该字段，则不过滤（保留到整理阶段通过实际文件数验证）
+                        if slice_thickness is not None and slice_thickness <= 0:
+                            logger.info(f"   🚫 Filtered out Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
+                                  f"SliceThickness={slice_thickness} (likely a scout/localizer)")
+                            continue
+
+                        # PACS 返回的实例数可能不可靠（某些 PACS 返回 0 或不准确）
+                        # 策略：如果 PACS 返回的实例数 >= min_files，直接保留
+                        # 如果 < min_files 或为 0，仍然保留，让整理阶段根据实际文件数判断
+                        series_info['NumberOfSeriesRelatedInstances'] = instance_count
+                        series_info['SliceThickness'] = slice_thickness
+
+                        if instance_count >= min_series_files:
+                            filtered_metadata.append(series_info)
+                        elif instance_count == 0:
+                            # PACS 返回 0，可能是数据未准备好，保留到整理阶段验证
+                            logger.debug(f"   ⚠️  Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
+                                  f"PACS reports 0 files, will verify during organization")
+                            filtered_metadata.append(series_info)
+                        else:
+                            # PACS 返回少量文件，但仍保留，整理阶段会再次验证实际文件数
+                            logger.debug(f"   ⚠️  Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
+                                  f"PACS reports {instance_count} files < {min_series_files}, will verify during organization")
+                            filtered_metadata.append(series_info)
+
+                    series_metadata = filtered_metadata
+
+                logger.info(f"📊 Find {len(series_metadata)} Series (after filtering)")
+                if modality_filter:
+                    logger.debug(f"   (Modality filter: {modality_filter})")
+                if min_series_files and min_series_files > 0:
+                    logger.debug(f"   (Min files filter: {min_series_files})")
+                if exclude_derived:
+                    logger.debug(f"   (Derived series filtered by keywords: {get_derived_keywords()})")
+
+        except ConnectionError as e:
+            logger.error(f"❌ Failed to establish PACS connection: {e}")
+            return []
         except Exception as e:
-            print(f"❌ Query metadata failed: {e}")
-        
+            logger.error(f"❌ Query metadata failed: {e}", exc_info=True)
+
         return series_metadata
     
-    def download_study(self, accession_number, output_dir=".", custom_folder_name=None, on_series_downloaded=None):
-        """Download Study data (directly from PACS, no ZIP generation)"""
-        print(f"🔍 Downloading AccessionNumber: {accession_number}")
-        
-        # 查询Series信息
-        series_metadata = self._query_series_metadata(accession_number)
+    def download_study(self, accession_number, output_dir=".", custom_folder_name=None,
+                       on_series_downloaded=None, modality_filter=None, min_series_files=None,
+                       exclude_derived=True):
+        """Download Study data (directly from PACS, no ZIP generation)
+
+        Args:
+            accession_number: 检查号
+            output_dir: 输出目录
+            custom_folder_name: 自定义文件夹名
+            on_series_downloaded: 下载完成回调
+            modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
+            min_series_files: 可选，最小序列文件数
+            exclude_derived: 是否排除衍生序列，默认True
+        """
+        logger.info(f"🔍 Downloading AccessionNumber: {accession_number}")
+
+        # 查询Series信息（应用过滤条件）
+        series_metadata = self._query_series_metadata(
+            accession_number,
+            modality_filter=modality_filter,
+            min_series_files=min_series_files,
+            exclude_derived=exclude_derived
+        )
         if not series_metadata:
-            print(f"❌ No data found for: {accession_number}")
+            logger.error(f"❌ No data found for: {accession_number}")
             return None
-        
+
+        # 重置下载统计
+        self.download_stats = DownloadStats(total_series=len(series_metadata))
+        self.failed_series_tracker = FailedSeriesTracker()
+
         # 创建输出目录
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         if custom_folder_name:
             output_path = os.path.join(output_dir, custom_folder_name)
         else:
             output_path = os.path.join(output_dir, f"{accession_number}_{timestamp}")
-        
+
         os.makedirs(output_path, exist_ok=True)
-        
-        # 存储状态
-        storage_state = {'current_path': '', 'files_received': 0}
-        
+
+        # P3: 存储状态，包括校验和信息
+        storage_state = {
+            'current_path': '',
+            'current_series_uid': '',  # 当前处理的SeriesInstanceUID
+            'files_received': 0,
+            'current_series_files': set(),  # 当前序列接收的文件
+            'failed_files': [],  # 失败的文件记录
+            'series_uid_to_dir': {}  # SeriesInstanceUID到目录的映射，避免竞态条件
+        }
+
         def handle_store(event):
-            """处理C-STORE请求"""
+            """P3: 处理C-STORE请求，包含数据完整性校验"""
             try:
                 dataset = event.dataset
                 dataset.file_meta = event.file_meta
-                
-                # 保存文件
+
+                # 验证SOP Instance UID
                 sop_instance_uid = dataset.SOPInstanceUID
+                if not sop_instance_uid:
+                    logger.error("❌ Received dataset without SOPInstanceUID")
+                    return 0xA701
+
+                # P0: 使用 SeriesInstanceUID 查找对应的目录，避免竞态条件
+                # 不能使用 storage_state['current_path']，因为它可能被下一个Series的循环修改
+                series_instance_uid = None
+                try:
+                    series_instance_uid = dataset.SeriesInstanceUID
+                except AttributeError:
+                    # SeriesInstanceUID 属性不存在，尝试从文件元数据获取
+                    logger.warning(f"⚠️  Dataset has no SeriesInstanceUID attribute, SOPInstanceUID={sop_instance_uid[:20]}...")
+                    # 使用当前路径作为fallback
+                    series_dir = storage_state['current_path']
+                except Exception as e:
+                    logger.error(f"❌ Failed to get SeriesInstanceUID from dataset: {e}, SOPInstanceUID={sop_instance_uid[:20]}...")
+                    return 0xA701
+
+                if series_instance_uid:
+                    series_dir = storage_state['series_uid_to_dir'].get(series_instance_uid)
+                    if not series_dir:
+                        # 如果找不到映射，使用当前路径作为fallback（兼容旧行为）
+                        series_dir = storage_state['current_path']
+                        available_uids = list(storage_state['series_uid_to_dir'].keys())
+                        logger.warning(f"⚠️  No directory mapping for Series UID {str(series_instance_uid)[:30]}..., "
+                                       f"available mappings: {len(available_uids)}, "
+                                       f"using current_path: {series_dir}")
+                else:
+                    # 没有 SeriesInstanceUID，使用当前路径
+                    series_dir = storage_state['current_path']
+
                 filename = f"{sop_instance_uid}.dcm"
-                filepath = os.path.join(storage_state['current_path'], filename)
-                
-                os.makedirs(storage_state['current_path'], exist_ok=True)
-                dataset.save_as(filepath, write_like_original=False)
-                
-                storage_state['files_received'] += 1
-                if storage_state['files_received'] % 10 == 0:
-                    print(f"   Received {storage_state['files_received']} files...")
-                
+                filepath = os.path.join(series_dir, filename)
+
+                # 确保目录存在
+                os.makedirs(series_dir, exist_ok=True)
+
+                # 保存文件
+                try:
+                    dataset.save_as(filepath, write_like_original=False)
+                except Exception as e:
+                    logger.error(f"❌ Failed to save dataset to {filepath}: {e}")
+                    return 0xA700
+
+                # P3: 验证文件完整性（文件可读且大小合理）
+                if os.path.exists(filepath):
+                    file_size = os.path.getsize(filepath)
+                    if file_size < 128:  # DICOM文件最小头大小
+                        logger.warning(f"⚠️  File {filename} is too small ({file_size} bytes), may be corrupted")
+                        storage_state['failed_files'].append({'uid': sop_instance_uid, 'reason': 'too_small'})
+                        return 0xA702
+
+                    # P3: 计算并缓存校验和（可选，仅对关键文件）
+                    if len(storage_state['current_series_files']) < 100:  # 只对前100个文件计算校验和
+                        checksum = compute_file_checksum(filepath)
+                        if checksum:
+                            with self._checksum_lock:
+                                self._checksum_cache[filepath] = checksum
+
+                    storage_state['current_series_files'].add(filepath)
+                    storage_state['files_received'] += 1
+                    self.download_stats.total_bytes += file_size
+
+                    # 记录前5个文件和每10个文件
+                    if storage_state['files_received'] <= 5 or storage_state['files_received'] % 10 == 0:
+                        logger.info(f"   Received {storage_state['files_received']} files... (last: {filename[:40]}... in {os.path.basename(series_dir)})")
+                else:
+                    logger.error(f"❌ File {filepath} not found after save")
+                    return 0xA700
+
                 return 0x0000
             except Exception as e:
-                print(f"❌ Failed saving DICOM file: {e}")
+                logger.error(f"❌ Failed saving DICOM file: {e}", exc_info=True)
                 return 0xA700
-        
-        # 启动C-STORE SCP
-        ae_scp = AE(ae_title=self.pacs_config['CALLING_AET'])
-        ae_scp.supported_contexts = AllStoragePresentationContexts
-        ae_scp.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
-        
-        server = ae_scp.start_server(
-            ('', self.pacs_config['CALLING_PORT']),
-            block=False,
-            evt_handlers=[(evt.EVT_C_STORE, handle_store)]
-        )
-        
-        try:
-            # 建立C-MOVE连接
-            assoc = self.ae.associate(
-                self.pacs_config['PACS_IP'],
-                self.pacs_config['PACS_PORT'],
-                ae_title=self.pacs_config['CALLED_AET']
-            )
-            
-            if not assoc.is_established:
-                print("❌ Unable to establish PACS association")
-                return None
-            
-            try:
-                # 下载每个Series
-                for i, series in enumerate(series_metadata):
-                    series_num = series.get('SeriesNumber', f'Series{i+1}')
-                    series_desc = series.get('SeriesDescription', 'Unknown')
-                    series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
-                    
-                    storage_state['current_path'] = series_dir
-                    
-                    print(f"📥 Downloading series {i+1}/{len(series_metadata)}: {series_num} - {series_desc}")
-                    
-                    # 当磁盘空间达到高水位时，暂停下载以等待转换/清理
-                    try:
-                        # 使用 base output dir 作为磁盘检查目标（output_dir 参数）
-                        self._wait_for_disk_low(output_path)
-                    except Exception:
-                        pass
 
-                    # 发送C-MOVE请求
-                    move_ds = Dataset()
-                    move_ds.QueryRetrieveLevel = 'SERIES'
-                    move_ds.StudyInstanceUID = series['StudyInstanceUID']
-                    move_ds.SeriesInstanceUID = series['SeriesInstanceUID']
-                    
-                    print(f"   Sending C-MOVE request for Series {series_num}...")
-                    
-                    # 报告下载进度
-                    if callable(self.download_progress_callback):
+        # P0: 使用类级别的锁确保C-MOVE操作串行化
+        # C-MOVE协议需要启动C-STORE SCP服务器接收图像，固定端口无法支持并发
+        # 如果两个任务同时使用同一端口，会导致图像混杂到错误的目录
+        logger.info(f"🔒 Acquiring C-MOVE lock for {accession_number}...")
+        with DICOMDownloadClient._cmove_lock:
+            logger.info(f"🔓 C-MOVE lock acquired for {accession_number}, starting download...")
+
+            # 启动C-STORE SCP
+            ae_scp = AE(ae_title=self.pacs_config['CALLING_AET'])
+            ae_scp.supported_contexts = AllStoragePresentationContexts
+            ae_scp.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+
+            server = ae_scp.start_server(
+                ('', self.pacs_config['CALLING_PORT']),
+                block=False,
+                evt_handlers=[(evt.EVT_C_STORE, handle_store)]
+            )
+
+            # P0: 跟踪失败的序列以便重试
+            failed_series = []
+
+            try:
+                # P1: 使用上下文管理器管理关联
+                with AssociationManager(self.ae, self.pacs_config) as assoc:
+                    # 下载每个Series（P0: 失败隔离）
+                    for i, series in enumerate(series_metadata):
+                        series_num = series.get('SeriesNumber', f'Series{i+1}')
+                        series_desc = series.get('SeriesDescription', 'Unknown')
+                        series_uid = series.get('SeriesInstanceUID')
+                        series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
+
+                        # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
+                        # 这避免了竞态条件：C-STORE可能在下一个Series的循环开始后才到达
+                        if series_uid:
+                            storage_state['series_uid_to_dir'][series_uid] = series_dir
+                            logger.debug(f"   Registered series_uid mapping: {series_uid[:20]}... -> {series_dir}")
+                        else:
+                            logger.warning(f"   Series {series_num} has no SeriesInstanceUID, cannot register mapping")
+                        storage_state['current_path'] = series_dir
+                        storage_state['current_series_uid'] = series_uid
+                        storage_state['current_series_files'] = set()  # 重置当前序列文件集合
+
                         try:
-                            progress_pct = 40 + int((i / len(series_metadata)) * 40)  # 40-80% 用于下载
-                            self.download_progress_callback(i + 1, len(series_metadata), series_desc, progress_pct)
-                        except Exception as cb_e:
-                            print(f"   Progress callback error: {cb_e}")
-                    
-                    responses = assoc.send_c_move(
-                        move_ds,
-                        self.pacs_config['CALLING_AET'],
-                        query_model=StudyRootQueryRetrieveInformationModelMove
-                    )
-                    
-                    # 跟踪C-MOVE响应状态
-                    move_status = None
-                    for (status, identifier) in responses:
-                        if status:
-                            move_status = status.Status
-                            if status.Status == 0x0000:
-                                print(f"   Series {series_num} C-MOVE completed successfully")
-                            elif status.Status != 0xFF00:  # 0xFF00 是Pending状态
-                                print(f"   Series {series_num} C-MOVE status: 0x{status.Status:04X}")
-                    
-                    if move_status is None:
-                        print(f"   ⚠️  Series {series_num}: No C-MOVE response received (timeout or network issue)")
-                    
-                    time.sleep(0.5)  # 短暂延迟，让文件写入完成
-                    
-                    # 通知外部：该Series下载完成
-                    # 注意：回调必须在sleep之后调用，确保文件已完全写入磁盘
-                    if callable(on_series_downloaded):
-                        try:
-                            on_series_downloaded(series_dir, series)
+                            logger.info(f"📥 Downloading series {i+1}/{len(series_metadata)}: {series_num} - {series_desc}")
+
+                            # 当磁盘空间达到高水位时，暂停下载以等待转换/清理
+                            try:
+                                self._wait_for_disk_low(output_path)
+                            except Exception:
+                                pass
+
+                            # 发送C-MOVE请求
+                            move_ds = Dataset()
+                            move_ds.QueryRetrieveLevel = 'SERIES'
+                            move_ds.StudyInstanceUID = series['StudyInstanceUID']
+                            move_ds.SeriesInstanceUID = series_uid
+
+                            logger.info(f"   Sending C-MOVE request for Series {series_num}...")
+
+                            # 报告下载进度
+                            if callable(self.download_progress_callback):
+                                try:
+                                    progress_pct = 40 + int((i / len(series_metadata)) * 40)
+                                    self.download_progress_callback(i + 1, len(series_metadata), series_desc, progress_pct)
+                                except Exception as cb_e:
+                                    logger.warning(f"   Progress callback error: {cb_e}")
+
+                            responses = assoc.send_c_move(
+                                move_ds,
+                                self.pacs_config['CALLING_AET'],
+                                query_model=StudyRootQueryRetrieveInformationModelMove
+                            )
+
+                            # 跟踪C-MOVE响应状态
+                            move_status = None
+                            error_messages = []
+                            for (status, identifier) in responses:
+                                if status:
+                                    move_status = status.Status
+                                    if status.Status == 0x0000:
+                                        logger.info(f"   Series {series_num} C-MOVE completed successfully")
+                                        self.download_stats.completed_series += 1
+                                    elif status.Status != 0xFF00:  # 0xFF00 是Pending状态
+                                        error_msg = f"0x{status.Status:04X}"
+                                        error_messages.append(error_msg)
+                                        logger.warning(f"   Series {series_num} C-MOVE status: {error_msg}")
+
+                            if move_status is None:
+                                logger.warning(f"   ⚠️  Series {series_num}: No C-MOVE response received (timeout or network issue)")
+                                raise TimeoutError(f"No C-MOVE response for series {series_num}")
+
+                            # 检查是否有错误状态
+                            if error_messages and move_status != 0x0000:
+                                raise RuntimeError(f"C-MOVE failed with status: {error_messages[-1]}")
+
+                            time.sleep(0.5)  # 短暂延迟，让文件写入完成
+
+                            # 通知外部：该Series下载完成
+                            if callable(on_series_downloaded):
+                                try:
+                                    on_series_downloaded(series_dir, series)
+                                except Exception as e:
+                                    logger.warning(f"⚠️  Series callback failed: {e}")
+
                         except Exception as e:
-                            print(f"⚠️  Series callback failed: {e}")
-                
+                            # P0: 失败隔离 - 记录错误但继续处理下一个序列
+                            logger.error(f"❌ Series {series_num} download failed: {e}")
+                            self.failed_series_tracker.add(series_uid, series, e)
+                            failed_series.append(series)
+                            self.download_stats.failed_series += 1
+                            self.download_stats.errors.append({
+                                'series': series_num,
+                                'error': str(e),
+                                'timestamp': time.time()
+                            })
+                            # 继续处理下一个序列，不中断整个下载流程
+                            continue
+
+                # P0: 尝试重试失败的序列
+                retryable = self.failed_series_tracker.get_retryable_series()
+                if retryable:
+                    logger.info(f"🔄 Attempting to retry {len(retryable)} failed series...")
+                    for series_uid, series_info in retryable:
+                        try:
+                            series_num = series_info.get('SeriesNumber', 'Unknown')
+                            series_desc = series_info.get('SeriesDescription', 'Unknown')
+                            series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
+
+                            # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
+                            storage_state['series_uid_to_dir'][series_uid] = series_dir
+                            storage_state['current_path'] = series_dir
+                            storage_state['current_series_uid'] = series_uid
+                            storage_state['current_series_files'] = set()
+
+                            logger.info(f"🔄 Retrying Series {series_num}...")
+
+                            move_ds = Dataset()
+                            move_ds.QueryRetrieveLevel = 'SERIES'
+                            move_ds.StudyInstanceUID = series_info['StudyInstanceUID']
+                            move_ds.SeriesInstanceUID = series_uid
+
+                            responses = assoc.send_c_move(
+                                move_ds,
+                                self.pacs_config['CALLING_AET'],
+                                query_model=StudyRootQueryRetrieveInformationModelMove
+                            )
+
+                            for (status, identifier) in responses:
+                                if status and status.Status == 0x0000:
+                                    logger.info(f"   Series {series_num} retry successful")
+                                    self.download_stats.completed_series += 1
+                                    self.download_stats.failed_series -= 1
+                                    if callable(on_series_downloaded):
+                                        on_series_downloaded(series_dir, series_info)
+                                    break
+                            else:
+                                logger.warning(f"   Series {series_num} retry failed")
+
+                            time.sleep(0.5)
+
+                        except Exception as e:
+                            logger.error(f"❌ Series {series_info.get('SeriesNumber')} retry failed: {e}")
+
+            except ConnectionError as e:
+                logger.error(f"❌ Failed to establish PACS connection: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"❌ Download error: {e}", exc_info=True)
+                return None
             finally:
-                assoc.release()
-                
-        except Exception as e:
-            print(f"❌ Download error: {e}")
-            return None
-        finally:
-            server.shutdown()
-        
-        print(f"✅ Download complete! Received {storage_state['files_received']} files")
-        print(f"📁 Files saved to: {output_path}")
-        
+                server.shutdown()
+
+        # 打印下载统计
+        stats_summary = self.download_stats.get_summary()
+        logger.info(f"✅ Download complete! Stats: {stats_summary}")
+        logger.info(f"📁 Files saved to: {output_path}")
+
+        # 如果有永久失败的序列，记录到文件
+        failure_summary = self.failed_series_tracker.get_summary()
+        if failure_summary['permanent_failures']:
+            failure_file = os.path.join(output_path, '.failed_series.json')
+            try:
+                with open(failure_file, 'w', encoding='utf-8') as f:
+                    json.dump(failure_summary, f, indent=2)
+                logger.warning(f"⚠️  {len(failure_summary['permanent_failures'])} series permanently failed, see {failure_file}")
+            except Exception as e:
+                logger.error(f"Failed to write failure log: {e}")
+
+        # 保存校验和缓存供后续验证
+        if self._checksum_cache:
+            checksum_file = os.path.join(output_path, '.checksums.json')
+            try:
+                with open(checksum_file, 'w', encoding='utf-8') as f:
+                    json.dump(self._checksum_cache, f, indent=2)
+            except Exception as e:
+                logger.error(f"Failed to write checksum cache: {e}")
+
         return output_path if storage_state['files_received'] > 0 else None
     
     def extract_zip(self, zip_filepath, extract_dir=None):
@@ -613,7 +1105,21 @@ class DICOMDownloadClient:
     
     def _is_dicom_file(self, filepath):
         """判断是否为DICOM文件"""
-        if filepath.endswith("json") or filepath.endswith("csv") or filepath.endswith("txt"):
+        lower_path = filepath.lower()
+        if (
+            lower_path.endswith(".json")
+            or lower_path.endswith(".csv")
+            or lower_path.endswith(".txt")
+            or lower_path.endswith(".nii")
+            or lower_path.endswith(".nii.gz")
+            or lower_path.endswith(".npz")
+            or lower_path.endswith(".png")
+            or lower_path.endswith(".jpg")
+            or lower_path.endswith(".jpeg")
+            or lower_path.endswith(".bmp")
+            or lower_path.endswith(".gif")
+            or lower_path.endswith(".webp")
+        ):
             return False
         try:
             with open(filepath, 'rb') as f:
@@ -627,16 +1133,65 @@ class DICOMDownloadClient:
         except:
             return False
     
+    def _wait_for_files_stable(self, directory, timeout=30, interval=0.5):
+        """等待目录中的文件大小稳定（不再增长）
+
+        Args:
+            directory: 要检查的目录
+            timeout: 最大等待时间（秒）
+            interval: 检查间隔（秒）
+        """
+        start_time = time.time()
+        prev_sizes = {}
+        stable_count = 0
+        required_stable_checks = 3  # 需要连续3次检查都稳定
+
+        while time.time() - start_time < timeout:
+            current_sizes = {}
+            total_files = 0
+
+            try:
+                for root, dirs, files in os.walk(directory):
+                    for file in files:
+                        if file.endswith('.dcm') or file.endswith('.dcm'):
+                            filepath = os.path.join(root, file)
+                            try:
+                                size = os.path.getsize(filepath)
+                                current_sizes[filepath] = size
+                                total_files += 1
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning(f"   ⚠️ Error checking file sizes: {e}")
+                break
+
+            # 检查文件大小是否稳定
+            if current_sizes == prev_sizes and total_files > 0:
+                stable_count += 1
+                if stable_count >= required_stable_checks:
+                    logger.info(f"   ✅ File system stable: {total_files} files ready")
+                    return
+            else:
+                stable_count = 0
+                if total_files > 0:
+                    logger.debug(f"   ⏳ File system changing: {total_files} files, waiting...")
+
+            prev_sizes = current_sizes.copy()
+            time.sleep(interval)
+
+        logger.warning(f"   ⚠️ File system stability timeout after {timeout}s")
+
     def _sanitize_folder_name(self, name):
         """清理文件夹名称，移除或替换Windows和dcm2niix不兼容的字符"""
         if not name:
             return "Unknown"
-        
+
         name = str(name)
-        
-        # 1. 替换Windows非法字符
-        name = re.sub(r'[<>"/\\|?*]', '_', name)
-        
+
+        # 1. 替换Windows非法字符 (包括冒号:和方括号[])
+        name = re.sub(r'[<>"/\\|?*:]', '_', name)
+        name = re.sub(r'[\[\]]', '_', name)
+
         # 2. 替换可能导致dcm2niix问题的字符组合
         # 点+空格（如 "303. X Elbow" -> "303_X Elbow"）
         name = re.sub(r'\.\s+', '_', name)
@@ -644,26 +1199,28 @@ class DICOMDownloadClient:
         name = re.sub(r'\s+', '_', name)
         # 多个连续点转为单个
         name = re.sub(r'\.+', '.', name)
-        
+        # 多个连续下划线转为单个
+        name = re.sub(r'_+', '_', name)
+
         # 3. 移除首尾的特殊字符
         name = name.strip('. _')
-        
+
         # 4. 长度限制
         if len(name) > 50:
             name = name[:50]
-        
+
         # 5. 确保不以点开头或结尾（Windows问题）
         name = name.strip('.')
-        
+
         return name if name else "Unknown"
     
-    def organize_dicom_files(self, extract_dir, organized_dir=None, output_format='nifti'):
+    def organize_dicom_files(self, extract_dir, organized_dir=None, output_format='nifti', min_series_files=None):
         """按Series整理DICOM文件并转换为指定格式 (nifti 或 npz)"""
-        return organize_dicom_files_impl(self, extract_dir, organized_dir, output_format)
+        return organize_dicom_files_impl(self, extract_dir, organized_dir, output_format, min_series_files=min_series_files)
 
-    def _process_single_series(self, series_path, series_folder, organized_dir, output_format='nifti'):
-        """处理单个Series目录：统计、转换并移动到 organized_dir。"""
-        return process_single_series_impl(self, series_path, series_folder, organized_dir, output_format)
+    def _process_single_series(self, series_path, series_folder, output_format='nifti', min_series_files=None):
+        """处理单个Series目录：统计、转换（原地处理，不再移动到 organized_dir）。"""
+        return process_single_series_impl(self, series_path, series_folder, output_format, min_series_files=min_series_files)
     
     def convert_dicom_to_nifti(self, series_dir, series_name):
         """将DICOM序列转换为NIfTI格式"""
@@ -912,14 +1469,15 @@ class DICOMDownloadClient:
         """
         return assess_converted_file_quality_impl(filepath, modality)
 
-    def _assess_series_quality_converted(self, converted_files, modality=None):
+    def _assess_series_quality_converted(self, converted_files, modality=None, series_dir=None):
         """对转换后的序列做QC，<=200全量，>200中间±3抽样
         
         Args:
             converted_files: 转换后的文件路径列表
             modality: 模态代码 (CT, MR, DX, etc.)，可选
+            series_dir: 序列目录路径，用于检测NIfTI方向错误
         """
-        return assess_series_quality_converted_impl(converted_files, modality)
+        return assess_series_quality_converted_impl(converted_files, modality, series_dir)
 
     def _get_converted_files(self, series_path):
         """获取转换后的NPZ/NIfTI文件列表，优先NPZ"""
@@ -1028,18 +1586,53 @@ class DICOMDownloadClient:
     def process_complete_workflow(self, accession_number, base_output_dir="./downloads",
                                 auto_extract=True, auto_organize=True, auto_metadata=True,
                                 keep_zip=True, keep_extracted=False, output_format='nifti',
-                                parallel_pipeline=True):
-        """完整的工作流程：下载 -> 整理 -> 转换 -> 提取元数据"""
-        print(f"\n{'='*80}")
-        print(f"🚀 Starting full DICOM processing workflow")
-        print(f"📋 AccessionNumber: {accession_number}")
-        print(f"{'='*80}")
-        
+                                parallel_pipeline=True, modality_filter=None, min_series_files=None,
+                                exclude_derived=True):
+        """完整的工作流程：下载 -> 整理 -> 转换 -> 提取元数据
+
+        Args:
+            accession_number: 检查号
+            base_output_dir: 基础输出目录
+            auto_extract: 自动解压（兼容性参数）
+            auto_organize: 自动整理文件
+            auto_metadata: 自动提取元数据
+            keep_zip: 保留ZIP文件（兼容性参数）
+            keep_extracted: 保留解压后的原始文件
+            output_format: 输出格式（'nifti' 或 'npz'）
+            parallel_pipeline: 是否使用并行流水线
+            modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
+            min_series_files: 可选，最小序列文件数，少于该值的序列将被跳过
+            exclude_derived: 是否排除衍生序列，默认True
+
+        Args:
+            accession_number: 检查号
+            base_output_dir: 基础输出目录
+            auto_extract: 自动解压（兼容性参数）
+            auto_organize: 自动整理文件
+            auto_metadata: 自动提取元数据
+            keep_zip: 保留ZIP文件（兼容性参数）
+            keep_extracted: 保留解压后的原始文件
+            output_format: 输出格式（'nifti' 或 'npz'）
+            parallel_pipeline: 是否使用并行流水线
+            modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
+            min_series_files: 可选，最小序列文件数，少于该值的序列将被跳过
+        """
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🚀 Starting full DICOM processing workflow")
+        logger.info(f"📋 AccessionNumber: {accession_number}")
+        if modality_filter:
+            logger.info(f"🔍 Modality filter: {modality_filter}")
+        if min_series_files:
+            logger.info(f"📊 Min series files: {min_series_files}")
+        if exclude_derived:
+            logger.info(f"🚫 Exclude derived series: enabled")
+        logger.info(f"{'='*80}")
+
         # 确保输出目录存在
         os.makedirs(base_output_dir, exist_ok=True)
-        
+
         # 步骤1: 下载DICOM文件
-        print(f"\n📥 Step 1: Download DICOM files")
+        logger.info(f"\n📥 Step 1: Download DICOM files")
 
         download_dir_holder = {'path': None}
         # allow configuring pending-series limit to apply backpressure when conversion is slow
@@ -1054,16 +1647,23 @@ class DICOMDownloadClient:
         series_lock = threading.Lock()
         download_done = threading.Event()
 
+        # P2: 队列看门狗，防止死锁
+        watchdog = QueueWatchdog(series_queue, timeout=300.0)
+
         def _on_series_downloaded(series_dir, series_meta):
             series_folder = os.path.basename(series_dir)
             series_queue.put((series_dir, series_folder))
+            watchdog.update_activity()  # P2: 更新看门狗活动
 
         def _download_worker():
             try:
                 download_path = self.download_study(
                     accession_number,
                     base_output_dir,
-                    on_series_downloaded=_on_series_downloaded
+                    on_series_downloaded=_on_series_downloaded,
+                    modality_filter=modality_filter,
+                    min_series_files=min_series_files,
+                    exclude_derived=exclude_derived
                 )
                 download_dir_holder['path'] = download_path
             finally:
@@ -1077,32 +1677,44 @@ class DICOMDownloadClient:
         except Exception:
             num_converters = 2
 
-        def _organize_worker(organized_dir_local, fmt):
+        def _organize_worker(fmt):
+            watchdog.update_activity()  # P2: 更新看门狗活动
             while True:
-                item = series_queue.get()
+                try:
+                    # P2: 使用超时获取，避免永久阻塞
+                    item = series_queue.get(timeout=60.0)
+                except Empty:
+                    logger.warning("⏱️  Organize worker: queue empty timeout, checking status...")
+                    if download_done.is_set():
+                        logger.info("   Download done, worker exiting")
+                        break
+                    continue
+
                 if item is None:
                     series_queue.task_done()
                     break
                 series_dir, series_folder = item
                 try:
-                    info = self._process_single_series(series_dir, series_folder, organized_dir_local, fmt)
+                    info = self._process_single_series(series_dir, series_folder, fmt, min_series_files=min_series_files)
                     if info:
                         with series_lock:
                             series_info[series_folder] = info
+                    watchdog.update_activity()  # P2: 更新看门狗活动
                 except Exception as e:
-                    print(f"⚠️  Series organize failed: {series_folder}: {e}")
+                    logger.warning(f"⚠️  Series organize failed: {series_folder}: {e}")
                 finally:
                     series_queue.task_done()
 
         if parallel_pipeline and auto_organize:
-            organized_dir = os.path.join(base_output_dir, f"{accession_number}_organized")
-            os.makedirs(organized_dir, exist_ok=True)
+            # P0: 原地处理 - 不再创建 organized 子目录
+            # P2: 启动看门狗
+            watchdog.start()
 
             download_thread = threading.Thread(target=_download_worker, daemon=True)
             # spawn multiple organizers
             organizer_threads = []
             for _ in range(num_converters):
-                t = threading.Thread(target=_organize_worker, args=(organized_dir, output_format), daemon=True)
+                t = threading.Thread(target=_organize_worker, args=(output_format,), daemon=True)
                 t.start()
                 organizer_threads.append(t)
 
@@ -1117,49 +1729,77 @@ class DICOMDownloadClient:
             for t in organizer_threads:
                 t.join()
 
+            # P2: 停止看门狗
+            watchdog.stop()
+
             download_dir = download_dir_holder['path']
             if not download_dir:
-                print("❌ Download failed, workflow terminated")
+                logger.error("❌ Download failed, workflow terminated")
                 return None
         else:
-            download_dir = self.download_study(accession_number, base_output_dir)
+            download_dir = self.download_study(
+                accession_number,
+                base_output_dir,
+                modality_filter=modality_filter,
+                min_series_files=min_series_files,
+                exclude_derived=exclude_derived
+            )
             if not download_dir:
-                print("❌ Download failed, workflow terminated")
+                logger.error("❌ Download failed, workflow terminated")
                 return None
-        
+
         results = {
             'accession_number': accession_number,
             'zip_file': download_dir,  # 保持接口兼容性
             'extract_dir': download_dir,  # 保持接口兼容性
             'success': False
         }
-        
+
         if auto_organize:
             # 步骤2: 整理DICOM文件
-            print(f"\n📁 Step 2: Organize DICOM files by series (format: {output_format})")
+            logger.info(f"\n📁 Step 2: Organize DICOM files by series (format: {output_format})")
+            # P0: 原地处理 - organized_dir 就是 download_dir
+            organized_dir = download_dir
             if parallel_pipeline:
-                # 使用流水线整理结果
-                organized_dir = os.path.join(base_output_dir, f"{accession_number}_organized")
+                # 使用流水线整理结果 - 原地处理，文件已经在正确的位置
                 results['organized_dir'] = organized_dir
                 results['series_info'] = series_info
             else:
-                organized_dir, series_info = self.organize_dicom_files(download_dir, output_format=output_format)
-                if not organized_dir:
-                    print("❌ File organization failed, workflow terminated")
-                    return results
+                # 等待文件系统稳定（确保所有下载的文件已完全写入磁盘）
+                logger.info("   ⏳ Waiting for file system to stabilize...")
+                time.sleep(2.0)
+                # 检查下载目录中的文件状态
+                self._wait_for_files_stable(download_dir)
+                _, series_info = self.organize_dicom_files(download_dir, output_format=output_format, min_series_files=min_series_files)
+                if not series_info:
+                    # 区分真正的组织失败 vs 所有序列都被过滤掉
+                    import glob
+                    dicom_files = glob.glob(os.path.join(download_dir, '**', '*.dcm'), recursive=True)
+                    if dicom_files:
+                        logger.error(f"❌ All {len(dicom_files)} DICOM files were filtered out (min_files={min_series_files}). This accession has insufficient data.")
+                        raise ValueError(f"All series filtered out: only {len(dicom_files)} files found, min required is {min_series_files}. This may be a scout/locator scan or incomplete study.")
+                    else:
+                        logger.error("❌ File organization failed: no DICOM files found in download directory")
+                        raise ValueError("File organization failed: no DICOM files found")
                 results['organized_dir'] = organized_dir
                 results['series_info'] = series_info
 
             if auto_metadata:
                 # 步骤3: 提取元数据 (独立线程)
-                print(f"\n📊 Step 3: Extract DICOM metadata")
+                logger.info(f"\n📊 Step 3: Extract DICOM metadata")
                 excel_name = f"dicom_metadata_{accession_number}.xlsx"
-                excel_path = os.path.join(os.path.dirname(organized_dir), excel_name)
+                excel_path = os.path.join(organized_dir, excel_name)
 
                 excel_holder = {'path': None}
 
                 def _metadata_worker():
-                    excel_holder['path'] = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
+                    try:
+                        excel_holder['path'] = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
+                    except Exception as e:
+                        logger.error(f"❌ Metadata extraction error: {e}")
+                        import traceback
+                        logger.error(f"Traceback: {traceback.format_exc()}")
+                        excel_holder['path'] = None
 
                 metadata_thread = threading.Thread(target=_metadata_worker, daemon=True)
                 metadata_thread.start()
@@ -1170,19 +1810,19 @@ class DICOMDownloadClient:
                     results['excel_file'] = excel_file
                     results['success'] = True
                 else:
-                    print("⚠️  Metadata extraction failed, previous steps completed")
-        
+                    logger.warning("⚠️  Metadata extraction failed, previous steps completed")
+
         # 打印最终结果
-        print(f"\n{'='*80}")
+        logger.info(f"\n{'='*80}")
         if results['success']:
-            print(f"🎉 Workflow completed!")
-            print(f"📁 Organized directory: {results.get('organized_dir', 'N/A')}")
-            print(f"📄 Excel file: {results.get('excel_file', 'N/A')}")
-            print(f"📊 Series count: {len(results.get('series_info', {}))}")
+            logger.info(f"🎉 Workflow completed!")
+            logger.info(f"📁 Organized directory: {results.get('organized_dir', 'N/A')}")
+            logger.info(f"📄 Excel file: {results.get('excel_file', 'N/A')}")
+            logger.info(f"📊 Series count: {len(results.get('series_info', {}))}")
         else:
-            print(f"⚠️  Workflow partially completed")
-        print(f"{'='*80}")
-        
+            logger.warning(f"⚠️  Workflow partially completed")
+        logger.info(f"{'='*80}")
+
         return results
 
 

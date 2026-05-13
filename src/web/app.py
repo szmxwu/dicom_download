@@ -12,12 +12,28 @@ Flask Web 应用主模块
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, Future
+from queue import Queue, Empty
 
 # 将项目根目录添加到 Python 路径（确保能找到 src 模块）
 # 从 src/web/app.py 向上两级到达项目根目录
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+
+# Flask/Jinja2 3.0+ 兼容性修复
+# 在导入 Flask 之前先修复所有兼容性问题
+try:
+    from markupsafe import Markup, escape
+    import sys
+    # 创建 jinja2 模块的兼容性层
+    import jinja2
+    jinja2.Markup = Markup
+    jinja2.escape = escape
+    sys.modules['jinja2'].Markup = Markup
+    sys.modules['jinja2'].escape = escape
+except ImportError:
+    pass
 
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
@@ -35,6 +51,12 @@ import secrets
 # 导入我们的DICOM处理客户端
 from src.client.unified import DICOMDownloadClient
 from src.utils.packaging import create_result_zip
+from src.core.constants import (
+    DEFAULT_DERIVED_SERIES_KEYWORDS,
+    get_derived_keywords,
+    set_derived_keywords,
+    reset_derived_keywords
+)
 
 def get_base_path():
     """获取程序运行时的根目录路径，兼容 PyInstaller 打包"""
@@ -101,6 +123,25 @@ logger = setup_logging()
 # WebSocket支持
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+# ============ 任务队列系统配置 ============
+MAX_CONCURRENT_TASKS = 3  # 最大并发任务数
+TASK_QUEUE_MAX_SIZE = 100  # 任务队列最大长度
+
+# 全局线程池执行器 - 限制并发数
+task_executor = ThreadPoolExecutor(
+    max_workers=MAX_CONCURRENT_TASKS,
+    thread_name_prefix='TaskWorker'
+)
+
+# 任务队列 - 存储待处理的任务ID
+task_queue = Queue(maxsize=TASK_QUEUE_MAX_SIZE)
+
+# 队列锁 - 保护队列操作
+_queue_lock = threading.Lock()
+
+# 当前正在运行的任务数
+_running_task_count = 0
+
 # 全局变量存储处理任务
 processing_tasks = {}
 _task_lock = threading.Lock()  # 任务字典锁，防止竞态条件
@@ -129,24 +170,153 @@ def _cleanup_old_tasks():
             logger.error(f"任务清理失败: {e}")
 
 
+# ============ 任务队列管理函数 ============
+
+def _get_queue_status():
+    """获取队列状态"""
+    global _running_task_count
+    with _queue_lock:
+        pending_count = task_queue.qsize()
+        running_count = _running_task_count
+        return {
+            'pending': pending_count,
+            'running': running_count,
+            'max_concurrent': MAX_CONCURRENT_TASKS,
+            'queue_capacity': TASK_QUEUE_MAX_SIZE,
+            'utilization': round(running_count / MAX_CONCURRENT_TASKS * 100, 1) if MAX_CONCURRENT_TASKS > 0 else 0
+        }
+
+
+def _submit_task_to_queue(task):
+    """
+    提交任务到队列系统
+
+    Args:
+        task: ProcessingTask 实例
+
+    Returns:
+        bool: 是否成功提交
+    """
+    global _running_task_count
+
+    try:
+        with _queue_lock:
+            # 检查队列是否已满
+            if task_queue.full():
+                logger.warning(f"Task queue is full, rejecting task {task.task_id}")
+                task.update_status('failed', error='Task queue is full, please try again later')
+                return False
+
+            # 将任务加入队列
+            task_queue.put(task.task_id)
+            task.update_status('pending', 0, 'Waiting in queue')
+            task.add_log(f'Task queued, position: {task_queue.qsize()}')
+            logger.info(f"Task {task.task_id} added to queue (queue size: {task_queue.qsize()})")
+
+        # 尝试启动队列处理器
+        _process_queue()
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to submit task {task.task_id} to queue: {e}")
+        task.update_status('failed', error=f'Failed to queue task: {str(e)}')
+        return False
+
+
+def _process_queue():
+    """处理队列中的任务"""
+    global _running_task_count
+
+    with _queue_lock:
+        # 检查当前运行任务数是否已达上限
+        if _running_task_count >= MAX_CONCURRENT_TASKS:
+            logger.debug(f"Max concurrent tasks ({MAX_CONCURRENT_TASKS}) reached, waiting...")
+            return
+
+        # 尝试获取队列中的下一个任务
+        try:
+            task_id = task_queue.get_nowait()
+        except Empty:
+            return  # 队列为空
+
+        # 增加运行计数
+        _running_task_count += 1
+
+    # 在锁外执行任务
+    try:
+        task = processing_tasks.get(task_id)
+        if not task:
+            logger.warning(f"Task {task_id} not found in processing_tasks")
+            with _queue_lock:
+                _running_task_count -= 1
+            return
+
+        if task.is_cancelled():
+            logger.info(f"Task {task_id} was cancelled, skipping")
+            with _queue_lock:
+                _running_task_count -= 1
+            return
+
+        # 确定任务类型并调用相应函数
+        if task.task_type == 'single':
+            task_func = process_single_task
+        elif task.task_type == 'batch':
+            task_func = process_batch_task
+        elif task.task_type == 'upload':
+            task_func = process_upload_task
+        else:
+            logger.error(f"Unknown task type: {task.task_type}")
+            with _queue_lock:
+                _running_task_count -= 1
+            return
+
+        # 提交到线程池执行
+        def _task_wrapper():
+            global _running_task_count
+            try:
+                task_func(task)
+            except Exception as e:
+                logger.error(f"Task {task_id} execution error: {e}")
+                try:
+                    task.update_status('failed')
+                    task.error = str(e)
+                except Exception:
+                    pass
+            finally:
+                with _queue_lock:
+                    _running_task_count -= 1
+                # 尝试处理队列中的下一个任务
+                _process_queue()
+
+        # 在线程池中执行
+        task_executor.submit(_task_wrapper)
+        logger.info(f"Task {task_id} started execution (running: {_running_task_count})")
+
+    except Exception as e:
+        logger.error(f"Error processing queue: {e}")
+        with _queue_lock:
+            _running_task_count = max(0, _running_task_count - 1)
+        _process_queue()  # 尝试下一个
+
+
 def _do_cleanup_old_tasks():
     """执行清理过期任务"""
     cutoff_time = time.time() - (TASK_MAX_AGE_HOURS * 3600)
     cleaned_count = 0
-    
+
     with _task_lock:
         # 找出过期任务
         expired_tasks = []
         for task_id, task in processing_tasks.items():
             if task.end_time and task.end_time < cutoff_time:
                 expired_tasks.append(task_id)
-        
+
         # 删除过期任务
         for task_id in expired_tasks:
             del processing_tasks[task_id]
             _task_cancel_flags.pop(task_id, None)
             cleaned_count += 1
-    
+
     if cleaned_count > 0:
         logger.info(f"清理了 {cleaned_count} 个过期任务（超过 {TASK_MAX_AGE_HOURS} 小时）")
 
@@ -457,6 +627,12 @@ def index():
     """主页面"""
     return render_template('index.html')
 
+@app.route('/api/client/download')
+def download_client_script():
+    """下载 CLI 客户端脚本"""
+    cli_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cli', 'download.py')
+    return send_file(cli_path, as_attachment=True, download_name='download.py', mimetype='text/x-python')
+
 @app.route('/api/process/single', methods=['POST'])
 def process_single():
     """处理单个AccessionNumber"""
@@ -477,14 +653,15 @@ def process_single():
         })
         
         processing_tasks[task_id] = task
-        
-        # 启动后台处理
-        threading.Thread(target=process_single_task, args=(task,)).start()
-        
+
+        # 提交到任务队列
+        if not _submit_task_to_queue(task):
+            return jsonify({'error': 'Task queue is full, please try again later'}), 503
+
         return jsonify({
             'task_id': task_id,
-            'status': 'started',
-            'message': f'开始处理AccessionNumber: {accession_number}'
+            'status': 'queued',
+            'message': f'任务已加入队列，等待处理AccessionNumber: {accession_number}'
         })
         
     except Exception as e:
@@ -509,14 +686,15 @@ def process_batch():
         })
         
         processing_tasks[task_id] = task
-        
-        # 启动后台处理
-        threading.Thread(target=process_batch_task, args=(task,)).start()
-        
+
+        # 提交到任务队列
+        if not _submit_task_to_queue(task):
+            return jsonify({'error': 'Task queue is full, please try again later'}), 503
+
         return jsonify({
             'task_id': task_id,
-            'status': 'started',
-            'message': f'开始批量处理 {len(accession_numbers)} 个研究'
+            'status': 'queued',
+            'message': f'批量任务已加入队列，等待处理 {len(accession_numbers)} 个研究'
         })
         
     except Exception as e:
@@ -557,14 +735,15 @@ def process_upload():
         })
         
         processing_tasks[task_id] = task
-        
-        # 启动后台处理
-        threading.Thread(target=process_upload_task, args=(task,)).start()
-        
+
+        # 提交到任务队列
+        if not _submit_task_to_queue(task):
+            return jsonify({'error': 'Task queue is full, please try again later'}), 503
+
         return jsonify({
             'task_id': task_id,
-            'status': 'started',
-            'message': f'开始处理上传文件: {file.filename}'
+            'status': 'queued',
+            'message': f'上传文件已加入队列，等待处理: {file.filename}'
         })
         
     except Exception as e:
@@ -588,6 +767,37 @@ def get_task_status(task_id):
         'error': task.error,
         'duration': (task.end_time or time.time()) - task.start_time
     })
+
+@app.route('/api/queue/status')
+def get_queue_status():
+    """获取任务队列状态"""
+    try:
+        status = _get_queue_status()
+        # 添加活跃任务列表
+        active_tasks = []
+        pending_tasks = []
+
+        with _task_lock:
+            for task_id, task in processing_tasks.items():
+                task_info = {
+                    'task_id': task.task_id,
+                    'task_type': task.task_type,
+                    'status': task.status,
+                    'progress': task.progress,
+                    'current_step': task.current_step
+                }
+                if task.status == 'running':
+                    active_tasks.append(task_info)
+                elif task.status == 'pending':
+                    pending_tasks.append(task_info)
+
+        status['active_tasks'] = active_tasks
+        status['pending_tasks'] = pending_tasks
+
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Failed to get queue status: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 def _serialize_task_history(task: 'ProcessingTask') -> dict:
@@ -810,8 +1020,242 @@ def system_status():
     
     if error_msg:
         response['dicom_error'] = error_msg
-    
+
     return jsonify(response)
+
+
+@app.route('/api/system/monitoring')
+def get_system_monitoring():
+    """Get detailed system monitoring information for the monitoring dashboard."""
+    import platform
+    import shutil
+
+    # 尝试导入psutil，如果失败则使用替代方案
+    try:
+        import psutil
+        has_psutil = True
+    except ImportError:
+        has_psutil = False
+        logger.warning("psutil not available, using fallback methods for system monitoring")
+
+    # 获取磁盘使用情况
+    disk_info = {}
+    try:
+        # 获取应用所在磁盘的使用情况
+        app_path = os.path.abspath('.')
+        if has_psutil:
+            disk_usage = psutil.disk_usage(app_path)
+            disk_info = {
+                'total_gb': round(disk_usage.total / (1024**3), 2),
+                'used_gb': round(disk_usage.used / (1024**3), 2),
+                'free_gb': round(disk_usage.free / (1024**3), 2),
+                'percent_used': round(disk_usage.percent, 1),
+                'path': app_path
+            }
+        else:
+            # 使用shutil作为替代方案
+            usage = shutil.disk_usage(app_path)
+            total_gb = usage.total / (1024**3)
+            used_gb = usage.used / (1024**3)
+            free_gb = usage.free / (1024**3)
+            percent_used = round((usage.used / usage.total) * 100, 1) if usage.total > 0 else 0
+            disk_info = {
+                'total_gb': round(total_gb, 2),
+                'used_gb': round(used_gb, 2),
+                'free_gb': round(free_gb, 2),
+                'percent_used': percent_used,
+                'path': app_path
+            }
+    except Exception as e:
+        logger.warning(f"获取磁盘信息失败: {e}")
+        disk_info = {'error': str(e)}
+
+    # 获取内存使用情况
+    memory_info = {}
+    try:
+        if has_psutil:
+            memory = psutil.virtual_memory()
+            memory_info = {
+                'total_gb': round(memory.total / (1024**3), 2),
+                'available_gb': round(memory.available / (1024**3), 2),
+                'percent_used': memory.percent
+            }
+        else:
+            # 没有psutil时，尝试读取/proc/meminfo（Linux）
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    meminfo = f.read()
+                mem_total = 0
+                mem_available = 0
+                for line in meminfo.split('\n'):
+                    if line.startswith('MemTotal:'):
+                        mem_total = int(line.split()[1]) * 1024  # kB to bytes
+                    elif line.startswith('MemAvailable:'):
+                        mem_available = int(line.split()[1]) * 1024
+                if mem_total > 0:
+                    used = mem_total - mem_available
+                    memory_info = {
+                        'total_gb': round(mem_total / (1024**3), 2),
+                        'available_gb': round(mem_available / (1024**3), 2),
+                        'percent_used': round((used / mem_total) * 100, 1)
+                    }
+                else:
+                    memory_info = {'error': 'Unable to read memory info'}
+            except Exception:
+                memory_info = {'error': 'Memory info requires psutil on this platform'}
+    except Exception as e:
+        logger.warning(f"获取内存信息失败: {e}")
+        memory_info = {'error': str(e)}
+
+    # 获取CPU使用情况
+    cpu_info = {}
+    try:
+        if has_psutil:
+            cpu_info = {
+                'percent': psutil.cpu_percent(interval=0.1),
+                'count': psutil.cpu_count(),
+                'load_avg': os.getloadavg() if hasattr(os, 'getloadavg') else None
+            }
+        else:
+            # 没有psutil时的基本CPU信息
+            cpu_count = os.cpu_count() or 1
+            cpu_info = {
+                'percent': None,  # 无法获取 without psutil
+                'count': cpu_count,
+                'load_avg': os.getloadavg() if hasattr(os, 'getloadavg') else None
+            }
+    except Exception as e:
+        logger.warning(f"获取CPU信息失败: {e}")
+        cpu_info = {'error': str(e)}
+
+    # 获取各目录大小
+    directory_sizes = {}
+    try:
+        for dir_name, dir_path in [
+            ('results', app.config['RESULT_FOLDER']),
+            ('uploads', app.config['UPLOAD_FOLDER']),
+            ('temp', './temp'),
+            ('logs', os.path.join(get_project_root(), 'logs'))
+        ]:
+            if os.path.exists(dir_path):
+                dir_size = get_directory_size(dir_path)
+                directory_sizes[dir_name] = {
+                    'path': dir_path,
+                    'size_gb': round(dir_size, 2)
+                }
+    except Exception as e:
+        logger.warning(f"获取目录大小失败: {e}")
+
+    # 获取日志文件列表
+    log_files = []
+    try:
+        # 使用绝对路径，避免工作目录问题
+        logs_dir = os.path.join(get_project_root(), 'logs')
+        if os.path.exists(logs_dir):
+            for file in os.listdir(logs_dir):
+                if file.endswith('.log'):
+                    file_path = os.path.join(logs_dir, file)
+                    try:
+                        stat = os.stat(file_path)
+                        log_files.append({
+                            'name': file,
+                            'size_mb': round(stat.st_size / (1024 * 1024), 2),
+                            'modified': stat.st_mtime
+                        })
+                    except Exception:
+                        pass
+            # 按修改时间排序，最新的在前
+            log_files.sort(key=lambda x: x['modified'], reverse=True)
+    except Exception as e:
+        logger.warning(f"获取日志文件列表失败: {e}")
+
+    # 获取活跃任务详情
+    active_tasks_info = []
+    try:
+        for task_id, task in processing_tasks.items():
+            if task.status in ['running', 'pending']:
+                task_info = {
+                    'task_id': task_id,
+                    'type': task.task_type,
+                    'status': task.status,
+                    'progress': task.progress,
+                    'current_step': task.current_step,
+                    'start_time': task.start_time,
+                    'elapsed_seconds': round(time.time() - task.start_time, 1) if task.start_time else None,
+                    'parameters': {
+                        'accession_number': task.parameters.get('accession_number', 'N/A') if task.task_type == 'single' else None,
+                        'batch_count': len(task.parameters.get('accession_numbers', [])) if task.task_type == 'batch' else None
+                    }
+                }
+                active_tasks_info.append(task_info)
+    except Exception as e:
+        logger.warning(f"获取活跃任务信息失败: {e}")
+
+    # 获取近期完成的任务（最近10个）
+    recent_completed = []
+    try:
+        all_tasks = []
+        for task_id, task in processing_tasks.items():
+            if task.status in ['completed', 'failed', 'cancelled']:
+                all_tasks.append({
+                    'task_id': task_id,
+                    'type': task.task_type,
+                    'status': task.status,
+                    'end_time': task.end_time,
+                    'elapsed_seconds': round(task.end_time - task.start_time, 1) if task.end_time and task.start_time else None
+                })
+        # 按结束时间排序，取最近10个
+        all_tasks.sort(key=lambda x: x.get('end_time') or 0, reverse=True)
+        recent_completed = all_tasks[:10]
+    except Exception as e:
+        logger.warning(f"获取近期任务信息失败: {e}")
+
+    # 获取PACS连接状态
+    pacs_status = {}
+    try:
+        if dicom_client_checker.check_status():
+            pacs_status = {
+                'connected': True,
+                'config': {
+                    'pacs_ip': os.getenv('PACS_IP', 'N/A'),
+                    'pacs_port': os.getenv('PACS_PORT', 'N/A'),
+                    'calling_aet': os.getenv('CALLING_AET', 'N/A'),
+                    'called_aet': os.getenv('CALLED_AET', 'N/A'),
+                    'calling_port': os.getenv('CALLING_PORT', 'N/A')
+                }
+            }
+        else:
+            pacs_status = {'connected': False, 'error': 'Connection failed'}
+    except Exception as e:
+        pacs_status = {'connected': False, 'error': str(e)}
+
+    # 系统信息
+    system_info = {
+        'platform': platform.platform(),
+        'python_version': platform.python_version(),
+        'uptime_seconds': None  # 需要psutil才能获取
+    }
+
+    return jsonify({
+        'timestamp': time.time(),
+        'system': system_info,
+        'disk': disk_info,
+        'memory': memory_info,
+        'cpu': cpu_info,
+        'directories': directory_sizes,
+        'log_files': log_files,
+        'active_tasks': active_tasks_info,
+        'recent_completed': recent_completed,
+        'pacs_connection': pacs_status,
+        'task_summary': {
+            'running': len([t for t in processing_tasks.values() if t.status == 'running']),
+            'pending': len([t for t in processing_tasks.values() if t.status == 'pending']),
+            'completed': len([t for t in processing_tasks.values() if t.status == 'completed']),
+            'failed': len([t for t in processing_tasks.values() if t.status == 'failed']),
+            'cancelled': len([t for t in processing_tasks.values() if t.status == 'cancelled']),
+            'total': len(processing_tasks)
+        }
+    })
 
 
 @app.route('/api/pacs-config', methods=['GET'])
@@ -850,7 +1294,7 @@ def set_pacs_config():
         pacs_ip = _normalize_host(data.get('PACS_IP'))
         pacs_port = _parse_port(data.get('PACS_PORT'), 'PACS_PORT')
         calling_aet = _normalize_aet(data.get('CALLING_AET'), 'CALLING_AET')
-        called_aet = _normalize_aet(data.get('CALLED_AET'), 'CALLING_AET')
+        called_aet = _normalize_aet(data.get('CALLED_AET'), 'CALLED_AET')
         calling_port = _parse_port(data.get('CALLING_PORT'), 'CALLING_PORT')
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
@@ -877,6 +1321,32 @@ def set_pacs_config():
         return jsonify({'message': 'Configuration saved'}), 200
     except Exception as e:
         return jsonify({'error': f'Failed to save configuration: {str(e)}'}), 500
+
+
+@app.route('/api/logs/download/<filename>')
+def download_log_file(filename):
+    """下载日志文件"""
+    # 安全检查：只允许下载logs目录下的.log文件
+    if not filename.endswith('.log') or '..' in filename or '/' in filename:
+        return jsonify({'error': 'Invalid filename'}), 400
+
+    # 使用绝对路径，避免工作目录问题
+    log_path = os.path.join(get_project_root(), 'logs', filename)
+
+    # 检查文件是否存在
+    if not os.path.exists(log_path) or not os.path.isfile(log_path):
+        return jsonify({'error': 'Log file not found'}), 404
+
+    try:
+        return send_file(
+            log_path,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='text/plain'
+        )
+    except Exception as e:
+        logger.error(f"下载日志文件失败: {e}")
+        return jsonify({'error': f'Failed to download log file: {str(e)}'}), 500
 
 # 处理任务函数
 def process_single_task(task):
@@ -943,7 +1413,7 @@ def process_single_task(task):
                 task.add_log(msg)
             except Exception:
                 pass
-            logger.info(f"MR_PROGRESS[{stage}]: {msg}")
+            logger.debug(f"MR_PROGRESS[{stage}]: {msg}")
 
         task_client.progress_callback = _mr_progress
         
@@ -968,7 +1438,17 @@ def process_single_task(task):
         # 获取参数
         accession_number = task.parameters['accession_number']
         options = task.parameters.get('options', {})
-        
+
+        # 获取过滤参数
+        modality_filter = options.get('modality_filter')
+        min_series_files = options.get('min_series_files')
+        exclude_derived = options.get('exclude_derived', True)  # 默认启用衍生序列过滤
+        if min_series_files is not None:
+            try:
+                min_series_files = int(min_series_files)
+            except (ValueError, TypeError):
+                min_series_files = None
+
         task.update_status('running', 15, 'Preparing process')
         task.add_log(f"Start processing AccessionNumber: {accession_number}")
         
@@ -990,11 +1470,24 @@ def process_single_task(task):
         # 检查取消标志
         task.check_cancellation("before_query")
         
-        # 先查询是否存在数据
+        # 先查询是否存在数据（应用过滤条件）
         try:
-            series_metadata = task_client._query_series_metadata(accession_number)
+            series_metadata = task_client._query_series_metadata(
+                accession_number,
+                modality_filter=modality_filter,
+                min_series_files=min_series_files,
+                exclude_derived=exclude_derived
+            )
             if not series_metadata:
-                raise Exception(f"AccessionNumber not found in PACS: {accession_number}")
+                filter_info = []
+                if modality_filter:
+                    filter_info.append(f"Modality filter: {modality_filter}")
+                if min_series_files:
+                    filter_info.append(f"Min files: {min_series_files}")
+                if exclude_derived:
+                    filter_info.append(f"Exclude derived")
+                filter_str = f" ({', '.join(filter_info)})" if filter_info else ""
+                raise Exception(f"No series found in PACS for AccessionNumber: {accession_number}{filter_str}")
             task.add_log(f"Found {len(series_metadata)} Series")
         except Exception as e:
             task.add_log(f"Query failed: {str(e)}", 'error')
@@ -1014,7 +1507,10 @@ def process_single_task(task):
                 keep_zip=options.get('keep_zip', True),
                 keep_extracted=options.get('keep_extracted', False),
                 output_format=options.get('output_format', 'nifti'),
-                parallel_pipeline=False  # 禁用并行流水线，使用单线程顺序处理
+                parallel_pipeline=False,  # 禁用并行流水线，使用单线程顺序处理
+                modality_filter=modality_filter,
+                min_series_files=min_series_files,
+                exclude_derived=exclude_derived
             )
             
             if results and results.get('success'):
@@ -1030,7 +1526,8 @@ def process_single_task(task):
                             results['organized_dir'],
                             task.task_id,
                             app.config['RESULT_FOLDER'],
-                            extra_files=[results.get('excel_file')]
+                            extra_files=[results.get('excel_file')],
+                            include_subdirs=set(results.get('series_info', {}).keys())
                         )
                         results['result_zip'] = zip_path
                         task.add_log(f'Result ZIP created: {zip_path}')
@@ -1092,8 +1589,24 @@ def process_batch_task(task):
     task_client = None  # 初始化变量
     try:
         accession_numbers = task.parameters['accession_numbers']
-        options = task.parameters['options']
-        
+        options = task.parameters.get('options', {})
+
+        # 获取过滤参数
+        modality_filter = options.get('modality_filter')
+        min_series_files = options.get('min_series_files')
+        exclude_derived = options.get('exclude_derived', True)  # 默认启用衍生序列过滤
+        if min_series_files is not None:
+            try:
+                min_series_files = int(min_series_files)
+            except (ValueError, TypeError):
+                min_series_files = None
+        if modality_filter:
+            task.add_log(f"Modality filter: {modality_filter}")
+        if min_series_files:
+            task.add_log(f"Min series files: {min_series_files}")
+        if exclude_derived:
+            task.add_log(f"Exclude derived series: enabled")
+
         # 去重处理，保持顺序
         seen = set()
         unique_accession_numbers = []
@@ -1101,7 +1614,7 @@ def process_batch_task(task):
             if acc and acc not in seen:
                 seen.add(acc)
                 unique_accession_numbers.append(acc)
-        
+
         if len(unique_accession_numbers) < len(accession_numbers):
             task.add_log(f"Removed {len(accession_numbers) - len(unique_accession_numbers)} duplicates, {len(unique_accession_numbers)} unique studies to process")
         
@@ -1132,7 +1645,7 @@ def process_batch_task(task):
                 task.add_log(msg)
             except Exception:
                 pass
-            logger.info(f"MR_PROGRESS[{stage}]: {msg}")
+            logger.debug(f"MR_PROGRESS[{stage}]: {msg}")
 
         task_client.progress_callback = _mr_progress
         
@@ -1163,7 +1676,10 @@ def process_batch_task(task):
                     auto_organize=options.get('auto_organize', True),
                     auto_metadata=options.get('auto_metadata', True),
                     output_format=options.get('output_format', 'nifti'),
-                    parallel_pipeline=False  # 禁用并行流水线，使用单线程顺序处理
+                    parallel_pipeline=False,  # 禁用并行流水线，使用单线程顺序处理
+                    modality_filter=modality_filter,
+                    min_series_files=min_series_files,
+                    exclude_derived=exclude_derived
                 )
                 results.append(result)
                 task.add_log(f'{accno} Process completed')
@@ -1183,11 +1699,76 @@ def process_batch_task(task):
             app.config['RESULT_FOLDER']
         )
         
+        # 计算详细的批处理统计信息
+        total_processed = len([r for r in results if r.get('success')])
+        total_failed = len([r for r in results if r.get('error')])
+        
+        # 收集质量统计数据
+        quality_stats = {
+            'normal': 0,
+            'low_quality': 0,
+            'fixed': 0,
+            'unknown': 0
+        }
+        total_images = 0
+        total_series = 0
+        
+        for r in results:
+            if r.get('success'):
+                series_info = r.get('series_info', {})
+                total_series += len(series_info)
+                
+                # 尝试从Excel元数据文件中读取质量统计
+                excel_file = r.get('excel_file')
+                if excel_file and os.path.exists(excel_file):
+                    try:
+                        import pandas as pd
+                        df = pd.read_excel(excel_file)
+                        if 'Low_quality' in df.columns:
+                            for _, row in df.iterrows():
+                                low_quality = row.get('Low_quality', 0)
+                                fixed = row.get('Fixed', '')
+                                if fixed == 'Yes' or 'Fixed' in str(row.get('Low_quality_reason', '')):
+                                    quality_stats['fixed'] += 1
+                                elif low_quality == 0 or low_quality == False:
+                                    quality_stats['normal'] += 1
+                                elif low_quality == 1 or low_quality == True:
+                                    quality_stats['low_quality'] += 1
+                                else:
+                                    quality_stats['unknown'] += 1
+                                total_images += 1
+                        else:
+                            # 如果没有质量列，只统计文件数量
+                            total_images += len(df)
+                            quality_stats['unknown'] += len(df)
+                    except Exception as e:
+                        # 如果读取Excel失败，使用series_info统计
+                        for series_name, series_data in series_info.items():
+                            file_count = series_data.get('file_count', 0)
+                            total_images += file_count
+                            quality_stats['unknown'] += file_count
+                else:
+                    # 如果没有Excel文件，使用series_info统计
+                    for series_name, series_data in series_info.items():
+                        file_count = series_data.get('file_count', 0)
+                        total_images += file_count
+                        quality_stats['unknown'] += file_count
+        
+        # 计算处理时间
+        duration = (task.end_time or time.time()) - task.start_time
+        avg_speed = total_images / duration if duration > 0 else 0
+        
         task.result = {
             'batch_results': results,
             'result_zip': zip_path,
-            'total_processed': len([r for r in results if r.get('success')]),
-            'total_failed': len([r for r in results if r.get('error')])
+            'total_processed': total_processed,
+            'total_failed': total_failed,
+            'total_studies': len(accession_numbers),
+            'total_series': total_series,
+            'total_images': total_images,
+            'duration': round(duration, 2),
+            'avg_speed': round(avg_speed, 2),
+            'quality_distribution': quality_stats
         }
         
         task.update_status('completed', 100, 'Batch process completed')
@@ -1261,10 +1842,13 @@ def process_upload_task(task):
             
             task.update_status('running', 95, 'Creating result files')
             task.add_log("Creating result files...")
+            zip_source = organized_dir or result_dir
             zip_path = create_result_zip(
-                result_dir,
+                zip_source,
                 task.task_id,
-                app.config['RESULT_FOLDER']
+                app.config['RESULT_FOLDER'],
+                extra_files=[excel_file],
+                include_subdirs=set(series_info.keys())
             )
 
             task.result = {
@@ -1302,11 +1886,11 @@ def process_upload_task(task):
 # WebSocket事件处理
 @socketio.on('connect')
 def handle_connect():
-    logger.info('客户端已连接')
+    logger.debug('客户端已连接')
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    logger.info('客户端已断开')
+    logger.debug('客户端已断开')
 
 @socketio.on('subscribe_task')
 def handle_subscribe_task(data):
@@ -1315,11 +1899,108 @@ def handle_subscribe_task(data):
     if task_id in processing_tasks:
         emit('task_subscribed', {'task_id': task_id})
 
+def _ensure_ssl_cert(ssl_dir):
+    """生成或复用自签名 SSL 证书，返回 (cert_path, key_path)。"""
+    import datetime
+    import ipaddress as _ipaddress
+    os.makedirs(ssl_dir, exist_ok=True)
+    cert_path = os.path.join(ssl_dir, 'cert.pem')
+    key_path  = os.path.join(ssl_dir, 'key.pem')
+
+    # 证书存在且未过期（剩余 > 7 天）则直接复用
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.backends import default_backend
+            with open(cert_path, 'rb') as f:
+                cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+            remaining = cert.not_valid_after_utc - datetime.datetime.now(datetime.timezone.utc)
+            if remaining.days > 7:
+                return cert_path, key_path
+        except Exception:
+            pass  # 证书损坏，重新生成
+
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+
+        key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048, backend=default_backend()
+        )
+        with open(key_path, 'wb') as f:
+            f.write(key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, 'dicom-server'),
+        ])
+        san_list = [x509.DNSName('localhost'), x509.DNSName('*')]
+        # 把本机所有网卡 IP 都加入 SAN，避免浏览器 IP 访问时证书不匹配
+        import socket as _socket
+        try:
+            hostname = _socket.gethostname()
+            for addr in _socket.getaddrinfo(hostname, None):
+                ip_str = addr[4][0]
+                try:
+                    san_list.append(x509.IPAddress(_ipaddress.ip_address(ip_str)))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for fixed_ip in ('127.0.0.1', '0.0.0.0'):
+            try:
+                san_list.append(x509.IPAddress(_ipaddress.IPv4Address(fixed_ip)))
+            except Exception:
+                pass
+
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+            .sign(key, hashes.SHA256(), default_backend())
+        )
+        with open(cert_path, 'wb') as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+        logger.info(f"🔒 已生成自签名 SSL 证书: {cert_path}")
+    except Exception as e:
+        logger.error(f"❌ SSL 证书生成失败: {e}")
+        raise
+
+    return cert_path, key_path
+
+
 if __name__ == '__main__':
     logger.info("="*60)
     logger.info("🏥 DICOM处理Web应用启动")
     logger.info("="*60)
-    logger.info("📡 访问地址: http://172.17.250.136:5005")
+
+    enable_https = os.getenv('ENABLE_HTTPS', 'false').lower() in ('true', '1', 'yes')
+    ssl_context = None
+    protocol = 'http'
+    if enable_https:
+        ssl_dir = os.path.join(project_root, 'ssl')
+        try:
+            cert_path, key_path = _ensure_ssl_cert(ssl_dir)
+            ssl_context = (cert_path, key_path)
+            protocol = 'https'
+            logger.info(f"🔒 HTTPS 已启用 (证书: {cert_path})")
+            logger.info("   ⚠️  首次访问时浏览器会提示证书不受信任，点击'高级→继续访问'即可")
+        except Exception as ssl_err:
+            logger.error(f"❌ HTTPS 启动失败，回退为 HTTP: {ssl_err}")
+
+    logger.info(f"📡 访问地址: {protocol}://172.17.250.136:5005")
     
     # 检查DICOM服务连接状态
     try:
@@ -1342,11 +2023,67 @@ if __name__ == '__main__':
     else:
         logger.info("🔐 未配置DICOM登录信息（当前实现无需真实认证）")
     logger.info("🚀 系统已就绪，等待用户请求...")
-    logger.info("📡 测试URL:")
-    logger.info("   - http://localhost:5005")
-    logger.info("   - http://127.0.0.1:5005") 
-    logger.info("   - http://172.17.250.136:5005")
+    logger.info("📡 访问地址:")
+    logger.info(f"   - {protocol}://localhost:5005")
+    logger.info(f"   - {protocol}://127.0.0.1:5005")
+    logger.info(f"   - {protocol}://172.17.250.136:5005")
     logger.info("="*60)
-    
-    # 启动应用，开启调试模式和自动重载
-    socketio.run(app, host='0.0.0.0', port=5005, debug=False, allow_unsafe_werkzeug=True)
+
+    # 启动应用
+    socketio.run(app, host='0.0.0.0', port=5005, debug=False,
+                 allow_unsafe_werkzeug=True, ssl_context=ssl_context)
+
+
+# ========== 衍生序列过滤关键词配置 API ==========
+
+@app.route('/api/filter-keywords', methods=['GET'])
+def get_filter_keywords():
+    """获取当前生效的衍生序列过滤关键词列表。"""
+    return jsonify({
+        'keywords': get_derived_keywords(),
+        'default_keywords': DEFAULT_DERIVED_SERIES_KEYWORDS,
+        'count': len(get_derived_keywords())
+    })
+
+
+@app.route('/api/filter-keywords', methods=['POST'])
+def set_filter_keywords():
+    """设置衍生序列过滤关键词列表（立即生效，影响后续所有新任务）。"""
+    data = request.json or {}
+    keywords = data.get('keywords')
+
+    if not isinstance(keywords, list):
+        return jsonify({'error': 'keywords must be a list of strings'}), 400
+
+    # 验证所有元素都是字符串且非空
+    validated = []
+    for k in keywords:
+        if isinstance(k, str) and k.strip():
+            validated.append(k.strip().upper())
+
+    if not validated:
+        return jsonify({'error': 'At least one valid keyword is required'}), 400
+
+    # 设置新的关键词（会自动去重）
+    set_derived_keywords(validated)
+    new_keywords = get_derived_keywords()
+    logger.info(f"📝 过滤关键词已更新: {new_keywords}")
+
+    return jsonify({
+        'message': 'Filter keywords updated successfully',
+        'keywords': new_keywords,
+        'count': len(new_keywords)
+    })
+
+
+@app.route('/api/filter-keywords/reset', methods=['POST'])
+def reset_filter_keywords():
+    """重置过滤关键词为系统默认值。"""
+    reset_derived_keywords()
+    keywords = get_derived_keywords()
+    logger.info(f"📝 过滤关键词已重置为默认值")
+    return jsonify({
+        'message': 'Filter keywords reset to default',
+        'keywords': keywords,
+        'count': len(keywords)
+    })

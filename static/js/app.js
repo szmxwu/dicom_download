@@ -6,6 +6,9 @@ class DICOMProcessor {
         this.currentTask = null;
         this.selectedFile = null;
         this.pacsConfigLoaded = false;
+        this.successModal = null;
+        this.errorModal = null;
+        this.isHandlingTaskCompletion = false;
         this.historyPage = 1;
         this.historyPageSize = 20;
         this.historyTotalPages = 0;
@@ -41,10 +44,12 @@ class DICOMProcessor {
     // 初始化应用
     init() {
         this.initLocalization();
+        this.initModals();
         this.initializeSocket();
         this.bindEvents();
         this.updateCurrentTime();
         this.loadSystemStatus();
+        this.loadFilterKeywords();
         
         // 防抖包装的方法
         this.debouncedLoadSystemStatus = this.debounce(() => this.loadSystemStatus(), 1000);
@@ -54,6 +59,30 @@ class DICOMProcessor {
         setInterval(() => this.debouncedLoadSystemStatus(), 30000);
         
         console.log('🏥 DICOM处理系统已初始化');
+    }
+
+    initModals() {
+        const successModalEl = document.getElementById('successModal');
+        const errorModalEl = document.getElementById('errorModal');
+
+        if (successModalEl) {
+            this.successModal = bootstrap.Modal.getOrCreateInstance(successModalEl);
+            successModalEl.addEventListener('hidden.bs.modal', () => this.cleanupModalArtifacts());
+        }
+
+        if (errorModalEl) {
+            this.errorModal = bootstrap.Modal.getOrCreateInstance(errorModalEl);
+            errorModalEl.addEventListener('hidden.bs.modal', () => this.cleanupModalArtifacts());
+        }
+    }
+
+    cleanupModalArtifacts() {
+        const hasVisibleModal = document.querySelector('.modal.show');
+        if (!hasVisibleModal) {
+            document.querySelectorAll('.modal-backdrop').forEach(backdrop => backdrop.remove());
+            document.body.classList.remove('modal-open');
+            document.body.style.removeProperty('padding-right');
+        }
     }
 
     // 防抖函数
@@ -163,6 +192,12 @@ class DICOMProcessor {
                 'use_default_fields': 'Use Default Fields',
                 'upload_custom_config': 'Upload Custom Config',
                 'upload_json_help': 'Upload JSON format field list',
+                'modality_filter': 'Modality Filter (Optional)',
+                'modality_filter_help': 'Filter by modality, e.g. MR, CT (comma separated)',
+                'min_series_files': 'Min Series Files (Optional)',
+                'min_series_files_help': 'Skip series with fewer files than this',
+                'exclude_derived': 'Exclude derived series (MPR, MIP, VR, etc.)',
+                'exclude_derived_help': 'Automatically filter out MPR, MIP, 3D VR, and other derived series',
                 'quick_actions': 'Quick Actions',
                 'reset_options': 'Reset Options',
                 'export_config': 'Export Config',
@@ -181,6 +216,9 @@ class DICOMProcessor {
                 'start_process_failed': 'Failed to start process',
                 'network_error': 'Network Error: ',
                 'process_started': 'Process task started',
+                'process_queued': 'Task queued, waiting...',
+                'batch_process_queued': 'Batch task queued, waiting...',
+                'upload_process_queued': 'Upload task queued, waiting...',
                 'enter_accession_number_list_error': 'Please enter AccessionNumber list',
                 'no_valid_accession_number': 'No valid AccessionNumber',
                 'start_batch_process_failed': 'Failed to start batch process',
@@ -192,10 +230,62 @@ class DICOMProcessor {
                 'task_cancelled': 'Task cancelled',
                 'cancel_task_failed': 'Failed to cancel task',
                 'initializing': 'Initializing...',
+                'status_running': 'Processing...',
+                'status_completed': 'Completed',
+                'status_failed': 'Failed',
+                'status_cancelled': 'Cancelled',
+                'status_unknown': 'Unknown Status',
+                'task_completed_message': 'Processing completed!',
+                'task_failed_message': 'Processing failed, please check logs',
                 'system_normal_html': '<i class="fas fa-circle"></i> System Normal',
                 'system_abnormal_html': '<i class="fas fa-exclamation-triangle"></i> System Abnormal',
                 'connection_lost_html': '<i class="fas fa-wifi"></i> Connection Lost',
-                'connection_error': 'Connection Error'
+                'connection_error': 'Connection Error',
+                'monitoring': 'Monitoring',
+                'system_monitoring': 'System Monitoring',
+                'disk_usage': 'Disk Usage',
+                'memory_usage': 'Memory Usage',
+                'cpu_usage': 'CPU Usage',
+                'pacs_status': 'PACS Status',
+                'used': 'Used',
+                'available': 'Available',
+                'cores': 'Cores',
+                'checking': 'Checking...',
+                'task_statistics': 'Task Statistics',
+                'total': 'Total',
+                'running': 'Running',
+                'pending': 'Pending',
+                'completed': 'Completed',
+                'failed': 'Failed',
+                'cancelled': 'Cancelled',
+                'active_tasks_detail': 'Active Tasks',
+                'progress': 'Progress',
+                'current_step': 'Current Step',
+                'elapsed_time': 'Elapsed',
+                'action': 'Action',
+                'no_active_tasks': 'No active tasks',
+                'directory_usage': 'Directory Usage',
+                'recent_completed': 'Recent Completed',
+                'no_recent_tasks': 'No recent tasks',
+                'auto_refresh': 'Auto',
+                'stop_auto_refresh': 'Stop',
+                'cancel': 'Cancel',
+                'seconds_ago': 'seconds ago',
+                'minutes_ago': 'minutes ago',
+                'hours_ago': 'hours ago',
+                'log_files': 'Log Files',
+                'download_log': 'Download Log',
+                'no_log_files': 'No log files',
+                'file_size': 'Size',
+                'modified_time': 'Modified',
+                'cli_client': 'CLI Client',
+                'cli_client_title': 'Command-line Batch Download Client',
+                'filter_keywords_config': 'Filter Keywords',
+                'derived_series_keywords': 'Derived Series Keywords',
+                'filter_keywords_help': 'One keyword per line. These keywords are used to filter out derived series (MPR, MIP, etc.).',
+                'save': 'Save',
+                'reset': 'Reset',
+                'filter_keywords_saved': 'Keywords saved. Will take effect on next task.'
             },
             'zh': {
                 'app_title': 'DICOM处理系统',
@@ -276,6 +366,12 @@ class DICOMProcessor {
                 'use_default_fields': '使用默认字段',
                 'upload_custom_config': '上传自定义配置',
                 'upload_json_help': '上传JSON格式的字段列表',
+                'modality_filter': '模态过滤 (可选)',
+                'modality_filter_help': '按模态过滤，如 MR, CT (逗号分隔)',
+                'min_series_files': '最小序列文件数 (可选)',
+                'min_series_files_help': '跳过文件数少于此值的序列',
+                'exclude_derived': '排除衍生序列 (MPR, MIP, VR 等)',
+                'exclude_derived_help': '自动过滤 MPR、MIP、3D VR 等衍生序列',
                 'quick_actions': '快速操作',
                 'reset_options': '重置选项',
                 'export_config': '导出配置',
@@ -294,6 +390,9 @@ class DICOMProcessor {
                 'start_process_failed': '启动处理失败',
                 'network_error': '网络错误: ',
                 'process_started': '处理任务已启动',
+                'process_queued': '任务已加入队列，等待中...',
+                'batch_process_queued': '批量任务已加入队列，等待中...',
+                'upload_process_queued': '上传任务已加入队列，等待中...',
                 'enter_accession_number_list_error': '请输入AccessionNumber列表',
                 'no_valid_accession_number': '没有有效的AccessionNumber',
                 'start_batch_process_failed': '启动批量处理失败',
@@ -305,10 +404,62 @@ class DICOMProcessor {
                 'task_cancelled': '任务已取消',
                 'cancel_task_failed': '取消任务失败',
                 'initializing': '初始化...',
+                'status_running': '处理中...',
+                'status_completed': '已完成',
+                'status_failed': '处理失败',
+                'status_cancelled': '已取消',
+                'status_unknown': '未知状态',
+                'task_completed_message': '处理完成！',
+                'task_failed_message': '处理失败，请检查日志信息',
                 'system_normal_html': '<i class="fas fa-circle"></i> 系统正常',
                 'system_abnormal_html': '<i class="fas fa-exclamation-triangle"></i> 系统异常',
                 'connection_lost_html': '<i class="fas fa-wifi"></i> 连接中断',
-                'connection_error': '无法连接'
+                'connection_error': '无法连接',
+                'monitoring': '监控',
+                'system_monitoring': '系统监控',
+                'disk_usage': '磁盘使用',
+                'memory_usage': '内存使用',
+                'cpu_usage': 'CPU使用',
+                'pacs_status': 'PACS状态',
+                'used': '已用',
+                'available': '可用',
+                'cores': '核心',
+                'checking': '检查中...',
+                'task_statistics': '任务统计',
+                'total': '总数',
+                'running': '运行中',
+                'pending': '等待中',
+                'completed': '已完成',
+                'failed': '失败',
+                'cancelled': '已取消',
+                'active_tasks_detail': '活跃任务',
+                'progress': '进度',
+                'current_step': '当前步骤',
+                'elapsed_time': '已运行',
+                'action': '操作',
+                'no_active_tasks': '无活跃任务',
+                'directory_usage': '目录使用',
+                'recent_completed': '近期完成',
+                'no_recent_tasks': '无近期任务',
+                'auto_refresh': '自动',
+                'stop_auto_refresh': '停止',
+                'cancel': '取消',
+                'seconds_ago': '秒前',
+                'minutes_ago': '分钟前',
+                'hours_ago': '小时前',
+                'log_files': '日志文件',
+                'download_log': '下载日志',
+                'no_log_files': '无日志文件',
+                'file_size': '大小',
+                'modified_time': '修改时间',
+                'cli_client': '客户端',
+                'cli_client_title': '命令行批量下载客户端',
+                'filter_keywords_config': '过滤关键词',
+                'derived_series_keywords': '衍生序列过滤关键词',
+                'filter_keywords_help': '每行一个关键词。这些关键词用于过滤衍生序列（MPR、MIP等）。',
+                'save': '保存',
+                'reset': '重置',
+                'filter_keywords_saved': '关键词已保存，将在下一个任务时生效'
             }
         };
 
@@ -447,6 +598,18 @@ class DICOMProcessor {
             testPacsConnectionBtn.addEventListener('click', () => this.testPacsConnection());
         }
 
+        // 过滤关键词配置：保存
+        const saveFilterKeywordsBtn = document.getElementById('saveFilterKeywords');
+        if (saveFilterKeywordsBtn) {
+            saveFilterKeywordsBtn.addEventListener('click', () => this.saveFilterKeywords());
+        }
+
+        // 过滤关键词配置：重置
+        const resetFilterKeywordsBtn = document.getElementById('resetFilterKeywords');
+        if (resetFilterKeywordsBtn) {
+            resetFilterKeywordsBtn.addEventListener('click', () => this.resetFilterKeywords());
+        }
+
         // 文件拖拽上传
         const uploadArea = document.getElementById('uploadArea');
         if (uploadArea) {
@@ -463,8 +626,52 @@ class DICOMProcessor {
 
         const historyTab = document.getElementById('history-tab');
         if (historyTab) {
-            historyTab.addEventListener('shown.bs.tab', () => this.loadTaskHistory());
+            historyTab.addEventListener('shown.bs.tab', () => {
+                this.loadTaskHistory();
+                this.clearProgressAndResult(); // 历史记录页与任务无关，隐藏进度/结果
+            });
         }
+
+        // 监控标签页事件
+        const monitoringTab = document.getElementById('monitoring-tab');
+        if (monitoringTab) {
+            monitoringTab.addEventListener('shown.bs.tab', () => {
+                this.loadMonitoringData();
+                this.clearProgressAndResult(); // 监控页与任务无关，隐藏进度/结果
+                // 自动开启自动刷新
+                if (!this.monitoringAutoRefreshInterval) {
+                    this.toggleAutoRefresh();
+                }
+            });
+            // 离开监控页面时停止自动刷新
+            monitoringTab.addEventListener('hidden.bs.tab', () => {
+                if (this.monitoringAutoRefreshInterval) {
+                    this.toggleAutoRefresh();
+                }
+            });
+        }
+
+        // 客户端标签页：与任务无关，隐藏进度/结果
+        const clientTab = document.getElementById('client-tab');
+        if (clientTab) {
+            clientTab.addEventListener('shown.bs.tab', () => this.clearProgressAndResult());
+        }
+
+        // 处理类标签页：切换时若没有与当前 tab 对应的运行中/刚完成的任务，则清空进度/结果
+        const processingTabMap = { 'single-tab': 'single', 'batch-tab': 'batch', 'upload-tab': 'upload' };
+        Object.entries(processingTabMap).forEach(([tabId, tabType]) => {
+            const tab = document.getElementById(tabId);
+            if (!tab) return;
+            tab.addEventListener('shown.bs.tab', () => {
+                const taskMatchesTab = this.currentTask && this.currentTask.type === tabType;
+                const isRunning = this.currentTask &&
+                    (this.currentTask.status === 'running' || this.currentTask.status === 'pending');
+                // 仅当没有匹配该 tab 的任务且没有正在运行的任务时才清空
+                if (!taskMatchesTab && !isRunning) {
+                    this.clearProgressAndResult();
+                }
+            });
+        });
 
         const historyPageSize = document.getElementById('historyPageSize');
         if (historyPageSize) {
@@ -769,6 +976,86 @@ class DICOMProcessor {
         }
     }
 
+    // 加载过滤关键词
+    async loadFilterKeywords() {
+        try {
+            const response = await fetch('/api/filter-keywords');
+            const data = await response.json();
+            if (response.ok) {
+                const textarea = document.getElementById('filterKeywordsTextarea');
+                if (textarea) {
+                    textarea.value = data.keywords.join('\n');
+                }
+            }
+        } catch (error) {
+            console.error('Failed to load filter keywords:', error);
+        }
+    }
+
+    // 保存过滤关键词
+    async saveFilterKeywords() {
+        const textarea = document.getElementById('filterKeywordsTextarea');
+        const statusDiv = document.getElementById('filterKeywordsStatus');
+        if (!textarea) return;
+
+        const keywords = textarea.value.split('\n').map(k => k.trim()).filter(k => k);
+
+        try {
+            const response = await fetch('/api/filter-keywords', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keywords })
+            });
+
+            const data = await response.json();
+            if (response.ok) {
+                if (statusDiv) {
+                    statusDiv.style.display = 'block';
+                    setTimeout(() => { statusDiv.style.display = 'none'; }, 3000);
+                }
+                // 更新textarea为服务器返回的实际值（可能已去重）
+                textarea.value = data.keywords.join('\n');
+            } else {
+                this.showError(data.error || 'Failed to save filter keywords');
+            }
+        } catch (error) {
+            console.error('Failed to save filter keywords:', error);
+            this.showError(`Failed to save filter keywords: ${error.message}`);
+        }
+    }
+
+    // 重置过滤关键词
+    async resetFilterKeywords() {
+        const textarea = document.getElementById('filterKeywordsTextarea');
+        const statusDiv = document.getElementById('filterKeywordsStatus');
+
+        try {
+            const response = await fetch('/api/filter-keywords/reset', {
+                method: 'POST'
+            });
+
+            const data = await response.json();
+            if (response.ok) {
+                if (textarea) {
+                    textarea.value = data.keywords.join('\n');
+                }
+                if (statusDiv) {
+                    statusDiv.style.display = 'block';
+                    statusDiv.innerHTML = '<span class="text-success"><i class="fas fa-check-circle"></i> Reset to default successfully</span>';
+                    setTimeout(() => {
+                        statusDiv.style.display = 'none';
+                        statusDiv.innerHTML = '<span class="text-success"><i class="fas fa-check-circle"></i> <span data-i18n="filter_keywords_saved">Keywords saved. Will take effect on next task.</span></span>';
+                    }, 3000);
+                }
+            } else {
+                this.showError(data.error || 'Failed to reset filter keywords');
+            }
+        } catch (error) {
+            console.error('Failed to reset filter keywords:', error);
+            this.showError(`Failed to reset filter keywords: ${error.message}`);
+        }
+    }
+
     // 更新连接状态
     updateConnectionStatus(connected) {
         const statusElement = document.getElementById('systemStatus');
@@ -890,10 +1177,24 @@ class DICOMProcessor {
         }
 
         const options = this.getProcessingOptions();
-        
+
+        // 添加过滤参数
+        const modalityFilter = document.getElementById('modalityFilter')?.value?.trim();
+        const minSeriesFiles = document.getElementById('minSeriesFiles')?.value;
+        const excludeDerived = document.getElementById('excludeDerived')?.checked;
+        if (modalityFilter) {
+            options.modality_filter = modalityFilter;
+        }
+        if (minSeriesFiles && parseInt(minSeriesFiles) > 0) {
+            options.min_series_files = parseInt(minSeriesFiles);
+        }
+        if (excludeDerived !== false) {
+            options.exclude_derived = true;
+        }
+
         try {
             console.log('发送处理请求:', { accession_number: accessionNumber, options });
-            
+
             const response = await fetch('/api/process/single', {
                 method: 'POST',
                 headers: {
@@ -907,16 +1208,24 @@ class DICOMProcessor {
 
             const data = await response.json();
             console.log('处理响应:', data);
-            
+
             if (response.ok) {
-                this.currentTask = { 
-                    id: data.task_id, 
+                const isQueued = data.status === 'queued';
+                this.currentTask = {
+                    id: data.task_id,
                     type: 'single',
-                    status: 'running'
+                    status: isQueued ? 'pending' : 'running'
                 };
                 this.showProgressCard();
                 this.subscribeToTask(data.task_id);
-                this.showSuccess(this.translations[this.currentLang]['process_started']);
+                if (isQueued) {
+                    this.showSuccess(this.translations[this.currentLang]['process_queued'] || 'Task queued, waiting...');
+                } else {
+                    this.showSuccess(this.translations[this.currentLang]['process_started']);
+                }
+            } else if (response.status === 503) {
+                // 队列满
+                this.showError((data.error || 'Task queue is full') + '. Please try again later.');
             } else {
                 this.showError(data.error || this.translations[this.currentLang]['start_process_failed']);
             }
@@ -956,7 +1265,21 @@ class DICOMProcessor {
 
         this.isProcessing = true;
         const options = this.getProcessingOptions();
-        
+
+        // 添加批量过滤参数
+        const modalityFilter = document.getElementById('batchModalityFilter')?.value?.trim();
+        const minSeriesFiles = document.getElementById('batchMinSeriesFiles')?.value;
+        const excludeDerived = document.getElementById('batchExcludeDerived')?.checked;
+        if (modalityFilter) {
+            options.modality_filter = modalityFilter;
+        }
+        if (minSeriesFiles && parseInt(minSeriesFiles) > 0) {
+            options.min_series_files = parseInt(minSeriesFiles);
+        }
+        if (excludeDerived !== false) {
+            options.exclude_derived = true;
+        }
+
         try {
             const response = await fetch('/api/process/batch', {
                 method: 'POST',
@@ -970,16 +1293,24 @@ class DICOMProcessor {
             });
 
             const data = await response.json();
-            
+
             if (response.ok) {
-                this.currentTask = { 
-                    id: data.task_id, 
+                const isQueued = data.status === 'queued';
+                this.currentTask = {
+                    id: data.task_id,
                     type: 'batch',
-                    status: 'running'
+                    status: isQueued ? 'pending' : 'running'
                 };
                 this.showProgressCard();
                 this.subscribeToTask(data.task_id);
-                this.showSuccess(`${this.translations[this.currentLang]['batch_process_started']} (${accessionNumbers.length})`);
+                if (isQueued) {
+                    this.showSuccess(`${this.translations[this.currentLang]['batch_process_queued'] || 'Batch task queued'} (${accessionNumbers.length})`);
+                } else {
+                    this.showSuccess(`${this.translations[this.currentLang]['batch_process_started']} (${accessionNumbers.length})`);
+                }
+            } else if (response.status === 503) {
+                // 队列满
+                this.showError((data.error || 'Task queue is full') + '. Please try again later.');
             } else {
                 this.showError(data.error || this.translations[this.currentLang]['start_batch_process_failed']);
             }
@@ -1021,16 +1352,24 @@ class DICOMProcessor {
             });
 
             const data = await response.json();
-            
+
             if (response.ok) {
-                this.currentTask = { 
-                    id: data.task_id, 
+                const isQueued = data.status === 'queued';
+                this.currentTask = {
+                    id: data.task_id,
                     type: 'upload',
-                    status: 'running'
+                    status: isQueued ? 'pending' : 'running'
                 };
                 this.showProgressCard();
                 this.subscribeToTask(data.task_id);
-                this.showSuccess(this.translations[this.currentLang]['upload_process_started']);
+                if (isQueued) {
+                    this.showSuccess(this.translations[this.currentLang]['upload_process_queued'] || 'Upload task queued, waiting...');
+                } else {
+                    this.showSuccess(this.translations[this.currentLang]['upload_process_started']);
+                }
+            } else if (response.status === 503) {
+                // 队列满
+                this.showError((data.error || 'Task queue is full') + '. Please try again later.');
             } else {
                 this.showError(data.error || this.translations[this.currentLang]['start_upload_failed']);
             }
@@ -1097,6 +1436,14 @@ class DICOMProcessor {
         }
     }
 
+    // 隐藏并清空进度/结果卡片（切换 tab 时调用）
+    clearProgressAndResult() {
+        const progressCard = document.getElementById('progressCard');
+        const resultCard   = document.getElementById('resultCard');
+        if (progressCard) progressCard.style.display = 'none';
+        if (resultCard)   resultCard.style.display   = 'none';
+    }
+
     // 显示进度卡片
     showProgressCard() {
         document.getElementById('progressCard').style.display = 'block';
@@ -1158,27 +1505,29 @@ class DICOMProcessor {
         const statusElement = document.getElementById('currentStatus');
         if (!statusElement) return;
 
+        const t = this.translations[this.currentLang] || this.translations.en;
+
         let statusText, statusClass;
         
         switch (status) {
             case 'running':
-                statusText = '处理中...';
+                statusText = t.status_running;
                 statusClass = 'bg-primary';
                 break;
             case 'completed':
-                statusText = '已完成';
+                statusText = t.status_completed;
                 statusClass = 'bg-success';
                 break;
             case 'failed':
-                statusText = '处理失败';
+                statusText = t.status_failed;
                 statusClass = 'bg-danger';
                 break;
             case 'cancelled':
-                statusText = '已取消';
+                statusText = t.status_cancelled;
                 statusClass = 'bg-warning';
                 break;
             default:
-                statusText = '未知状态';
+                statusText = t.status_unknown;
                 statusClass = 'bg-secondary';
         }
 
@@ -1250,7 +1599,12 @@ class DICOMProcessor {
 
     // 处理任务完成
     async handleTaskCompleted() {
-        this.showSuccess('处理完成！');
+        if (this.isHandlingTaskCompletion) {
+            return;
+        }
+
+        this.isHandlingTaskCompletion = true;
+        this.showSuccess(this.translations[this.currentLang]['task_completed_message']);
         
         // 隐藏取消按钮
         this.hideCancelButton();
@@ -1265,14 +1619,17 @@ class DICOMProcessor {
             }
         } catch (error) {
             console.error('获取任务结果失败:', error);
+        } finally {
+            this.currentTask = null;
+            this.isHandlingTaskCompletion = false;
         }
-
-        this.currentTask = null;
     }
 
     // 处理任务失败
     handleTaskFailed(status) {
-        const message = status === 'cancelled' ? '任务已取消' : '处理失败，请检查日志信息';
+        const message = status === 'cancelled'
+            ? this.translations[this.currentLang]['task_cancelled']
+            : this.translations[this.currentLang]['task_failed_message'];
         this.showError(message);
         
         // 隐藏取消按钮
@@ -1304,6 +1661,11 @@ class DICOMProcessor {
         resultCard.style.display = 'block';
         resultCard.classList.add('fade-in');
         
+        // 如果是批量处理结果，初始化质量分布图表
+        if (this.currentTask.type === 'batch' && window.Chart) {
+            setTimeout(() => this.initBatchReportChart(), 100);
+        }
+        
         // 滚动到结果卡片
         resultCard.scrollIntoView({ 
             behavior: 'smooth', 
@@ -1318,7 +1680,17 @@ class DICOMProcessor {
             result_zip: Boolean(result && result.result_zip),
             total_processed: Number((result && result.total_processed) || 0),
             total_failed: Number((result && result.total_failed) || 0),
-            series_count: Number((result && result.series_count) || 0)
+            series_count: Number((result && result.series_count) || 0),
+            total_series: Number((result && result.total_series) || 0),
+            total_images: Number((result && result.total_images) || 0),
+            duration: Number((result && result.duration) || 0),
+            avg_speed: Number((result && result.avg_speed) || 0),
+            quality_distribution: {
+                normal: Number((result && result.quality_distribution && result.quality_distribution.normal) || 0),
+                low_quality: Number((result && result.quality_distribution && result.quality_distribution.low_quality) || 0),
+                fixed: Number((result && result.quality_distribution && result.quality_distribution.fixed) || 0),
+                unknown: Number((result && result.quality_distribution && result.quality_distribution.unknown) || 0)
+            }
         };
 
         if (result && result.series_info && typeof result.series_info === 'object') {
@@ -1380,39 +1752,169 @@ class DICOMProcessor {
 
     // 渲染批量处理结果
     renderBatchResult(result) {
+        const total = (result.total_processed || 0) + (result.total_failed || 0);
+        const successRate = total > 0 ? ((result.total_processed || 0) / total * 100).toFixed(1) : 0;
+        const duration = Number(result.duration || 0);
+        const avgSpeed = Number(result.avg_speed || 0);
+        const minutes = Math.floor(duration / 60);
+        const seconds = Math.floor(duration % 60);
+        const durationStr = minutes > 0 ? `${minutes}分${seconds}秒` : `${seconds}秒`;
+        
+        // 质量分布数据
+        const qualityDist = result.quality_distribution || { normal: 0, low_quality: 0, fixed: 0, unknown: 0 };
+        const totalQuality = qualityDist.normal + qualityDist.low_quality + qualityDist.fixed + qualityDist.unknown;
+        
+        // 生成唯一的canvas ID
+        const chartId = `qualityChart_${this.currentTask ? this.currentTask.id : Date.now()}`;
+        
+        // 存储质量数据用于后续图表初始化
+        this._batchQualityData = qualityDist;
+        this._batchChartId = chartId;
+        
         return `
-            <div class="row">
-                <div class="col-md-4">
-                    <div class="result-stat">
-                        <div class="number text-success">${result.total_processed || 0}</div>
-                        <div class="label">成功处理</div>
+            <div class="batch-report" id="batchReport_${chartId}">
+                <!-- 统计概览 -->
+                <div class="row mb-4">
+                    <div class="col-12">
+                        <h6 class="text-primary mb-3"><i class="fas fa-chart-bar"></i> 处理统计概览</h6>
+                    </div>
+                    <div class="col-6 col-md-3 mb-2">
+                        <div class="result-stat">
+                            <div class="number text-success">${result.total_processed || 0}</div>
+                            <div class="label">成功研究</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3 mb-2">
+                        <div class="result-stat">
+                            <div class="number text-danger">${result.total_failed || 0}</div>
+                            <div class="label">失败研究</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3 mb-2">
+                        <div class="result-stat">
+                            <div class="number text-info">${result.total_series || 0}</div>
+                            <div class="label">总序列数</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3 mb-2">
+                        <div class="result-stat">
+                            <div class="number text-primary">${result.total_images || 0}</div>
+                            <div class="label">总图像数</div>
+                        </div>
                     </div>
                 </div>
-                <div class="col-md-4">
-                    <div class="result-stat">
-                        <div class="number text-danger">${result.total_failed || 0}</div>
-                        <div class="label">处理失败</div>
+                
+                <!-- 时间和速度 -->
+                <div class="row mb-4">
+                    <div class="col-12">
+                        <div class="card bg-light">
+                            <div class="card-body py-2">
+                                <div class="row text-center">
+                                    <div class="col-4">
+                                        <small class="text-muted">处理时长</small>
+                                        <div class="fw-bold">${durationStr}</div>
+                                    </div>
+                                    <div class="col-4">
+                                        <small class="text-muted">成功率</small>
+                                        <div class="fw-bold text-${successRate >= 90 ? 'success' : successRate >= 70 ? 'warning' : 'danger'}">${successRate}%</div>
+                                    </div>
+                                    <div class="col-4">
+                                        <small class="text-muted">平均速度</small>
+                                        <div class="fw-bold">${avgSpeed.toFixed(1)} 张/秒</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
-                <div class="col-md-4">
-                    <div class="result-stat">
-                        <div class="number">${(result.total_processed || 0) + (result.total_failed || 0)}</div>
-                        <div class="label">总数</div>
+                
+                <!-- 质量分布图表 -->
+                ${totalQuality > 0 ? `
+                <div class="row mb-4">
+                    <div class="col-md-6">
+                        <h6 class="text-primary mb-3"><i class="fas fa-chart-pie"></i> 质量分布</h6>
+                        <div style="max-width: 250px; margin: 0 auto;">
+                            <canvas id="${chartId}" data-quality='${JSON.stringify(qualityDist)}'></canvas>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <h6 class="text-primary mb-3"><i class="fas fa-list"></i> 质量详情</h6>
+                        <ul class="list-group list-group-flush">
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                                <span><i class="fas fa-check-circle text-success"></i> 正常质量</span>
+                                <span class="badge bg-success rounded-pill">${qualityDist.normal}</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                                <span><i class="fas fa-exclamation-circle text-warning"></i> 低质量</span>
+                                <span class="badge bg-warning rounded-pill">${qualityDist.low_quality}</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                                <span><i class="fas fa-wrench text-info"></i> 已修复</span>
+                                <span class="badge bg-info rounded-pill">${qualityDist.fixed}</span>
+                            </li>
+                            ${qualityDist.unknown > 0 ? `
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                                <span><i class="fas fa-question-circle text-secondary"></i> 未检测</span>
+                                <span class="badge bg-secondary rounded-pill">${qualityDist.unknown}</span>
+                            </li>
+                            ` : ''}
+                        </ul>
                     </div>
                 </div>
-            </div>
-            <div class="mt-3">
-                <h6><i class="fas fa-download text-success"></i> 下载批量结果</h6>
-                <div class="d-grid">
-                    ${result.result_zip ? `
-                        <a href="/api/download/${this.currentTask.id}/zip" 
-                           class="btn btn-primary">
-                            <i class="fas fa-file-archive"></i> 下载批量结果ZIP
-                        </a>
-                    ` : ''}
+                ` : ''}
+                
+                <!-- 下载按钮 -->
+                <div class="mt-3">
+                    <h6 class="text-success mb-3"><i class="fas fa-download"></i> 下载批量结果</h6>
+                    <div class="d-grid">
+                        ${result.result_zip ? `
+                            <a href="/api/download/${this.currentTask.id}/zip" 
+                               class="btn btn-primary">
+                                <i class="fas fa-file-archive"></i> 下载批量结果ZIP
+                            </a>
+                        ` : ''}
+                    </div>
                 </div>
             </div>
         `;
+    }
+
+    // 初始化批量报告图表（在结果渲染后调用）
+    initBatchReportChart() {
+        if (!this._batchChartId || !this._batchQualityData) return;
+        
+        const canvas = document.getElementById(this._batchChartId);
+        if (!canvas || !window.Chart) return;
+        
+        const qualityDist = this._batchQualityData;
+        
+        new Chart(canvas, {
+            type: 'pie',
+            data: {
+                labels: ['正常', '低质量', '已修复', '未检测'],
+                datasets: [{
+                    data: [qualityDist.normal, qualityDist.low_quality, qualityDist.fixed, qualityDist.unknown],
+                    backgroundColor: ['#198754', '#ffc107', '#0dcaf0', '#6c757d'],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            boxWidth: 12,
+                            font: { size: 11 }
+                        }
+                    }
+                }
+            }
+        });
+        
+        // 清理
+        this._batchChartId = null;
+        this._batchQualityData = null;
     }
 
     // 渲染上传文件结果
@@ -1531,13 +2033,29 @@ class DICOMProcessor {
     // 显示成功消息
     showSuccess(message) {
         document.getElementById('successMessage').textContent = message;
-        new bootstrap.Modal(document.getElementById('successModal')).show();
+        if (!this.successModal) {
+            const successModalEl = document.getElementById('successModal');
+            if (successModalEl) {
+                this.successModal = bootstrap.Modal.getOrCreateInstance(successModalEl);
+            }
+        }
+        if (this.successModal) {
+            this.successModal.show();
+        }
     }
 
     // 显示错误消息
     showError(message) {
         document.getElementById('errorMessage').textContent = message;
-        new bootstrap.Modal(document.getElementById('errorModal')).show();
+        if (!this.errorModal) {
+            const errorModalEl = document.getElementById('errorModal');
+            if (errorModalEl) {
+                this.errorModal = bootstrap.Modal.getOrCreateInstance(errorModalEl);
+            }
+        }
+        if (this.errorModal) {
+            this.errorModal.show();
+        }
     }
 
     // HTML转义
@@ -1545,6 +2063,309 @@ class DICOMProcessor {
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // ==================== 监控页面功能 ====================
+
+    // 加载监控数据
+    async loadMonitoringData() {
+        try {
+            const response = await fetch('/api/system/monitoring');
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            const data = await response.json();
+            this.updateMonitoringUI(data);
+
+            // 更新最后更新时间
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString();
+            const lastUpdateEl = document.getElementById('lastUpdateTime');
+            if (lastUpdateEl) {
+                lastUpdateEl.textContent = timeStr;
+            }
+        } catch (error) {
+            console.error('加载监控数据失败:', error);
+        }
+    }
+
+    // 更新监控页面UI
+    updateMonitoringUI(data) {
+        const t = this.translations[this.currentLang];
+
+        // 更新磁盘使用
+        if (data.disk && !data.disk.error) {
+            const diskPercent = data.disk.percent_used || 0;
+            const diskBar = document.getElementById('diskProgressBar');
+            if (diskBar) {
+                diskBar.style.width = `${diskPercent}%`;
+                diskBar.className = `progress-bar ${diskPercent > 90 ? 'bg-danger' : diskPercent > 70 ? 'bg-warning' : 'bg-primary'}`;
+            }
+            const diskUsedEl = document.getElementById('diskUsed');
+            if (diskUsedEl) diskUsedEl.textContent = data.disk.used_gb || '--';
+            const diskTotalEl = document.getElementById('diskTotal');
+            if (diskTotalEl) diskTotalEl.textContent = data.disk.total_gb || '--';
+            const diskFreeEl = document.getElementById('diskFree');
+            if (diskFreeEl) diskFreeEl.textContent = `${t['available'] || 'Free'}: ${data.disk.free_gb || '--'} GB`;
+        }
+
+        // 更新内存使用
+        if (data.memory && !data.memory.error) {
+            const memPercent = data.memory.percent_used || 0;
+            const memBar = document.getElementById('memoryProgressBar');
+            if (memBar) {
+                memBar.style.width = `${memPercent}%`;
+            }
+            const memUsedEl = document.getElementById('memoryUsed');
+            if (memUsedEl) memUsedEl.textContent = memPercent;
+            const memAvailableEl = document.getElementById('memoryAvailable');
+            if (memAvailableEl) memAvailableEl.textContent = data.memory.available_gb || '--';
+        }
+
+        // 更新CPU使用
+        if (data.cpu && !data.cpu.error) {
+            const cpuPercentEl = document.getElementById('cpuPercent');
+            if (cpuPercentEl) cpuPercentEl.textContent = `${data.cpu.percent || '--'}%`;
+            const cpuCoresEl = document.getElementById('cpuCores');
+            if (cpuCoresEl) cpuCoresEl.textContent = data.cpu.count || '--';
+        }
+
+        // 更新PACS状态
+        if (data.pacs_connection) {
+            const pacsBadge = document.getElementById('pacsStatusBadge');
+            if (pacsBadge) {
+                if (data.pacs_connection.connected) {
+                    pacsBadge.innerHTML = `<span class="badge bg-success"><i class="fas fa-check"></i> ${t['normal'] || 'Normal'}</span>`;
+                } else {
+                    pacsBadge.innerHTML = `<span class="badge bg-danger"><i class="fas fa-times"></i> ${t['error'] || 'Error'}</span>`;
+                }
+            }
+            const pacsSummary = document.getElementById('pacsConfigSummary');
+            if (pacsSummary && data.pacs_connection.config) {
+                const cfg = data.pacs_connection.config;
+                pacsSummary.textContent = `${cfg.called_aet} @ ${cfg.pacs_ip}:${cfg.pacs_port}`;
+            }
+        }
+
+        // 更新任务统计
+        if (data.task_summary) {
+            const statTotal = document.getElementById('statTotal');
+            if (statTotal) statTotal.textContent = data.task_summary.total || 0;
+            const statRunning = document.getElementById('statRunning');
+            if (statRunning) statRunning.textContent = data.task_summary.running || 0;
+            const statPending = document.getElementById('statPending');
+            if (statPending) statPending.textContent = data.task_summary.pending || 0;
+            const statCompleted = document.getElementById('statCompleted');
+            if (statCompleted) statCompleted.textContent = data.task_summary.completed || 0;
+            const statFailed = document.getElementById('statFailed');
+            if (statFailed) statFailed.textContent = data.task_summary.failed || 0;
+            const statCancelled = document.getElementById('statCancelled');
+            if (statCancelled) statCancelled.textContent = data.task_summary.cancelled || 0;
+        }
+
+        // 更新活跃任务列表
+        this.updateActiveTasksTable(data.active_tasks || [], t);
+
+        // 更新目录使用
+        this.updateDirectoryUsage(data.directories || {}, t);
+
+        // 更新近期完成任务
+        this.updateRecentCompletedTable(data.recent_completed || [], t);
+
+        // 更新日志文件列表
+        this.updateLogFilesTable(data.log_files || [], t);
+    }
+
+    // 更新活跃任务表格
+    updateActiveTasksTable(tasks, t) {
+        const tbody = document.getElementById('activeTasksBody');
+        if (!tbody) return;
+
+        if (tasks.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted">${t['no_active_tasks'] || 'No active tasks'}</td></tr>`;
+            return;
+        }
+
+        tbody.innerHTML = tasks.map(task => {
+            const elapsed = task.elapsed_seconds ? this.formatElapsedTime(task.elapsed_seconds) : '--';
+            const progressBar = `
+                <div class="progress" style="height: 6px;">
+                    <div class="progress-bar" role="progressbar" style="width: ${task.progress || 0}%"></div>
+                </div>
+                <small>${task.progress || 0}%</small>
+            `;
+            const statusBadge = task.status === 'running'
+                ? '<span class="badge bg-primary">Running</span>'
+                : '<span class="badge bg-warning">Pending</span>';
+
+            let taskInfo = '';
+            if (task.type === 'single' && task.parameters.accession_number) {
+                taskInfo = `<small class="text-muted">${this.escapeHtml(task.parameters.accession_number)}</small>`;
+            } else if (task.type === 'batch' && task.parameters.batch_count) {
+                taskInfo = `<small class="text-muted">${task.parameters.batch_count} items</small>`;
+            }
+
+            return `
+                <tr>
+                    <td><small>${task.task_id.substring(0, 8)}...</small></td>
+                    <td>${task.type}${taskInfo ? '<br>' + taskInfo : ''}</td>
+                    <td>${statusBadge}</td>
+                    <td>${progressBar}</td>
+                    <td><small>${this.escapeHtml(task.current_step || '--')}</small></td>
+                    <td><small>${elapsed}</small></td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-danger" onclick="cancelTaskById('${task.task_id}')">
+                            <i class="fas fa-stop"></i> ${t['cancel'] || 'Cancel'}
+                        </button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    // 更新目录使用显示
+    updateDirectoryUsage(directories, t) {
+        const container = document.getElementById('directoryUsageContainer');
+        if (!container) return;
+
+        const dirNames = {
+            'results': { icon: 'fa-folder', color: 'primary', label: 'Results' },
+            'uploads': { icon: 'fa-upload', color: 'info', label: 'Uploads' },
+            'temp': { icon: 'fa-temp', color: 'warning', label: 'Temp' },
+            'logs': { icon: 'fa-file-alt', color: 'secondary', label: 'Logs' }
+        };
+
+        let html = '';
+        for (const [key, info] of Object.entries(directories)) {
+            const config = dirNames[key] || { icon: 'fa-folder', color: 'secondary', label: key };
+            html += `
+                <div class="col-md-3 col-sm-6 mb-3">
+                    <div class="d-flex align-items-center">
+                        <i class="fas ${config.icon} fa-2x text-${config.color} me-2"></i>
+                        <div>
+                            <div class="small text-muted">${config.label}</div>
+                            <div class="fw-bold">${info.size_gb} GB</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        container.innerHTML = html || `<div class="col-12 text-muted text-center">${t['no_data'] || 'No data'}</div>`;
+    }
+
+    // 更新近期完成任务表格
+    updateRecentCompletedTable(tasks, t) {
+        const tbody = document.getElementById('recentCompletedBody');
+        if (!tbody) return;
+
+        if (tasks.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">${t['no_recent_tasks'] || 'No recent tasks'}</td></tr>`;
+            return;
+        }
+
+        const statusColors = {
+            'completed': 'success',
+            'failed': 'danger',
+            'cancelled': 'secondary'
+        };
+
+        tbody.innerHTML = tasks.map(task => {
+            const statusColor = statusColors[task.status] || 'secondary';
+            const duration = task.elapsed_seconds ? this.formatElapsedTime(task.elapsed_seconds) : '--';
+
+            return `
+                <tr>
+                    <td><small>${task.task_id.substring(0, 8)}...</small></td>
+                    <td>${task.type}</td>
+                    <td><span class="badge bg-${statusColor}">${task.status}</span></td>
+                    <td>${duration}</td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    // 更新日志文件列表
+    updateLogFilesTable(logFiles, t) {
+        const tbody = document.getElementById('logFilesBody');
+        if (!tbody) return;
+
+        if (logFiles.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">${t['no_log_files'] || 'No log files'}</td></tr>`;
+            return;
+        }
+
+        tbody.innerHTML = logFiles.map(log => {
+            const modifiedDate = new Date(log.modified * 1000).toLocaleString();
+            return `
+                <tr>
+                    <td><small>${this.escapeHtml(log.name)}</small></td>
+                    <td><small>${log.size_mb} MB</small></td>
+                    <td><small>${modifiedDate}</small></td>
+                    <td>
+                        <a href="/api/logs/download/${encodeURIComponent(log.name)}" class="btn btn-sm btn-outline-primary" download>
+                            <i class="fas fa-download"></i> ${t['download_log'] || 'Download'}
+                        </a>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    // 格式化已运行时间
+    formatElapsedTime(seconds) {
+        if (seconds < 60) {
+            return `${Math.floor(seconds)}s`;
+        } else if (seconds < 3600) {
+            return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+        } else {
+            const hours = Math.floor(seconds / 3600);
+            const mins = Math.floor((seconds % 3600) / 60);
+            return `${hours}h ${mins}m`;
+        }
+    }
+
+    // 切换自动刷新
+    toggleAutoRefresh() {
+        if (this.monitoringAutoRefreshInterval) {
+            clearInterval(this.monitoringAutoRefreshInterval);
+            this.monitoringAutoRefreshInterval = null;
+            const icon = document.getElementById('autoRefreshIcon');
+            const text = document.getElementById('autoRefreshText');
+            if (icon) icon.className = 'fas fa-play';
+            if (text) text.textContent = this.translations[this.currentLang]['auto_refresh'] || 'Auto';
+        } else {
+            this.loadMonitoringData();
+            this.monitoringAutoRefreshInterval = setInterval(() => {
+                this.loadMonitoringData();
+            }, 5000);
+            const icon = document.getElementById('autoRefreshIcon');
+            const text = document.getElementById('autoRefreshText');
+            if (icon) icon.className = 'fas fa-pause';
+            if (text) text.textContent = this.translations[this.currentLang]['stop_auto_refresh'] || 'Stop';
+        }
+    }
+
+    // 取消指定任务
+    async cancelTaskById(taskId) {
+        const t = this.translations[this.currentLang];
+        if (confirm(t['confirm_cancel_task'] || 'Are you sure you want to cancel this task?')) {
+            try {
+                const response = await fetch(`/api/task/${taskId}/cancel`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    this.showSuccess(t['task_cancelled'] || 'Task cancelled');
+                    this.loadMonitoringData();
+                } else {
+                    const data = await response.json();
+                    this.showError(data.error || t['cancel_task_failed'] || 'Failed to cancel task');
+                }
+            } catch (error) {
+                this.showError((t['network_error'] || 'Network error: ') + error.message);
+            }
+        }
     }
 }
 
@@ -1593,4 +2414,8 @@ function resetAllOptions() {
 
 function exportSettings() {
     processor.exportSettings();
+}
+
+function cancelTaskById(taskId) {
+    processor.cancelTaskById(taskId);
 }

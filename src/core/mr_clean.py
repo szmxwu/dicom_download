@@ -11,6 +11,8 @@ MRI 数据清洗与智能分类模块
 - 动态增强时相分析
 """
 
+from typing import Optional, Dict
+
 import pandas as pd
 import numpy as np
 import ast
@@ -29,7 +31,7 @@ DEFAULT_CONFIG_PATH = os.path.join(
 )
 
 
-def load_mr_clean_config(config_path: str | None = None) -> dict:
+def load_mr_clean_config(config_path: Optional[str] = None) -> Dict:
     """
     加载 MR_clean 规则配置
 
@@ -46,7 +48,7 @@ def load_mr_clean_config(config_path: str | None = None) -> dict:
         return json.load(f)
 
 
-def _get_cfg(cfg: dict | None, config_path: str | None = None) -> dict:
+def _get_cfg(cfg: Optional[Dict], config_path: Optional[str] = None) -> Dict:
     return cfg if cfg is not None else load_mr_clean_config(config_path)
 
 # ==============================================================================
@@ -771,7 +773,7 @@ def propagate_enhancement_status(df, cfg: dict, progress_callback=None):
 # ==============================================================================
 
 
-def process_mri_dataframe(df, cfg: dict | None = None, config_path: str | None = None, progress_callback=None):
+def process_mri_dataframe(df, cfg: Optional[Dict] = None, config_path: Optional[str] = None, progress_callback=None):
     """
     对包含MRI序列信息的DataFrame执行完整的分类流程。
     """
