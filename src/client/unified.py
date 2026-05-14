@@ -131,12 +131,14 @@ class AssociationManager:
 class QueueWatchdog:
     """P2: 队列看门狗，防止死锁"""
 
-    def __init__(self, queue: Queue, timeout: float = 300.0):
+    def __init__(self, queue: Queue, timeout: float = 300.0, max_alerts: int = 3):
         self.queue = queue
         self.timeout = timeout
         self.last_activity = time.time()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._monitor, daemon=True)
+        self._alert_count = 0
+        self._max_alerts = max_alerts
 
     def start(self):
         self._thread.start()
@@ -152,12 +154,25 @@ class QueueWatchdog:
         while not self._stop_event.is_set():
             time.sleep(5.0)
             if time.time() - self.last_activity > self.timeout:
-                logger.error(f"Queue watchdog: No activity for {self.timeout}s, potential deadlock detected")
+                # 队列为空是正常空闲（workflow 结束或尚未开始），不是死锁
+                if self.queue.empty():
+                    self.last_activity = time.time()
+                    continue
+                self._alert_count += 1
+                if self._alert_count > self._max_alerts:
+                    logger.warning(f"Queue watchdog: Max alerts ({self._max_alerts}) reached, stopping monitor")
+                    break
+                logger.error(
+                    f"Queue watchdog: No activity for {self.timeout}s, "
+                    f"potential deadlock detected (alert {self._alert_count}/{self._max_alerts})"
+                )
                 # 放入哨兵值来唤醒可能阻塞的 worker
                 try:
                     self.queue.put(None, timeout=1.0)
                 except:
                     pass
+                # 重置活动时间，避免同一死锁状态被无限重复报告
+                self.last_activity = time.time()
 
 
 def compute_file_checksum(filepath: str, algorithm: str = 'md5') -> Optional[str]:
@@ -1718,28 +1733,28 @@ class DICOMDownloadClient:
             # P0: 原地处理 - 不再创建 organized 子目录
             # P2: 启动看门狗
             watchdog.start()
+            try:
+                download_thread = threading.Thread(target=_download_worker, daemon=True)
+                # spawn multiple organizers
+                organizer_threads = []
+                for _ in range(num_converters):
+                    t = threading.Thread(target=_organize_worker, args=(output_format,), daemon=True)
+                    t.start()
+                    organizer_threads.append(t)
 
-            download_thread = threading.Thread(target=_download_worker, daemon=True)
-            # spawn multiple organizers
-            organizer_threads = []
-            for _ in range(num_converters):
-                t = threading.Thread(target=_organize_worker, args=(output_format,), daemon=True)
-                t.start()
-                organizer_threads.append(t)
+                download_thread.start()
 
-            download_thread.start()
-
-            # 等待下载完成
-            download_thread.join()
-            # 通知整理线程退出（放入与 worker 数相同的哨兵）
-            for _ in range(len(organizer_threads)):
-                series_queue.put(None)
-            series_queue.join()
-            for t in organizer_threads:
-                t.join()
-
-            # P2: 停止看门狗
-            watchdog.stop()
+                # 等待下载完成
+                download_thread.join()
+                # 通知整理线程退出（放入与 worker 数相同的哨兵）
+                for _ in range(len(organizer_threads)):
+                    series_queue.put(None)
+                series_queue.join()
+                for t in organizer_threads:
+                    t.join()
+            finally:
+                # P2: 停止看门狗（确保异常时也能停止，避免线程泄漏）
+                watchdog.stop()
 
             download_dir = download_dir_holder['path']
             if not download_dir:
