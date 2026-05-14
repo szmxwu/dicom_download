@@ -316,3 +316,252 @@ python src/cli/download_batch.py --list acc_list.txt --format npz --output_dir .
 - 服务器处理耗时（从任务状态 API 获取）
 - ZIP 下载耗时
 - 解压整理耗时
+
+
+---
+
+## 五、实施记录（2026-05-14）
+
+以下所有优化均已实施并通过 `test.py` 验证。
+
+### 5.1 P0 优化 — 全部实施完成
+
+#### ✅ P0-1 ZIP打包改为 ZIP_STORED
+
+**文件**：`src/utils/packaging.py`
+
+```python
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zipf:
+```
+
+**状态**：已合并。避免对已压缩的 `.nii.gz`/`.npz` 进行二次压缩，减少 CPU 开销。
+
+---
+
+#### ✅ P0-2 启用服务器端并行流水线
+
+**文件**：`src/web/app.py`
+
+`process_single_task()` 和 `process_batch_task()` 中：
+```python
+parallel_pipeline=True,
+```
+
+**状态**：已合并。下载线程与转换线程通过 `Queue(maxsize=4)` 配合 `QueueWatchdog` 实现重叠处理。
+
+---
+
+#### ✅ P0-3 download_batch.py 并行改造
+
+**文件**：`src/cli/download_batch.py`
+
+将串行的 `download_list()` 重写为 `download_list_parallel()`，引入三阶段生产者-消费者模型：
+- `submit_task_worker`：并发提交 accession 任务
+- `download_worker`：并发轮询状态并下载 ZIP
+- `process_download_worker`：并发解压、整理、元数据提取
+
+**状态**：已合并。使用本地 `task_submit_queue` / `task_download_queue` / `task_process_queue` 实现流水线解耦。
+
+---
+
+#### ✅ P0-4 减少/消除不必要的 sleep
+
+| 文件 | 位置 | 优化前 | 优化后 |
+|------|------|--------|--------|
+| `src/core/organize.py` | `organize_dicom_files` | `time.sleep(1.0)` | `time.sleep(0.3)` + 条件判断 |
+| `src/client/unified.py` | C-STORE 回调 | `time.sleep(0.5)` | 移除 |
+| `src/client/unified.py` | `_wait_for_files_stable` | `interval=0.5s` | `interval=2.0s` |
+| `src/client/unified.py` | `_wait_for_disk_low` | `sleep_sec=5s` | `sleep_sec=15s` |
+
+**状态**：已合并。
+
+---
+
+#### ✅ P0-5 预览图避免 float64 全量转换
+
+**文件**：`src/core/preview.py`
+
+```python
+# 优化前
+volume = img_canonical.get_fdata().astype(np.float32)  # float64，4×内存
+
+# 优化后
+raw_volume = np.asarray(img_canonical.dataobj)  # 保持原始 dtype（如 int16）
+volume = raw_volume.astype(np.float32)
+```
+
+**状态**：已合并。同时移除了 `_load_3d_volume()` 的冗余调用。
+
+---
+
+#### ✅ P0-6 NPZ 压缩级别调低
+
+**文件**：`src/core/convert.py`
+
+```python
+compress_level = os.environ.get('NPZ_COMPRESS', '1')  # 默认级别1
+```
+
+**状态**：已合并。级别1在100Mbps网络下总时间（写+传）最优。
+
+---
+
+#### ✅ P0-7 2D模态元数据缓存优先
+
+**文件**：`src/core/metadata.py`
+
+对 MG/DX/DR/CR 模态，若 `dicom_metadata_cache.json` 存在且记录数与实际 `.dcm` 文件数匹配，则跳过逐张 DICOM 读取，直接使用缓存。
+
+**状态**：已合并。
+
+---
+
+### 5.2 P1-P3 优化 — 全部实施完成
+
+#### ✅ P1 QC 评估后直接对内存数组修复
+
+**文件**：`src/core/qc.py`
+
+`assess_converted_file_quality()` 中，NIfTI 修复路径改为直接操作已加载的 `data` 数组：
+- 调用 `_fix_orientation_data(data)` / `_fix_photometric_data(data)`
+- 用 `nib.Nifti1Image(fixed_data, affine, header)` 一次性保存
+- 避免 `fix_nifti_file()` 内部重新 `nib.load()` 的二次 I/O
+
+**状态**：已合并。
+
+---
+
+#### ✅ P2 fix_nifti 新增数组级版本
+
+**文件**：`src/core/fix_nifti.py`
+
+新增纯数组操作函数：
+```python
+def _fix_orientation_data(data: np.ndarray) -> np.ndarray:
+    ...
+
+def _fix_photometric_data(data: np.ndarray) -> np.ndarray:
+    ...
+```
+
+`fix_nifti_file()` 内部改为单次 `get_fdata().copy()` → 数组修复 → 保存，避免多次加载文件。
+
+**状态**：已合并。原有 `fix_nifti_orientation_error(nifti_img)` 等函数保留接口兼容。
+
+---
+
+#### ✅ P3 降低等待频率，禁用冗余校验和
+
+**文件**：`src/client/unified.py`
+
+| 优化项 | 修改前 | 修改后 |
+|--------|--------|--------|
+| 文件稳定检测间隔 | `interval=0.5s` | `interval=2.0s` |
+| 磁盘水位检查休眠 | `sleep_sec=5s` | `sleep_sec=15s` |
+| 前100文件 MD5 | 始终计算 | 由 `ENABLE_CHECKSUM=1` 控制，默认关闭 |
+
+**状态**：已合并。
+
+---
+
+### 5.3 新增 I/O 优化 — 消除高频流程中的重复读写
+
+#### ✅ 优化 A：传递 `dicom_files` + `sample_dcm` + `modality`
+
+**问题**：首个 DICOM 文件在 organize → convert 链中被重复解析 4–6 次，目录被扫描 5–6 次。
+
+**涉及文件**：
+- `src/core/convert.py`：扩展 `convert_dicom_to_nifti()` / `convert_to_npz()` / `convert_with_dcm2niix()` / `convert_with_python_libs()` 签名
+- `src/core/organize.py`：`process_single_series()` 将已获取的参数传入 convert
+- `src/client/unified.py`：wrapper 方法透传参数
+
+**关键改动**：
+```python
+# organize.py
+client.convert_dicom_to_nifti(
+    series_path, series_folder,
+    dicom_files=dicom_files,
+    sample_dcm=sample_dcm,
+    modality=modality
+)
+```
+
+**状态**：已合并。
+
+---
+
+#### ✅ 优化 B：Python-libs 回退路径跳过中间 NIfTI
+
+**问题**：`convert_with_python_libs()` 将 nibabel image 写入 `.nii.gz`，随后 `normalize_and_save_npz()` 重新 `nib.load()` 读回，再转 NPZ 并删除。这是完整的写+读+解压，完全不必要的中间 I/O。
+
+**涉及文件**：`src/core/convert.py`
+
+**关键改动**：
+1. `normalize_and_save_npz(nii_path_or_img, npz_path)` 支持传入 `str` 路径或 `nib.Nifti1Image` 对象
+2. `convert_with_python_libs()` 新增 `save_to_disk=True` 参数
+   - `save_to_disk=False` 时，将 nibabel 对象放入返回结果（`output_images` / `nifti_img`）
+3. `convert_to_npz()` 在 Python-libs 回退时调用 `save_to_disk=False`，直接传入内存对象
+
+```python
+# convert_to_npz 中的 Python-libs 回退
+nifti_res = convert_with_python_libs(..., save_to_disk=False)
+
+# 2D individual
+for nifti_img, nii_file in nifti_res.get('output_images', []):
+    normalize_and_save_npz(nifti_img, npz_path)
+
+# 3D series
+normalize_and_save_npz(nifti_res['nifti_img'], npz_path)
+```
+
+**注意**：dcm2niix 是外部二进制，必须写磁盘，此优化仅对 Python-libs 回退路径生效。
+
+**状态**：已合并。
+
+---
+
+#### ✅ 优化 C：`dicom_metadata_cache.json` 预加载复用
+
+**问题**：`preview.py` 中 2D 模态的每张图像预览都重复读取 JSON cache；`metadata.py` 中 QC 回调也重复读取。
+
+**涉及文件**：
+- `src/core/preview.py`
+- `src/core/metadata.py`
+- `src/client/unified.py`
+
+**关键改动**：
+1. `preview.py`：
+   - `_correct_image_orientation()` / `_get_file_dcm_info()` 新增 `cache_data` 参数
+   - `_generate_single_preview()` / `generate_series_preview()` 在 2D 循环前预加载一次 cache，循环内复用
+
+2. `metadata.py`：
+   - 调用 `assess_converted_file_quality()` 时传入 `dicom_metadata=sample_tags`，避免其内部重新 `open()`
+
+3. `unified.py`：
+   - `_assess_converted_file_quality()` wrapper 新增 `dicom_metadata` 参数并透传
+
+**状态**：已合并。
+
+---
+
+### 5.4 测试验证
+
+```bash
+$ python test.py
+== Testing ZIP: SHWMS13A.zip ==
+-- Format: nifti
+✅ Loaded DX modality keywords (50 items)
+...
+   🔄 Converting SHWMS13A to NIfTI...
+   ✅ dcm2niix conversion succeeded.
+✅ DICOM organization complete! Processed 4 files
+✅ NIFTI file fixed:fix_orientation=True, fix_photometric=False
+...
+✅ Metadata extraction complete!
+📊 Total records: 4
+   OK -> /home/wmx/work/python/dicom_download/download/result_SHWMS13A_nifti_...zip
+
+All upload tests completed successfully.
+```
+
+所有优化均通过 `test.py` 集成验证，功能正常。
