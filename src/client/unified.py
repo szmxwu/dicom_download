@@ -381,7 +381,7 @@ class DICOMDownloadClient:
                 logger.warning(f"Disk high watermark reached ({current:.2f}GB >= {high}GB). Pausing downloads...")
             except Exception:
                 pass
-            time.sleep(sleep_sec)
+            time.sleep(15)  # P3 优化：从 5s 延长到 15s，减少频繁的目录大小计算
             try:
                 current = self._get_dir_size_gb(directory)
             except Exception:
@@ -738,7 +738,8 @@ class DICOMDownloadClient:
                         return 0xA702
 
                     # P3: 计算并缓存校验和（可选，仅对关键文件）
-                    if len(storage_state['current_series_files']) < 100:  # 只对前100个文件计算校验和
+                    # 通过环境变量 ENABLE_CHECKSUM=1 启用，默认关闭以减少 I/O 开销。
+                    if os.environ.get('ENABLE_CHECKSUM', '0') == '1' and len(storage_state['current_series_files']) < 100:
                         checksum = compute_file_checksum(filepath)
                         if checksum:
                             with self._checksum_lock:
@@ -855,7 +856,7 @@ class DICOMDownloadClient:
                             if error_messages and move_status != 0x0000:
                                 raise RuntimeError(f"C-MOVE failed with status: {error_messages[-1]}")
 
-                            time.sleep(0.5)  # 短暂延迟，让文件写入完成
+                            time.sleep(0.1)  # 短暂延迟，让文件写入完成（C-STORE 回调已同步写入）
 
                             # 通知外部：该Series下载完成
                             if callable(on_series_downloaded):
@@ -1137,8 +1138,12 @@ class DICOMDownloadClient:
         except:
             return False
     
-    def _wait_for_files_stable(self, directory, timeout=30, interval=0.5):
-        """等待目录中的文件大小稳定（不再增长）
+    def _wait_for_files_stable(self, directory, timeout=10, interval=2.0):
+        """等待目录中的文件大小稳定（不再增长）。
+
+        P1 优化：C-STORE 回调是同步写入的，文件在回调返回时已落盘。
+        将检查间隔从 0.5s/3次 放宽到 2.0s/1次，减少 os.walk 开销。
+        对于大目录（数千个 DICOM），60 次 walk → 最多 5 次 walk。
 
         Args:
             directory: 要检查的目录
@@ -1148,7 +1153,7 @@ class DICOMDownloadClient:
         start_time = time.time()
         prev_sizes = {}
         stable_count = 0
-        required_stable_checks = 3  # 需要连续3次检查都稳定
+        required_stable_checks = 1  # 只需要1次稳定即可（C-STORE 已同步写入）
 
         while time.time() - start_time < timeout:
             current_sizes = {}
@@ -1157,7 +1162,7 @@ class DICOMDownloadClient:
             try:
                 for root, dirs, files in os.walk(directory):
                     for file in files:
-                        if file.endswith('.dcm') or file.endswith('.dcm'):
+                        if file.endswith('.dcm'):
                             filepath = os.path.join(root, file)
                             try:
                                 size = os.path.getsize(filepath)
@@ -1169,7 +1174,6 @@ class DICOMDownloadClient:
                 logger.warning(f"   ⚠️ Error checking file sizes: {e}")
                 break
 
-            # 检查文件大小是否稳定
             if current_sizes == prev_sizes and total_files > 0:
                 stable_count += 1
                 if stable_count >= required_stable_checks:
@@ -1226,13 +1230,13 @@ class DICOMDownloadClient:
         """处理单个Series目录：统计、转换（原地处理，不再移动到 organized_dir）。"""
         return process_single_series_impl(self, series_path, series_folder, output_format, min_series_files=min_series_files)
     
-    def convert_dicom_to_nifti(self, series_dir, series_name):
+    def convert_dicom_to_nifti(self, series_dir, series_name, dicom_files=None, sample_dcm=None, modality=None):
         """将DICOM序列转换为NIfTI格式"""
-        return convert_dicom_to_nifti_impl(self, series_dir, series_name)
+        return convert_dicom_to_nifti_impl(self, series_dir, series_name, dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality)
     
-    def _convert_to_npz(self, series_dir, series_name):
+    def _convert_to_npz(self, series_dir, series_name, dicom_files=None, sample_dcm=None, modality=None):
         """将DICOM序列转换为NPZ格式，并按照要求规范化方向"""
-        return convert_to_npz_impl(self, series_dir, series_name)
+        return convert_to_npz_impl(self, series_dir, series_name, dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality)
 
     def _normalize_and_save_npz(self, nii_path, npz_path):
         """加载NIfTI，利用DICOM方向信息规范化并保存为NPZ"""
@@ -1464,14 +1468,15 @@ class DICOMDownloadClient:
         """基于直方图/对比度的简单质检，返回0/1（输入为数组）"""
         return assess_image_quality_from_array_impl(pixel_data)
 
-    def _assess_converted_file_quality(self, filepath, modality=None):
+    def _assess_converted_file_quality(self, filepath, modality=None, dicom_metadata=None):
         """基于转换后的NPZ/NIfTI文件做质检，返回0/1
         
         Args:
             filepath: 文件路径
             modality: 模态代码 (CT, MR, DX, etc.)，可选
+            dicom_metadata: 可选的 DICOM 元数据字典，用于方向错误检测
         """
-        return assess_converted_file_quality_impl(filepath, modality)
+        return assess_converted_file_quality_impl(filepath, modality, dicom_metadata=dicom_metadata)
 
     def _assess_series_quality_converted(self, converted_files, modality=None, series_dir=None):
         """对转换后的序列做QC，<=200全量，>200中间±3抽样
@@ -1771,7 +1776,7 @@ class DICOMDownloadClient:
             else:
                 # 等待文件系统稳定（确保所有下载的文件已完全写入磁盘）
                 logger.info("   ⏳ Waiting for file system to stabilize...")
-                time.sleep(2.0)
+                time.sleep(0.5)
                 # 检查下载目录中的文件状态
                 self._wait_for_files_stable(download_dir)
                 _, series_info = self.organize_dicom_files(download_dir, output_format=output_format, min_series_files=min_series_files)

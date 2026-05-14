@@ -291,7 +291,16 @@ def apply_windowing(image_2d: np.ndarray, dcm, modality: str = None) -> np.ndarr
         np.ndarray: 8位灰度图像数组
     """
     img = image_2d.astype(np.float32)
-    wc, ww = get_window_params(dcm)
+    modality_upper = (modality or '').upper()
+    
+    # MR 模态不使用 DICOM Window 标签，因为 NPZ 数据经过 dcm2niix → NIfTI 转换后
+    # nibabel.get_fdata() 会应用 scl_slope/scl_inter，数值范围可能与原始 DICOM
+    # 像素值不同。DICOM 中的 WindowCenter/WindowWidth 是基于原始像素值的，
+    # 直接套用到 rescale 后的 float 数据会导致窗口严重不匹配，产生二值化效果。
+    # MR 没有标准化物理单位（不像 CT 的 HU），因此使用数据自适应窗口更可靠。
+    use_dicom_window = modality_upper != 'MR'
+    
+    wc, ww = get_window_params(dcm) if use_dicom_window else (None, None)
     
     if wc is not None and ww is not None:
         # 使用 DICOM 标签中的窗宽窗位
@@ -666,7 +675,8 @@ def _correct_image_orientation(
     preview_idx: int,
     is_3d: bool,
     series_dir: str,
-    sample_dcm
+    sample_dcm,
+    cache_data=None
 ) -> np.ndarray:
     """
     校正图像方向（处理行列颠倒的情况）
@@ -681,6 +691,7 @@ def _correct_image_orientation(
         is_3d: 是否为3D图像
         series_dir: 序列目录
         sample_dcm: 样本DICOM对象
+        cache_data: 可选，已加载的缓存字典（避免重复读取 JSON）
         
     Returns:
         校正后的图像
@@ -693,27 +704,28 @@ def _correct_image_orientation(
         cols = None
         
         if not is_3d:
-            cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
-            if os.path.exists(cache_path):
-                try:
-                    with open(cache_path, 'r', encoding='utf-8') as f:
-                        cache = json.load(f)
-                    records = cache.get('records') or []
-                    conversion_map = cache.get('conversion_map') or {}
-                except Exception:
-                    records = []
-                    conversion_map = {}
-
-                if conversion_map:
+            cache = cache_data
+            if cache is None:
+                cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
+                if os.path.exists(cache_path):
                     try:
-                        conv_entry = conversion_map.get(os.path.basename(preview_file))
-                        if isinstance(conv_entry, dict):
-                            rows = conv_entry.get('Rows')
-                            cols = conv_entry.get('Columns')
+                        with open(cache_path, 'r', encoding='utf-8') as f:
+                            cache = json.load(f)
                     except Exception:
-                        pass
+                        cache = None
+            records = (cache.get('records') or []) if cache else []
+            conversion_map = (cache.get('conversion_map') or {}) if cache else {}
 
-                if records and (rows is None or cols is None):
+            if conversion_map:
+                try:
+                    conv_entry = conversion_map.get(os.path.basename(preview_file))
+                    if isinstance(conv_entry, dict):
+                        rows = conv_entry.get('Rows')
+                        cols = conv_entry.get('Columns')
+                except Exception:
+                    pass
+
+            if records and (rows is None or cols is None):
                     basename = os.path.basename(preview_file)
                     match = re.search(r"_(\d{1,6})(?:\.nii(?:\.gz)?|\.npz)$", basename)
                     if match:
@@ -758,7 +770,8 @@ def _get_file_dcm_info(
     preview_file: str,
     preview_idx: int,
     series_dir: str,
-    sample_dcm
+    sample_dcm,
+    cache_data=None
 ):
     """
     获取特定文件对应的DICOM信息
@@ -771,55 +784,60 @@ def _get_file_dcm_info(
         preview_idx: 预览索引
         series_dir: 序列目录
         sample_dcm: 样本DICOM对象（作为fallback）
+        cache_data: 可选，已加载的缓存字典（避免重复读取 JSON）
         
     Returns:
         DICOM对象或包含元数据的字典
     """
     try:
-        cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
-        if os.path.exists(cache_path):
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                cache = json.load(f)
-            conversion_map = cache.get('conversion_map') or {}
+        cache = cache_data
+        if cache is None:
+            cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
+            if os.path.exists(cache_path):
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+            else:
+                cache = {}
+        conversion_map = cache.get('conversion_map') or {}
+        
+        # 尝试从conversion_map获取
+        conv_entry = conversion_map.get(os.path.basename(preview_file))
+        if isinstance(conv_entry, dict):
+            # 创建一个简单对象来保存元数据
+            class DcmInfo:
+                pass
             
-            # 尝试从conversion_map获取
-            conv_entry = conversion_map.get(os.path.basename(preview_file))
-            if isinstance(conv_entry, dict):
-                # 创建一个简单对象来保存元数据
-                class DcmInfo:
-                    pass
-                
-                dcm_info = DcmInfo()
-                # 复制基本属性
-                for attr in ['Rows', 'Columns', 'WindowCenter', 'WindowWidth', 
-                             'PhotometricInterpretation', 'PixelSpacing',
-                             'RescaleSlope', 'RescaleIntercept']:
-                    if attr in conv_entry:
-                        value = conv_entry[attr]
-                        # 尝试转换数值
-                        try:
-                            if attr in ['Rows', 'Columns']:
-                                value = int(value)
-                            elif attr in ['WindowCenter', 'WindowWidth', 'RescaleSlope', 'RescaleIntercept']:
-                                value = float(value)
-                            elif attr == 'PixelSpacing':
-                                # 可能是字符串表示的列表
-                                if isinstance(value, str):
-                                    value = [float(x.strip()) for x in value.strip('[]').split(',')]
-                        except Exception:
-                            pass
-                        setattr(dcm_info, attr, value)
-                
-                # 对于缺失的属性，使用sample_dcm的
-                if sample_dcm is not None:
-                    for attr in ['WindowCenter', 'WindowWidth', 'PhotometricInterpretation',
-                                 'PixelSpacing', 'RescaleSlope', 'RescaleIntercept']:
-                        if not hasattr(dcm_info, attr) or getattr(dcm_info, attr) is None:
-                            val = getattr(sample_dcm, attr, None)
-                            if val is not None:
-                                setattr(dcm_info, attr, val)
-                
-                return dcm_info
+            dcm_info = DcmInfo()
+            # 复制基本属性
+            for attr in ['Rows', 'Columns', 'WindowCenter', 'WindowWidth', 
+                         'PhotometricInterpretation', 'PixelSpacing',
+                         'RescaleSlope', 'RescaleIntercept']:
+                if attr in conv_entry:
+                    value = conv_entry[attr]
+                    # 尝试转换数值
+                    try:
+                        if attr in ['Rows', 'Columns']:
+                            value = int(value)
+                        elif attr in ['WindowCenter', 'WindowWidth', 'RescaleSlope', 'RescaleIntercept']:
+                            value = float(value)
+                        elif attr == 'PixelSpacing':
+                            # 可能是字符串表示的列表
+                            if isinstance(value, str):
+                                value = [float(x.strip()) for x in value.strip('[]').split(',')]
+                    except Exception:
+                        pass
+                    setattr(dcm_info, attr, value)
+            
+            # 对于缺失的属性，使用sample_dcm的
+            if sample_dcm is not None:
+                for attr in ['WindowCenter', 'WindowWidth', 'PhotometricInterpretation',
+                             'PixelSpacing', 'RescaleSlope', 'RescaleIntercept']:
+                    if not hasattr(dcm_info, attr) or getattr(dcm_info, attr) is None:
+                        val = getattr(sample_dcm, attr, None)
+                        if val is not None:
+                            setattr(dcm_info, attr, val)
+            
+            return dcm_info
         
         return sample_dcm
     except Exception:
@@ -835,7 +853,8 @@ def _generate_single_preview(
     sample_dcm,
     modality: str,
     sanitize_folder_name: Callable[[str], str],
-    output_suffix: str = ""
+    output_suffix: str = "",
+    cache_data=None
 ) -> Optional[str]:
     """
     生成单张预览图
@@ -850,6 +869,7 @@ def _generate_single_preview(
         modality: 模态类型
         sanitize_folder_name: 文件夹名称清理函数
         output_suffix: 输出文件名后缀
+        cache_data: 可选，已加载的缓存字典（避免重复读取 JSON）
         
     Returns:
         生成的预览图路径，失败时返回None
@@ -866,11 +886,12 @@ def _generate_single_preview(
     
     # 校正方向
     image_2d = _correct_image_orientation(
-        image_2d, preview_file, preview_idx, is_3d, series_dir, sample_dcm
+        image_2d, preview_file, preview_idx, is_3d, series_dir, sample_dcm,
+        cache_data=cache_data
     )
     
     # 获取该文件特定的DICOM信息（用于窗宽窗位等）
-    file_dcm = _get_file_dcm_info(preview_file, preview_idx, series_dir, sample_dcm)
+    file_dcm = _get_file_dcm_info(preview_file, preview_idx, series_dir, sample_dcm, cache_data=cache_data)
     
     # 应用窗宽窗位
     image_2d = apply_windowing(image_2d, file_dcm, modality)
@@ -1128,9 +1149,7 @@ def _generate_3d_triplane_preview(
         生成的预览图路径，失败时返回None
     """
     try:
-        # 加载3D体积数据
-        data = _load_3d_volume(preview_file, modality, sample_dcm)
-        if data is None:
+        if not os.path.exists(preview_file):
             return None
 
         # 获取扫描方位
@@ -1138,6 +1157,9 @@ def _generate_3d_triplane_preview(
         orientation = normalize_orientation(raw_orientation, sample_dcm)
 
         # 加载原始3D数据用于提取三视图（使用nibabel canonical格式）
+        # P2 优化：移除冗余的 _load_3d_volume 调用。该函数会完整加载 NIfTI/NPZ 体积到内存，
+        # 但下方的 NIfTI/NPZ 分支又会重新加载一次，导致同一个文件被加载两次。
+        # 改为直接让各分支自行加载，避免重复内存分配和 I/O。
         if preview_file.endswith(('.nii', '.nii.gz')):
             img = nib.load(preview_file)
             if len(img.shape) > 3:
@@ -1152,12 +1174,18 @@ def _generate_3d_triplane_preview(
 
             try:
                 img_canonical = nib.as_closest_canonical(img)
-                volume = img_canonical.get_fdata().astype(np.float32)
+                # 优化：使用 dataobj 避免 get_fdata() 的 float64 全量转换和内存拷贝。
+                # get_fdata() 会返回 float64 并应用 scl_slope/scl_inter，对大体积（如 512x512x594）
+                # 会分配 ~1GB 内存。dataobj 保持原始 dtype（如 int16），内存占用仅 1/4。
+                # np.asarray(dataobj) 触发数据加载，但避免了不必要的类型转换。
+                raw_volume = np.asarray(img_canonical.dataobj)
+                while raw_volume.ndim > 3:
+                    raw_volume = raw_volume[..., 0]
+                volume = raw_volume.astype(np.float32)
             except Exception:
                 volume = np.asarray(img.get_fdata()).astype(np.float32)
-
-            while volume.ndim > 3:
-                volume = volume[..., 0]
+                while volume.ndim > 3:
+                    volume = volume[..., 0]
 
             # canonical volume is (X, Y, Z)
             # X: Left->Right, Y: Posterior->Anterior, Z: Inferior->Superior
@@ -1354,7 +1382,8 @@ def generate_series_preview(
     conversion_result: dict,
     sample_dcm,
     modality: str,
-    sanitize_folder_name: Callable[[str], str]
+    sanitize_folder_name: Callable[[str], str],
+    cache_data=None
 ) -> Optional[str]:
     """
     生成序列预览图
@@ -1403,6 +1432,16 @@ def generate_series_preview(
         # 判断是否为2D X射线模态
         is_2d_xray = modality in ['DR', 'MG', 'DX', 'CR']
         
+        # 预加载 DICOM 元数据缓存（避免在循环中重复读取 JSON）
+        if cache_data is None:
+            cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, 'r', encoding='utf-8') as f:
+                        cache_data = json.load(f)
+                except Exception:
+                    cache_data = None
+        
         generated_previews = []
         
         if is_2d_xray and len(output_files) > 1:
@@ -1421,7 +1460,8 @@ def generate_series_preview(
                     sample_dcm=sample_dcm,
                     modality=modality,
                     sanitize_folder_name=sanitize_folder_name,
-                    output_suffix=suffix
+                    output_suffix=suffix,
+                    cache_data=cache_data
                 )
                 
                 if preview_path:
@@ -1447,7 +1487,8 @@ def generate_series_preview(
                     sample_dcm=sample_dcm,
                     modality=modality,
                     sanitize_folder_name=sanitize_folder_name,
-                    output_suffix=""
+                    output_suffix="",
+                    cache_data=cache_data
                 )
                 return preview_path
             else:

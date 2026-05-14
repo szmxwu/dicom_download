@@ -710,8 +710,13 @@ def index():
 @app.route('/api/client/download')
 def download_client_script():
     """下载 CLI 客户端脚本"""
-    cli_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cli', 'download.py')
-    return send_file(cli_path, as_attachment=True, download_name='download.py', mimetype='text/x-python')
+    file_name = request.args.get('file', 'download.py')
+    # 只允许下载这两个脚本，防止路径遍历
+    allowed = {'download.py', 'download_batch.py'}
+    if file_name not in allowed:
+        file_name = 'download.py'
+    cli_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cli', file_name)
+    return send_file(cli_path, as_attachment=True, download_name=file_name, mimetype='text/x-python')
 
 @app.route('/api/process/single', methods=['POST'])
 def process_single():
@@ -1588,7 +1593,7 @@ def process_single_task(task):
                 keep_zip=options.get('keep_zip', True),
                 keep_extracted=options.get('keep_extracted', False),
                 output_format=options.get('output_format', 'nifti'),
-                parallel_pipeline=False,  # 禁用并行流水线，使用单线程顺序处理
+                parallel_pipeline=True,  # 启用下载-转换并行流水线，下载与整理/转换重叠执行
                 modality_filter=modality_filter,
                 min_series_files=min_series_files,
                 exclude_derived=exclude_derived
@@ -1759,7 +1764,7 @@ def process_batch_task(task):
                     auto_organize=options.get('auto_organize', True),
                     auto_metadata=options.get('auto_metadata', True),
                     output_format=options.get('output_format', 'nifti'),
-                    parallel_pipeline=False,  # 禁用并行流水线，使用单线程顺序处理
+                    parallel_pipeline=True,  # 启用下载-转换并行流水线，下载与整理/转换重叠执行
                     modality_filter=modality_filter,
                     min_series_files=min_series_files,
                     exclude_derived=exclude_derived

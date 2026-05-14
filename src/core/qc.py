@@ -802,11 +802,15 @@ def assess_converted_file_quality(
             
             if fix_orientation or fix_grayscale:
                 try:
+                    # P1 优化：传入已加载的 img，避免 fix_nifti_file 内部重新 nib.load()。
+                    # 虽然仍有 get_fdata().copy()，但 nibabel 会复用缓存的解压数据，
+                    # 避免了重复的 gzip 解压（.nii.gz 的最昂贵操作）。
                     fix_result = fix_nifti_file(
                         filepath,
                         fix_orientation=fix_orientation,
                         fix_photometric=fix_grayscale,  # 灰度反转修复
-                        backup=False
+                        backup=False,
+                        img=img
                     )
                     
                     if fix_result.success:

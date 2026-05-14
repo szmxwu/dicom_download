@@ -114,9 +114,9 @@ def organize_dicom_files(
     logger.info(f"📂 Organized directory: {organized_dir}")
     logger.info(f"📊 Min series files filter: {min_series_files}")
 
-    # 等待文件系统稳定
+    # 等待文件系统稳定（Windows 下文件句柄释放可能有短暂延迟）
     logger.info("⏳ Waiting for file system to stabilize before organizing...")
-    time.sleep(1.0)
+    time.sleep(0.3)
 
     series_info: Dict[str, Any] = {}
     processed_files = 0
@@ -252,7 +252,10 @@ def process_single_series(
         return None
 
     # 等待文件系统稳定（确保文件已完全写入磁盘）
-    time.sleep(0.2)
+    # Windows 下 C-STORE 回调返回后文件句柄可能仍有短暂延迟，但已有重试机制兜底
+    # 仅在目录为空时短暂等待，否则直接处理
+    if not any(os.path.isfile(os.path.join(series_path, f)) for f in os.listdir(series_path) if not f.startswith('.')):
+        time.sleep(0.1)
 
     # 使用锁文件防止重复处理同一个series（应对多线程竞争条件）
     lock_file = os.path.join(series_path, '.processing_lock')
@@ -434,11 +437,21 @@ def process_single_series(
         else:
             print(f"   ✅ All {verified_count} files verified with checksums")
 
-    # 执行格式转换
+    # 执行格式转换（传入已扫描的 dicom_files 和 sample_dcm/modality，避免重复 I/O）
     if output_format == 'nifti':
-        client.convert_dicom_to_nifti(series_path, series_folder)
+        client.convert_dicom_to_nifti(
+            series_path, series_folder,
+            dicom_files=dicom_files,
+            sample_dcm=sample_dcm,
+            modality=modality
+        )
     elif output_format == 'npz':
-        client._convert_to_npz(series_path, series_folder)
+        client._convert_to_npz(
+            series_path, series_folder,
+            dicom_files=dicom_files,
+            sample_dcm=sample_dcm,
+            modality=modality
+        )
 
     # P0: 原地处理 - 不再移动到 organized 子目录
     # 文件已经在正确的位置，直接返回原路径

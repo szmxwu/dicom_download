@@ -176,7 +176,7 @@ def extract_dicom_metadata(
                     # Add QC and fix information - wrap in try/except to not lose tags on QC failure
                     try:
                         if read_all:
-                            converted_quality_results = [assess_converted_file_quality(p, cached_modality) for p in converted_files]
+                            converted_quality_results = [assess_converted_file_quality(p, cached_modality, dicom_metadata=sample_tags) for p in converted_files]
                             for idx, record in enumerate(cached_records):
                                 quality_val, quality_reason = _extract_quality_value(
                                     converted_quality_results[idx] if idx < len(converted_quality_results) else 1
@@ -276,38 +276,95 @@ def extract_dicom_metadata(
             accession_number = getattr(dcm, 'AccessionNumber', '')
             
             if need_read_all:
-                print(f"   ℹ️  Detected {modality} modality; will read all {len(dicom_files)} DICOM files")
-                records: List[Dict] = []
-                for idx, dicom_file in enumerate(dicom_files):
+                # P2 优化：2D 模态（MG/DX/DR/CR）文件数量通常很大（如乳腺钼靶可达数百张）。
+                # 如果转换后 DICOM 仍保留在目录中，优先检查缓存是否完整，避免逐张读取。
+                cache_path = os.path.join(series_path, "dicom_metadata_cache.json")
+                use_cache = False
+                cached_records: List[Dict] = []
+                if os.path.exists(cache_path):
                     try:
-                        dcm = pydicom.dcmread(dicom_file, force=True)
-                        metadata = {
-                            'SeriesFolder': series_folder,
-                            'FileName': os.path.basename(dicom_file),
-                            'FileIndex': idx + 1,
-                            'TotalFilesInSeries': len(dicom_files)
-                        }
-                        for keyword in current_keywords:
-                            try:
-                                value = getattr(dcm, keyword, None)
-                                if value is not None:
-                                    if hasattr(value, '__len__') and not isinstance(value, str):
-                                        if len(value) == 1:
-                                            value = value[0]
-                                        else:
-                                            value = str(value)
-                                    elif hasattr(value, 'value'):
-                                        value = value.value
-                                    metadata[keyword] = str(value)
-                                else:
-                                    metadata[keyword] = ""
-                            except Exception:
-                                metadata[keyword] = ""
-                        records.append(metadata)
+                        with open(cache_path, 'r', encoding='utf-8') as f:
+                            cache = json.load(f)
+                        cached_records = cache.get('records', [])
+                        # 缓存记录数与实际 DICOM 文件数匹配即视为完整
+                        if len(cached_records) == len(dicom_files):
+                            use_cache = True
+                            print(f"   ℹ️  Detected {modality} modality; using cached metadata for {len(dicom_files)} files")
+                        else:
+                            print(f"   ℹ️  Cache incomplete ({len(cached_records)}/{len(dicom_files)}), will re-read")
                     except Exception:
-                        continue
+                        pass
 
-                converted_quality_results = [assess_converted_file_quality(p, modality) for p in converted_files]
+                records: List[Dict] = []
+                if use_cache:
+                    # 复用缓存记录，补充/修正文件名和索引
+                    for idx, dicom_file in enumerate(dicom_files):
+                        if idx < len(cached_records):
+                            record = dict(cached_records[idx])
+                            record['FileName'] = os.path.basename(dicom_file)
+                            record['FileIndex'] = idx + 1
+                            record['TotalFilesInSeries'] = len(dicom_files)
+                            records.append(record)
+                        else:
+                            # 缓存记录不足，fallback 读取单张
+                            try:
+                                dcm = pydicom.dcmread(dicom_file, force=True)
+                                metadata = {
+                                    'SeriesFolder': series_folder,
+                                    'FileName': os.path.basename(dicom_file),
+                                    'FileIndex': idx + 1,
+                                    'TotalFilesInSeries': len(dicom_files)
+                                }
+                                for keyword in current_keywords:
+                                    try:
+                                        value = getattr(dcm, keyword, None)
+                                        if value is not None:
+                                            if hasattr(value, '__len__') and not isinstance(value, str):
+                                                value = str(value) if len(value) > 1 else value[0]
+                                            elif hasattr(value, 'value'):
+                                                value = value.value
+                                            metadata[keyword] = str(value)
+                                        else:
+                                            metadata[keyword] = ""
+                                    except Exception:
+                                        metadata[keyword] = ""
+                                records.append(metadata)
+                            except Exception:
+                                continue
+                else:
+                    print(f"   ℹ️  Detected {modality} modality; will read all {len(dicom_files)} DICOM files")
+                    for idx, dicom_file in enumerate(dicom_files):
+                        try:
+                            dcm = pydicom.dcmread(dicom_file, force=True)
+                            metadata = {
+                                'SeriesFolder': series_folder,
+                                'FileName': os.path.basename(dicom_file),
+                                'FileIndex': idx + 1,
+                                'TotalFilesInSeries': len(dicom_files)
+                            }
+                            for keyword in current_keywords:
+                                try:
+                                    value = getattr(dcm, keyword, None)
+                                    if value is not None:
+                                        if hasattr(value, '__len__') and not isinstance(value, str):
+                                            if len(value) == 1:
+                                                value = value[0]
+                                            else:
+                                                value = str(value)
+                                        elif hasattr(value, 'value'):
+                                            value = value.value
+                                        metadata[keyword] = str(value)
+                                    else:
+                                        metadata[keyword] = ""
+                                except Exception:
+                                    metadata[keyword] = ""
+                            records.append(metadata)
+                        except Exception:
+                            continue
+
+                # 复用已加载的 cache sample_tags，避免 assess_converted_file_quality 重新读取 JSON
+                dicom_metadata_for_qc = cache.get('sample_tags', {}) if 'cache' in dir() and cache else None
+                converted_quality_results = [assess_converted_file_quality(p, modality, dicom_metadata=dicom_metadata_for_qc) for p in converted_files]
                 for idx, record in enumerate(records):
                     quality_val, quality_reason = _extract_quality_value(
                         converted_quality_results[idx] if idx < len(converted_quality_results) else 1

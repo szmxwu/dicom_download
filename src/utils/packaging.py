@@ -55,7 +55,10 @@ def create_result_zip(
     os.makedirs(result_dir, exist_ok=True)
     zip_path = os.path.join(result_dir, f"result_{task_id}.zip")
 
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    # 使用 ZIP_STORED（仅存储，不压缩）而非 ZIP_DEFLATED。
+    # 包内文件已经是压缩格式：.nii.gz = gzip 压缩，.npz = NumPy 压缩。
+    # 再次 ZIP 压缩几乎无体积收益，但 CPU 开销巨大。存储模式大幅提升打包速度。
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zipf:
         if include_subdirs is not None:
             # 只打包指定的子目录，跳过未通过整理阶段的过滤目录
             allowed = set(include_subdirs)

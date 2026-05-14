@@ -527,11 +527,17 @@
                                         <i class="fas fa-terminal text-primary"></i>
                                         <span data-i18n="cli_client_title">Command-line Batch Download Client</span>
                                     </h5>
-                                    <a href="/api/client/download" class="btn btn-primary btn-sm">
-                                        <i class="fas fa-download"></i>
-                                        <span data-i18n="cli_client">CLI Client</span>
-                                        <code class="ms-1 text-white-50">download.py</code>
-                                    </a>
+                                    <div class="btn-group btn-group-sm" role="group">
+                                        <a href="/api/client/download?file=download.py" class="btn btn-primary">
+                                            <i class="fas fa-download"></i>
+                                            <span data-i18n="cli_client">CLI Client</span>
+                                            <code class="ms-1 text-white-50">download.py</code>
+                                        </a>
+                                        <a href="/api/client/download?file=download_batch.py" class="btn btn-outline-primary">
+                                            <i class="fas fa-download"></i>
+                                            <code>download_batch.py</code>
+                                        </a>
+                                    </div>
                                 </div>
 
                                 <!-- 快速开始 -->

@@ -279,20 +279,23 @@ def _safe_as_closest_canonical(img: Any) -> Any:
         return repaired_img
 
 
-def normalize_and_save_npz(nii_path: str, npz_path: str) -> None:
+def normalize_and_save_npz(nii_path_or_img, npz_path: str) -> None:
     """
     归一化并保存 NIfTI 数据为 NPZ 压缩格式。
 
-    加载 NIfTI 文件，将其转换为标准方向（canonical），
+    加载 NIfTI 文件（或直接使用传入的 nibabel 图像对象），将其转换为标准方向（canonical），
     对数据在各轴上进行翻转，并重新排列维度顺序为 (Z, Y, X)，
     最后以 float32 类型压缩保存为 NPZ 格式。
 
     参数:
-        nii_path: 输入 NIfTI 文件路径
+        nii_path_or_img: 输入 NIfTI 文件路径(str)或 nib.Nifti1Image 对象
         npz_path: 输出 NPZ 文件路径
     """
-    # 加载 NIfTI 文件，返回一个 Nifti1Image 对象（包含数据和头信息）
-    img = nib.load(nii_path)
+    # 支持传入文件路径或 nibabel 图像对象（Python-libs 路径跳过中间 NIfTI 写入）
+    if hasattr(nii_path_or_img, 'get_fdata') or hasattr(nii_path_or_img, 'dataobj'):
+        img = nii_path_or_img
+    else:
+        img = nib.load(nii_path_or_img)
     # 将图像转换为最接近的标准方向（canonical），以统一轴向（通常为 RAS）
     # 对于 affine 不可分解的文件，先重建可分解 affine 再重试。
     img_canonical = _safe_as_closest_canonical(img)
@@ -313,14 +316,35 @@ def normalize_and_save_npz(nii_path: str, npz_path: str) -> None:
     transpose_axes = [2, 1, 0] + list(range(3, data.ndim))
     data = np.transpose(data, transpose_axes)
 
-    # 将数据转换为 float32（节省空间）并以压缩的 npz 格式写入磁盘
-    np.savez_compressed(npz_path, data=data.astype(np.float32))
+    # 将数据转换为 float32 并以 NPZ 格式写入磁盘。
+    # 压缩策略：当前网络为内外100M，savez_compressed 默认级别6 的 CPU 开销（~58s/600MB）
+    # 远超传输收益。固定使用级别1：压缩率~37%，写入时间~10s/600MB，
+    # 在100M网络下总时间（写+传）最优。可通过环境变量 NPZ_COMPRESS 覆盖。
+    #   0 = np.savez（不压缩）
+    #   1 = np.savez_compressed 级别1（默认，100M网络推荐）
+    #   6 = np.savez_compressed 默认级别6（外网慢速）
+    compress_level = os.environ.get('NPZ_COMPRESS', '1')
+    if compress_level == '1':
+        import zlib
+        old_level = zlib.Z_DEFAULT_COMPRESSION
+        zlib.Z_DEFAULT_COMPRESSION = 1
+        try:
+            np.savez_compressed(npz_path, data=data.astype(np.float32))
+        finally:
+            zlib.Z_DEFAULT_COMPRESSION = old_level
+    elif compress_level == '6':
+        np.savez_compressed(npz_path, data=data.astype(np.float32))
+    else:
+        np.savez(npz_path, data=data.astype(np.float32))
 
 
 def convert_dicom_to_nifti(
     client: "DicomClient",
     series_dir: str,
-    series_name: str
+    series_name: str,
+    dicom_files: Optional[List[str]] = None,
+    sample_dcm=None,
+    modality: Optional[str] = None
 ) -> Dict[str, Union[bool, str, int, List[str]]]:
     """
     将 DICOM 序列转换为 NIfTI 格式。
@@ -333,6 +357,9 @@ def convert_dicom_to_nifti(
         client: DICOM 客户端实例，提供辅助方法
         series_dir: DICOM 序列目录路径
         series_name: 序列名称
+        dicom_files: 可选，已扫描的 DICOM 文件列表（避免重复扫描）
+        sample_dcm: 可选，已读取的样本 DICOM 对象（避免重复读取）
+        modality: 可选，已知的影像模态（避免重复读取）
 
     返回:
         包含转换结果的字典：
@@ -345,15 +372,18 @@ def convert_dicom_to_nifti(
     try:
         print(f"   🔄 Converting {series_name} to NIfTI...")
 
-        sample_dcm, modality = client._get_series_sample_dicom(series_dir)
-        dicom_files: List[str] = []
-        try:
-            for file in os.listdir(series_dir):
-                filepath = os.path.join(series_dir, file)
-                if os.path.isfile(filepath) and client._is_dicom_file(filepath):
-                    dicom_files.append(filepath)
-        except Exception:
+        if sample_dcm is None or not modality:
+            sample_dcm, modality = client._get_series_sample_dicom(series_dir)
+
+        if dicom_files is None:
             dicom_files = []
+            try:
+                for file in os.listdir(series_dir):
+                    filepath = os.path.join(series_dir, file)
+                    if os.path.isfile(filepath) and client._is_dicom_file(filepath):
+                        dicom_files.append(filepath)
+            except Exception:
+                dicom_files = []
 
         if dicom_files:
             client._cache_metadata_for_series(series_dir, series_name, dicom_files, modality)
@@ -365,7 +395,10 @@ def convert_dicom_to_nifti(
                 file_count=len(dicom_files)
             )
 
-        nifti_result = convert_with_dcm2niix(client, series_dir, series_name)
+        nifti_result = convert_with_dcm2niix(
+            client, series_dir, series_name,
+            dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality
+        )
         if nifti_result and nifti_result.get('success'):
             logger.info(
                 "dcm2niix转换成功: series=%s, output=%s",
@@ -401,7 +434,10 @@ def convert_dicom_to_nifti(
         )
 
         print("   ⚠️  dcm2niix not available, trying Python libraries...")
-        nifti_result = convert_with_python_libs(client, series_dir, series_name)
+        nifti_result = convert_with_python_libs(
+            client, series_dir, series_name,
+            dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality
+        )
         if nifti_result and nifti_result.get('success'):
             client._generate_series_preview(series_dir, series_name, nifti_result, sample_dcm, modality)
             cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
@@ -433,18 +469,25 @@ def convert_dicom_to_nifti(
 def convert_to_npz(
     client: "DicomClient",
     series_dir: str,
-    series_name: str
+    series_name: str,
+    dicom_files: Optional[List[str]] = None,
+    sample_dcm=None,
+    modality: Optional[str] = None
 ) -> Dict[str, Union[bool, str, int, float, List[str], List[int]]]:
     """
     将 DICOM 序列转换为归一化的 NPZ 格式。
 
     首先将 DICOM 转换为 NIfTI，然后将 NIfTI 数据归一化并保存为 NPZ 格式。
     支持批量转换多文件序列。转换完成后进行质量控制评估。
+    Python-libs 回退路径会跳过中间 NIfTI 文件写入，直接在内存中生成 NPZ。
 
     参数:
         client: DICOM 客户端实例，提供辅助方法
         series_dir: DICOM 序列目录路径
         series_name: 序列名称
+        dicom_files: 可选，已扫描的 DICOM 文件列表（避免重复扫描）
+        sample_dcm: 可选，已读取的样本 DICOM 对象（避免重复读取）
+        modality: 可选，已知的影像模态（避免重复读取）
 
     返回:
         包含转换结果的字典：
@@ -460,36 +503,59 @@ def convert_to_npz(
     try:
         print(f"   🔄 Converting {series_name} to NPZ (Normalized)...")
 
-        sample_dcm, modality = client._get_series_sample_dicom(series_dir)
+        if sample_dcm is None or not modality:
+            sample_dcm, modality = client._get_series_sample_dicom(series_dir)
 
-        nifti_res = convert_with_dcm2niix(client, series_dir, series_name)
+        nifti_res = convert_with_dcm2niix(
+            client, series_dir, series_name,
+            dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality
+        )
+        used_python_libs_memory = False
         if not (nifti_res and nifti_res.get('success')):
-            nifti_res = convert_with_python_libs(client, series_dir, series_name)
+            # Python-libs 回退：跳过中间 NIfTI 写入，直接在内存中生成 NPZ
+            nifti_res = convert_with_python_libs(
+                client, series_dir, series_name,
+                dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality,
+                save_to_disk=False
+            )
+            used_python_libs_memory = True
 
         if not (nifti_res and nifti_res.get('success')):
             return {'success': False, 'error': 'Failed to generate base volume for NPZ'}
 
         output_files: List[str] = []
         if nifti_res.get('conversion_mode') == 'individual':
-            for nii_file in nifti_res.get('output_files', []):
-                nii_path = os.path.join(series_dir, nii_file)
-                npz_file = nii_file.replace('.nii.gz', '.npz').replace('.nii', '.npz')
-                npz_path = os.path.join(series_dir, npz_file)
+            if used_python_libs_memory and 'output_images' in nifti_res:
+                # 内存对象路径：直接传入 nibabel image 生成 NPZ
+                for nifti_img, nii_file in nifti_res.get('output_images', []):
+                    npz_file = nii_file.replace('.nii.gz', '.npz').replace('.nii', '.npz')
+                    npz_path = os.path.join(series_dir, npz_file)
+                    normalize_and_save_npz(nifti_img, npz_path)
+                    output_files.append(npz_file)
+            else:
+                # dcm2niix 路径：从磁盘读取中间 NIfTI
+                for nii_file in nifti_res.get('output_files', []):
+                    nii_path = os.path.join(series_dir, nii_file)
+                    npz_file = nii_file.replace('.nii.gz', '.npz').replace('.nii', '.npz')
+                    npz_path = os.path.join(series_dir, npz_file)
 
-                normalize_and_save_npz(nii_path, npz_path)
-                output_files.append(npz_file)
-                if os.path.exists(nii_path):
-                    os.remove(nii_path)
+                    normalize_and_save_npz(nii_path, npz_path)
+                    output_files.append(npz_file)
+                    if os.path.exists(nii_path):
+                        os.remove(nii_path)
         else:
             nii_file = nifti_res.get('output_file')
-            nii_path = os.path.join(series_dir, nii_file)
             npz_file = nii_file.replace('.nii.gz', '.npz').replace('.nii', '.npz')
             npz_path = os.path.join(series_dir, npz_file)
 
-            normalize_and_save_npz(nii_path, npz_path)
+            if used_python_libs_memory and 'nifti_img' in nifti_res:
+                normalize_and_save_npz(nifti_res['nifti_img'], npz_path)
+            else:
+                nii_path = os.path.join(series_dir, nii_file)
+                normalize_and_save_npz(nii_path, npz_path)
+                if os.path.exists(nii_path):
+                    os.remove(nii_path)
             output_files.append(npz_file)
-            if os.path.exists(nii_path):
-                os.remove(nii_path)
 
         qc_summary = client._assess_series_quality_converted(
             [os.path.join(series_dir, f) for f in output_files],
@@ -569,7 +635,10 @@ def convert_to_npz(
 def convert_with_dcm2niix(
     client: "DicomClient",
     series_dir: str,
-    series_name: str
+    series_name: str,
+    dicom_files: Optional[List[str]] = None,
+    sample_dcm=None,
+    modality: Optional[str] = None
 ) -> Dict[str, Union[bool, str, int, List[str]]]:
     """
     使用 dcm2niix 工具将 DICOM 转换为 NIfTI。
@@ -582,6 +651,9 @@ def convert_with_dcm2niix(
         client: DICOM 客户端实例
         series_dir: DICOM 序列目录路径
         series_name: 序列名称
+        dicom_files: 可选，已扫描的 DICOM 文件列表（避免重复扫描）
+        sample_dcm: 可选，已读取的样本 DICOM 对象（避免重复读取）
+        modality: 可选，已知的影像模态（避免重复读取）
 
     返回:
         包含转换结果的字典：
@@ -620,32 +692,35 @@ def convert_with_dcm2niix(
             return {'success': False, 'error': 'dcm2niix not available'}
 
         # 等待文件系统稳定，并收集 DICOM 文件（最多重试3次）
-        dicom_files: List[str] = []
-        for attempt in range(3):
+        if dicom_files is None:
             dicom_files = []
-            for file in os.listdir(series_dir):
-                filepath = os.path.join(series_dir, file)
-                if file.endswith('.dcm') and os.path.isfile(filepath):
-                    dicom_files.append(filepath)
-            
-            if dicom_files:
-                break
-            
-            if attempt < 2:
-                logger.info("No DICOM files found in %s, waiting 0.5s and retrying... (attempt %d/3)", series_dir, attempt + 1)
-                time.sleep(0.5)
+            for attempt in range(3):
+                dicom_files = []
+                for file in os.listdir(series_dir):
+                    filepath = os.path.join(series_dir, file)
+                    if file.endswith('.dcm') and os.path.isfile(filepath):
+                        dicom_files.append(filepath)
+                
+                if dicom_files:
+                    break
+                
+                if attempt < 2:
+                    logger.info("No DICOM files found in %s, waiting 0.5s and retrying... (attempt %d/3)", series_dir, attempt + 1)
+                    time.sleep(0.5)
 
         if not dicom_files:
             logger.warning("No DICOM files found in series directory: %s", series_dir)
             return {'success': False, 'error': 'No DICOM files found'}
 
-        modality = ''
-        sample_tags = client._load_sample_tags_from_cache(series_dir)
-        if isinstance(sample_tags, dict):
-            modality = str(sample_tags.get('Modality') or '')
-        if not modality:
-            first_dcm = pydicom.dcmread(dicom_files[0], force=True)
-            modality = getattr(first_dcm, 'Modality', '')
+        if modality:
+            pass  # 使用传入的 modality
+        else:
+            sample_tags = client._load_sample_tags_from_cache(series_dir)
+            if isinstance(sample_tags, dict):
+                modality = str(sample_tags.get('Modality') or '')
+            if not modality:
+                first_dcm = sample_dcm if sample_dcm is not None else pydicom.dcmread(dicom_files[0], force=True)
+                modality = getattr(first_dcm, 'Modality', '')
 
         output_name = client._sanitize_folder_name(series_name)
 
@@ -907,7 +982,11 @@ def _build_2d_xray_affine(dcm: FileDataset) -> np.ndarray:
 def convert_with_python_libs(
     client: "DicomClient",
     series_dir: str,
-    series_name: str
+    series_name: str,
+    dicom_files: Optional[List[str]] = None,
+    sample_dcm=None,
+    modality: Optional[str] = None,
+    save_to_disk: bool = True
 ) -> Dict[str, Union[bool, str, int, List[str]]]:
     """
     使用 Python 库（pydicom + nibabel）将 DICOM 转换为 NIfTI。
@@ -923,35 +1002,46 @@ def convert_with_python_libs(
         client: DICOM 客户端实例
         series_dir: DICOM 序列目录路径
         series_name: 序列名称
+        dicom_files: 可选，已扫描的 DICOM 文件列表（避免重复扫描）
+        sample_dcm: 可选，已读取的样本 DICOM 对象（避免重复读取）
+        modality: 可选，已知的影像模态（避免重复读取）
+        save_to_disk: 是否写入 NIfTI 文件；False 时返回内存中的 nibabel 对象
 
     返回:
         包含转换结果的字典：
         - success: 是否成功
         - method: 'python_libs'
-        - output_file(s): 输出文件路径
+        - output_file(s): 输出文件路径（save_to_disk=True 时）
+        - output_images: [(nifti_img, filename), ...]（save_to_disk=False 且 2D 时）
+        - nifti_img: nibabel 图像对象（save_to_disk=False 且 3D 时）
         - modality: 影像模态
         - conversion_mode: 'series' 或 'individual'
         - file_count/slice_count: 文件数或切片数
         - error: 错误信息（失败时）
     """
     try:
-        dicom_files: List[str] = []
-        for file in os.listdir(series_dir):
-            filepath = os.path.join(series_dir, file)
-            if client._is_dicom_file(filepath):
-                dicom_files.append(filepath)
+        if dicom_files is None:
+            dicom_files = []
+            for file in os.listdir(series_dir):
+                filepath = os.path.join(series_dir, file)
+                if client._is_dicom_file(filepath):
+                    dicom_files.append(filepath)
 
         if not dicom_files:
             return {'success': False, 'error': 'No DICOM files found'}
 
-        first_dcm = pydicom.dcmread(dicom_files[0], force=True)
-        modality = getattr(first_dcm, 'Modality', '')
+        if sample_dcm is not None and modality:
+            first_dcm = sample_dcm
+        else:
+            first_dcm = pydicom.dcmread(dicom_files[0], force=True)
+            modality = modality or getattr(first_dcm, 'Modality', '')
 
         if modality in ['DR', 'MG', 'DX', 'CR']:
             logger.info("Detected %s modality; converting each DICOM file to NIfTI (Python libs)", modality)
 
             success_count = 0
             output_files: List[str] = []
+            output_images: List[Tuple] = []
             conversion_entries: List[Dict[str, str]] = []
 
             for idx, dcm_file in enumerate(dicom_files):
@@ -987,10 +1077,14 @@ def convert_with_python_libs(
                     # 否则：保持原方向，_build_2d_xray_affine 已经构建了正确的 RAS 矩阵
 
                     output_filename = f"{client._sanitize_folder_name(series_name)}_{idx+1:04d}.nii.gz"
-                    output_path = os.path.join(series_dir, output_filename)
-                    nib.save(nifti_img, output_path)
 
-                    output_files.append(output_filename)
+                    if save_to_disk:
+                        output_path = os.path.join(series_dir, output_filename)
+                        nib.save(nifti_img, output_path)
+                        output_files.append(output_filename)
+                    else:
+                        output_images.append((nifti_img, output_filename))
+
                     success_count += 1
 
                     # 记录转换信息
@@ -1017,21 +1111,26 @@ def convert_with_python_libs(
                 _write_conversion_map(series_dir, conversion_entries)
                 
                 # 清理原始 DICOM 文件
-                for dcm_file in dicom_files:
-                    try:
-                        os.remove(dcm_file)
-                    except Exception:
-                        pass
+                if save_to_disk:
+                    for dcm_file in dicom_files:
+                        try:
+                            os.remove(dcm_file)
+                        except Exception:
+                            pass
 
                 logger.info("   ✅ Python libs conversion succeeded: %d/%d files", success_count, len(dicom_files))
-                return {
+                result = {
                     'success': True,
                     'method': 'python_libs',
                     'modality': modality,
                     'conversion_mode': 'individual',
-                    'output_files': output_files,
                     'file_count': success_count
                 }
+                if save_to_disk:
+                    result['output_files'] = output_files
+                else:
+                    result['output_images'] = output_images
+                return result
 
             return {'success': False, 'error': 'No files converted successfully'}
 
@@ -1062,24 +1161,32 @@ def convert_with_python_libs(
             # 否则：保持原方向，build_affine_from_dicom 已经构建了正确的矩阵
             
             output_filename = f"{client._sanitize_folder_name(series_name)}.nii.gz"
-            output_path = os.path.join(series_dir, output_filename)
-            nib.save(nifti_img, output_path)
 
-            client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
-            for file in dicom_files:
-                try:
-                    os.remove(file)
-                except Exception:
-                    pass
+            if save_to_disk:
+                output_path = os.path.join(series_dir, output_filename)
+                nib.save(nifti_img, output_path)
 
-            print(f"   ✅ Python libs conversion succeeded: {output_filename}")
-            return {
+                client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
+                for file in dicom_files:
+                    try:
+                        os.remove(file)
+                    except Exception:
+                        pass
+
+                print(f"   ✅ Python libs conversion succeeded: {output_filename}")
+            else:
+                print(f"   ✅ Python libs conversion succeeded (in-memory): {output_filename}")
+
+            result = {
                 'success': True,
                 'method': 'python_libs',
                 'modality': modality,
                 'conversion_mode': 'series',
                 'output_file': output_filename
             }
+            if not save_to_disk:
+                result['nifti_img'] = nifti_img
+            return result
 
         slice_info: List[Tuple[float, str, FileDataset, Optional[List[float]]]] = []
         for filepath in dicom_files:
@@ -1146,18 +1253,23 @@ def convert_with_python_libs(
         # 否则：保持原方向，build_affine_from_dicom 已经处理了回退方案
         
         output_filename = f"{client._sanitize_folder_name(series_name)}.nii.gz"
-        output_path = os.path.join(series_dir, output_filename)
-        nib.save(nifti_img, output_path)
 
-        client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
-        for file in dicom_files:
-            try:
-                os.remove(file)
-            except Exception:
-                pass
+        if save_to_disk:
+            output_path = os.path.join(series_dir, output_filename)
+            nib.save(nifti_img, output_path)
 
-        print(f"   ✅ Python libs conversion succeeded: {output_filename} ({len(slices)} slices)")
-        return {
+            client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
+            for file in dicom_files:
+                try:
+                    os.remove(file)
+                except Exception:
+                    pass
+
+            print(f"   ✅ Python libs conversion succeeded: {output_filename} ({len(slices)} slices)")
+        else:
+            print(f"   ✅ Python libs conversion succeeded (in-memory): {output_filename} ({len(slices)} slices)")
+
+        result = {
             'success': True,
             'method': 'python_libs',
             'modality': modality,
@@ -1165,6 +1277,9 @@ def convert_with_python_libs(
             'output_file': output_filename,
             'slice_count': len(slices)
         }
+        if not save_to_disk:
+            result['nifti_img'] = nifti_img
+        return result
 
     except Exception as e:
         return {'success': False, 'error': str(e)}
