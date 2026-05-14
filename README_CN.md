@@ -10,6 +10,8 @@
 - **图像转换**: 将 DICOM 序列转换为 NIfTI 格式。
 - **Web 界面**: 提供友好的 Web 界面用于查询患者和管理任务。
 - **多模态支持**: 针对 MRI、CT、数字X光 (DX/DR) 和乳腺钼靶 (MG) 提供专门的元数据提取支持。
+- **衍生序列过滤**: 自动过滤 MPR、MIP、3D VR 等人工重建序列（默认启用）。
+- **智能过滤**: 支持按模态、最小序列文件数（3D体积默认为10）和衍生序列排除进行配置过滤。
 
 ## 安装说明
 
@@ -110,17 +112,62 @@ QC_DEFAULT_SERIES_LOW_QUALITY_RATIO=0.3
 
 ## 使用方法
 
+### Web 界面
+
 1. 启动 Web 应用：
    ```bash
-   python -m src.web.app.py
+   python -m src.web.app
    ```
 2. 打开浏览器访问 `http://localhost:5005`。
 3. 使用界面查询患者并开始下载/处理任务。
 
+**过滤选项（Web 界面）：**
+- **模态过滤**：按模态筛选（如 `MR`、`CT`，或逗号分隔的 `MR,CT`）
+- **最小序列文件数**：跳过文件数少于此阈值的序列（3D体积如CT/MR默认：10）
+- **排除衍生序列**：自动过滤 MPR、MIP、VR 等重建序列（默认启用）
+
+### 命令行工具 (CLI)
+
+对于批量处理，请使用 CLI 工具：
+
+```bash
+# 基本用法（使用默认过滤器：排除衍生序列，最小文件数=10）
+python src/cli/download.py M25053000056
+
+# 指定输出格式
+python src/cli/download.py M25053000056 --format npz
+
+# 按模态过滤
+python src/cli/download.py M25053000056 --modality MR
+
+# 包含衍生序列（MPR、MIP、VR 等）
+python src/cli/download.py M25053000056 --include_derived
+
+# 调整最小文件阈值
+python src/cli/download.py M25053000056 --min_files 20
+
+# 完整示例（所有选项）
+python src/cli/download.py M25053000056 \
+    --output_dir ./downloads \
+    --format nifti \
+    --modality CT \
+    --min_files 15
+```
+
+**CLI 参数说明：**
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `accession` | 要下载的 AccessionNumber | （必填） |
+| `--output_dir` | 下载结果存放目录 | `./downloads` |
+| `--format` | 输出格式（`nifti` 或 `npz`） | `nifti` |
+| `--modality` | 模态过滤（如 `MR`、`CT`，逗号分隔） | 无 |
+| `--min_files` | 最小序列文件数阈值 | `10` |
+| `--include_derived` | 包含衍生序列（MPR、MIP、VR 等） | 否 |
+
 ### 输出说明
 - 元数据 Excel 至少包含 `DICOM_Metadata` 与 `Series_Summary` 两个工作表。
 - 当存在 MR 记录时，会额外生成 `MR_Cleaned` 工作表。
-- 大量任务建议使用download.py执行
+- 大量任务建议使用 download.py 执行
 
 ## 项目结构
 
@@ -208,6 +255,14 @@ arr_zxy = np.transpose(arr, (0, 2, 1))  # 现在 shape == (Z, X, Y)
    - NPZ 生成会先用 dcm2niix（若可用）或 Python 库生成 NIfTI 中间文件以获取可靠的方向信息。
    - `.npz` 使用 `np.savez_compressed` 压缩并以 float32 存储，以平衡精度与文件大小。
 
+近期改进（2026-03-18）：
+
+- **衍生序列过滤**：
+   - 自动过滤 MPR、MIP、3D VR 等人工重建/衍生序列。
+   - 同时检查 `ImageType`（DERIVED/SECONDARY）和 `SeriesDescription` 关键词。
+   - Web 界面和 CLI 默认启用（CLI 使用 `--include_derived` 可禁用）。
+   - 可配置最小序列文件数（3D体积如 CT/MR 默认：10）。
+
 近期改进（2026-02-08）：
 
 - **基于模态的可配置质控阈值**：
@@ -238,3 +293,112 @@ arr_zxy = np.transpose(arr, (0, 2, 1))  # 现在 shape == (Z, X, Y)
    - 对 `PhotometricInterpretation` 为 `MONOCHROME1` 的图像自动反转，使输出与常见显示（MONOCHROME2）一致。
 
 上述改进提高了对下游流程的鲁棒性，并可在早期检测出可疑序列以便人工复查。
+
+---
+
+## Web 界面
+
+系统提供友好的 Web 界面用于管理 DICOM 处理任务：
+
+![Web Interface](web/static/images/fig.png)
+
+**功能特点：**
+- **单个处理**：通过检查号（Accession Number）处理单个检查
+- **批量处理**：同时处理多个检查
+- **文件上传**：上传并处理 DICOM ZIP 文件
+- **任务列表**：查看历史任务并下载已完成的结果
+- **实时进度**：实时跟踪处理进度，显示分步状态
+- **处理选项**：可配置的提取、组织和输出格式设置
+- **PACS 配置**：直接配置 DICOM 服务器设置
+- **智能过滤**：
+  - 模态过滤（如 `MR`、`CT` 或 `MR,CT`）
+  - 最小序列文件数（3D体积默认：10）
+  - 排除衍生序列（MPR、MIP、VR 等）- 默认启用
+
+---
+
+## 架构与工作流程
+
+### 系统架构
+
+```mermaid
+graph TD
+    A[用户] -->|Web 界面/API| B[Flask Web 服务器]
+    B --> C[DICOMDownloadClient]
+    C --> D[从 PACS 下载]
+    C --> E[整理文件]
+    C --> F[转换为 NIfTI/NPZ]
+    C --> G[提取元数据]
+    C --> H[生成预览图]
+    D --> I[DICOM 文件]
+    E --> J[整理后的序列]
+    F --> K[.nii.gz / .npz]
+    G --> L[metadata.xlsx]
+    H --> M[preview.png]
+    K --> N[结果包]
+    L --> N
+    M --> N
+    N -->|ZIP 下载| A
+```
+
+### 预览图生成工作流程
+
+预览图生成系统使用方向感知算法确保图像正确显示：
+
+```mermaid
+flowchart TD
+    A[开始：生成预览图] --> B{文件格式}
+    B -->.npz| C[加载 NPZ 数据]
+    B -->.nii| D[加载 NIfTI 数据]
+    
+    C --> E[提取 X-Z 切片]
+    D --> E
+    
+    E --> F[转置：X→水平方向，Z→垂直方向]
+    
+    F --> G[获取 DICOM 扫描方位]
+    G --> H{方位类型}
+    
+    H -->|COR| I[计算纵横比：<br/>slice_spacing / pixel_spacing[X]]
+    H -->|SAG| J[计算纵横比：<br/>slice_spacing / pixel_spacing[Y]]
+    H -->|AX| K[计算纵横比：<br/>slice_spacing / pixel_spacing[Y]]
+    
+    I --> L[应用纵横比]
+    J --> L
+    K --> L
+    
+    L --> M[应用窗宽窗位]
+    M --> N[保存预览图像]
+    N --> O[结束]
+```
+
+### 方位检测逻辑
+
+系统使用 DICOM 的 `ImageOrientationPatient` (IOP) 标签检测扫描方位：
+
+```mermaid
+flowchart TD
+    A[读取 DICOM 的 IOP] --> B[计算法向量：<br/>cross(row_vec, col_vec)]
+    B --> C{检查斜位}
+    C -->|abs(max)² < 0.9 × sum²| D[返回：OBL]
+    C -->|否| E[查找主轴]
+    
+    E -->|X 轴为主| F[返回：SAG 矢状位]
+    E -->|Y 轴为主| G[返回：COR 冠状位]
+    E -->|Z 轴为主| H[返回：AX 轴位]
+    
+    F --> I[应用方位特定的<br/>纵横比计算]
+    G --> I
+    H --> I
+    D --> I
+```
+
+### 预览图生成的关键特性
+
+1. **统一格式处理**：`.npz` 和 `.nii` 文件在加载后使用相同的处理流程
+2. **方位感知纵横比**：
+   - **COR（冠状位）**：X-Z 平面 → 纵横比 = slice_spacing / pixel_spacing[0]
+   - **SAG（矢状位）**：Y-Z 平面 → 纵横比 = slice_spacing / pixel_spacing[1]
+   - **AX（轴位）**：X-Y 平面 → 纵横比 = slice_spacing / pixel_spacing[1]
+3. **自动行列校正**：根据 DICOM 元数据检测并校正行列颠倒
+4. **窗宽窗位支持**：应用 DICOM 窗位/窗宽实现正确对比度

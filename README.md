@@ -12,6 +12,8 @@ A unified client for downloading DICOM files from PACS servers and processing th
 - **Image Conversion**: Convert DICOM series to NIfTI format.
 - **Web Interface**: User-friendly web UI for searching patients and managing tasks.
 - **Modality Support**: Specialized metadata extraction for MRI, CT, Digital Radiography (DX/DR), and Mammography (MG).
+- **Derived Series Filtering**: Automatically filter out MPR, MIP, 3D VR, and other derived/reconstructed series (enabled by default).
+- **Smart Filtering**: Configurable filters for modality, minimum series file count (default: 10 for 3D volumes), and derived series exclusion.
 
 ## Installation
 
@@ -112,6 +114,8 @@ Note: X-ray images (DX/DR/MG/CR) typically have simpler content, so they use mor
 
 ## Usage
 
+### Web Interface
+
 1. Start the web application:
    ```bash
    python -m src.web.app
@@ -119,10 +123,53 @@ Note: X-ray images (DX/DR/MG/CR) typically have simpler content, so they use mor
 2. Open your browser and navigate to `http://localhost:5005`.
 3. Use the interface to search for patients and start download/processing tasks.
 
+**Filter Options (Web Interface):**
+- **Modality Filter**: Filter by modality (e.g., `MR`, `CT`, or comma-separated like `MR,CT`)
+- **Min Series Files**: Skip series with fewer files than this threshold (default: 10 for 3D volumes like CT/MR)
+- **Exclude Derived Series**: Automatically filter out MPR, MIP, VR, and other reconstructed series (enabled by default)
+
+### Command Line Interface (CLI)
+
+For batch processing, use the CLI tool:
+
+```bash
+# Basic usage (with default filters: exclude derived, min_files=10)
+python src/cli/download.py M25053000056
+
+# Specify output format
+python src/cli/download.py M25053000056 --format npz
+
+# Filter by modality
+python src/cli/download.py M25053000056 --modality MR
+
+# Include derived series (MPR, MIP, VR, etc.)
+python src/cli/download.py M25053000056 --include_derived
+
+# Adjust minimum file threshold
+python src/cli/download.py M25053000056 --min_files 20
+
+# Full example with all options
+python src/cli/download.py M25053000056 \
+    --output_dir ./downloads \
+    --format nifti \
+    --modality CT \
+    --min_files 15
+```
+
+**CLI Arguments:**
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `accession` | AccessionNumber to download | (required) |
+| `--output_dir` | Download result directory | `./downloads` |
+| `--format` | Output format (`nifti` or `npz`) | `nifti` |
+| `--modality` | Modality filter (e.g., `MR`, `CT`, comma-separated) | None |
+| `--min_files` | Minimum series file count threshold | `10` |
+| `--include_derived` | Include derived series (MPR, MIP, VR, etc.) | False |
+
 ### Output
 - The metadata Excel contains at least `DICOM_Metadata` and `Series_Summary` sheets.
 - If MR records are present, an additional `MR_Cleaned` sheet is generated.
-- download.py is recommended for large tasks 
+- `download.py` is recommended for large tasks 
 
 ## Project Structure
 
@@ -213,6 +260,14 @@ Notes:
    - NPZ generation uses a temporary NIfTI intermediate (dcm2niix or Python libs) to obtain robust orientation information from DICOM tags.
    - The `.npz` files are compressed with `np.savez_compressed` and use float32 to balance precision and size.
 
+Recent improvements (2026-03-18):
+
+- **Derived Series Filtering**:
+   - Automatically filter out MPR, MIP, 3D VR, and other derived/reconstructed series.
+   - Checks both `ImageType` (DERIVED/SECONDARY) and `SeriesDescription` keywords.
+   - Enabled by default in both Web UI and CLI (use `--include_derived` to disable in CLI).
+   - Configurable minimum series file count (default: 10 for 3D volumes like CT/MR).
+
 Recent improvements (2026-02-08):
 
 - **Modality-specific Configurable QC Thresholds**:
@@ -243,3 +298,112 @@ Earlier improvements (2026-01-17):
    - `PhotometricInterpretation` MONOCHROME1 images are auto-inverted to match display expectation (consistent with MONOCHROME2).
 
 These changes improve robustness for downstream pipelines and provide early detection of problematic series.
+
+---
+
+## Web Interface
+
+The system provides a user-friendly web interface for managing DICOM processing tasks:
+
+![Web Interface](web/static/images/fig.png)
+
+**Features:**
+- **Single Process**: Process individual studies by Accession Number
+- **Batch Process**: Process multiple studies simultaneously
+- **File Upload**: Upload and process DICOM ZIP files
+- **Task List**: View history and download completed tasks
+- **Real-time Progress**: Live progress tracking with step-by-step status
+- **Process Options**: Configurable extraction, organization, and output format settings
+- **PACS Configuration**: Direct configuration of DICOM server settings
+- **Smart Filtering**:
+  - Modality filter (e.g., `MR`, `CT`, or `MR,CT`)
+  - Minimum series file count (default: 10 for 3D volumes)
+  - Exclude derived series (MPR, MIP, VR, etc.) - enabled by default
+
+---
+
+## Architecture & Workflow
+
+### System Architecture
+
+```mermaid
+graph TD
+    A[User] -->|Web Interface/API| B[Flask Web Server]
+    B --> C[DICOMDownloadClient]
+    C --> D[Download from PACS]
+    C --> E[Organize Files]
+    C --> F[Convert to NIfTI/NPZ]
+    C --> G[Extract Metadata]
+    C --> H[Generate Preview]
+    D --> I[DICOM Files]
+    E --> J[Organized Series]
+    F --> K[.nii.gz / .npz]
+    G --> L[metadata.xlsx]
+    H --> M[preview.png]
+    K --> N[Results Package]
+    L --> N
+    M --> N
+    N -->|ZIP Download| A
+```
+
+### Preview Generation Workflow
+
+The preview generation system uses a sophisticated orientation-aware algorithm to ensure correct image display:
+
+```mermaid
+flowchart TD
+    A[Start: Generate Preview] --> B{File Format}
+    B -->|.npz| C[Load NPZ Data]
+    B -->|.nii| D[Load NIfTI Data]
+    
+    C --> E[Extract X-Z Slice]
+    D --> E
+    
+    E --> F[Transpose: X→Horizontal, Z→Vertical]
+    
+    F --> G[Get DICOM Orientation]
+    G --> H{Orientation Type}
+    
+    H -->|COR| I[Calc Aspect Ratio:<br/>slice_spacing / pixel_spacing[X]]
+    H -->|SAG| J[Calc Aspect Ratio:<br/>slice_spacing / pixel_spacing[Y]]
+    H -->|AX| K[Calc Aspect Ratio:<br/>slice_spacing / pixel_spacing[Y]]
+    
+    I --> L[Apply Aspect Ratio]
+    J --> L
+    K --> L
+    
+    L --> M[Apply Windowing]
+    M --> N[Save Preview Image]
+    N --> O[End]
+```
+
+### Orientation Detection Logic
+
+The system uses DICOM `ImageOrientationPatient` (IOP) to detect scan orientation:
+
+```mermaid
+flowchart TD
+    A[Read IOP from DICOM] --> B[Calculate Normal Vector:<br/>cross(row_vec, col_vec)]
+    B --> C{Check Oblique}
+    C -->|abs(max)² < 0.9 × sum²| D[Return: OBL]
+    C -->|No| E[Find Dominant Axis]
+    
+    E -->|X dominant| F[Return: SAG]
+    E -->|Y dominant| G[Return: COR]
+    E -->|Z dominant| H[Return: AX]
+    
+    F --> I[Apply Orientation-Specific<br/>Aspect Ratio Calculation]
+    G --> I
+    H --> I
+    D --> I
+```
+
+### Key Features of Preview Generation
+
+1. **Format-Unified Processing**: Both `.npz` and `.nii` files are processed identically after loading
+2. **Orientation-Aware Aspect Ratio**: 
+   - **COR (Coronal)**: X-Z plane → aspect = slice_spacing / pixel_spacing[0]
+   - **SAG (Sagittal)**: Y-Z plane → aspect = slice_spacing / pixel_spacing[1]  
+   - **AX (Axial)**: X-Y plane → aspect = slice_spacing / pixel_spacing[1]
+3. **Automatic Transpose Correction**: Detects and corrects row/column mismatches based on DICOM metadata
+4. **Windowing Support**: Applies DICOM window center/width for proper contrast

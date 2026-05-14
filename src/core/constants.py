@@ -9,7 +9,7 @@
 # 用于在 PACS 查询阶段和整理阶段过滤 MPR/MIP/3D 重建等衍生序列
 DEFAULT_DERIVED_SERIES_KEYWORDS = [
     'MPR', 'MIP', 'MINIP', 'SSD', 'VRT', 'VR',
-    'CPR', 'CURVED', 'THICK',
+    'CPR', 'CURVED', '3D', 'THICK',
     'SCOUT', 'TOPOGRAM', 'SURVEY',
     'REF', 'REFERENCE', 'LOC', 'BATCH',
     'AVERAGE', 'SUM', 'REFORMAT',

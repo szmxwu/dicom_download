@@ -175,7 +175,7 @@ def organize_dicom_files(
                 except Exception:
                     check_modality = ''
 
-                if check_modality in volume_modalities:
+                if check_modality in volume_modalities or not check_modality:
                     actual_count = len(dicom_files)
                     logger.info(f"   📊 Series {series_folder}: {actual_count} DICOM files, modality={check_modality}")
                     if actual_count < min_series_files:
@@ -370,7 +370,7 @@ def process_single_series(
         if cached_metadata and use_cached_metadata:
             check_modality = cached_metadata.get('modality', '').upper()
 
-        if check_modality in volume_modalities:
+        if check_modality in volume_modalities or not check_modality:
             actual_count = len(dicom_files)
             if actual_count < min_series_files:
                 print(f"   🚫 Series {series_folder} filtered during organize: "
@@ -452,7 +452,6 @@ def process_single_series(
             sample_dcm=sample_dcm,
             modality=modality
         )
-
     # P0: 原地处理 - 不再移动到 organized 子目录
     # 文件已经在正确的位置，直接返回原路径
 
