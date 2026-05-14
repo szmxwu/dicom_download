@@ -1222,15 +1222,34 @@ def _generate_3d_triplane_preview(
         original_orientation = min(layer_counts, key=layer_counts.get)
         original_slices = layer_counts[original_orientation]
 
-        # 从 canonical NIfTI header 获取体素尺寸（必须用 canonical 图像，轴序已重排）
+        # 获取体素尺寸（用于各向异性数据的纵横比校正）
         # canonical 体积轴顺序：axis0=X(dx), axis1=Y(dy), axis2=Z(dz)
-        try:
-            canon_zooms = img_canonical.header.get_zooms()[:3]
-            dx = float(canon_zooms[0]) if float(canon_zooms[0]) > 1e-6 else 1.0
-            dy = float(canon_zooms[1]) if float(canon_zooms[1]) > 1e-6 else 1.0
-            dz = float(canon_zooms[2]) if float(canon_zooms[2]) > 1e-6 else 1.0
-        except Exception:
-            dx = dy = dz = 1.0
+        dx = dy = dz = 1.0
+        if preview_file.endswith(('.nii', '.nii.gz')):
+            try:
+                canon_zooms = img_canonical.header.get_zooms()[:3]
+                dx = float(canon_zooms[0]) if float(canon_zooms[0]) > 1e-6 else 1.0
+                dy = float(canon_zooms[1]) if float(canon_zooms[1]) > 1e-6 else 1.0
+                dz = float(canon_zooms[2]) if float(canon_zooms[2]) > 1e-6 else 1.0
+            except Exception:
+                pass
+        elif preview_file.endswith('.npz') and sample_dcm is not None:
+            # 从 DICOM 样本获取像素间距和层厚
+            try:
+                pixel_spacing = getattr(sample_dcm, 'PixelSpacing', None)
+                if pixel_spacing and len(pixel_spacing) >= 2:
+                    dy = float(pixel_spacing[0])  # row spacing
+                    dx = float(pixel_spacing[1])  # col spacing
+                # Z 方向间距：优先 SliceThickness，备选 SpacingBetweenSlices
+                thickness = getattr(sample_dcm, 'SliceThickness', None)
+                if thickness is not None:
+                    dz = float(thickness)
+                else:
+                    spacing = getattr(sample_dcm, 'SpacingBetweenSlices', None)
+                    if spacing is not None:
+                        dz = float(spacing)
+            except Exception:
+                pass
 
         # 体素间距校正：经过 transpose 后各切片的行列方向对应的体素间距：
         #   Axial   (Y, X) — row_spacing=dy, col_spacing=dx
@@ -1246,7 +1265,7 @@ def _generate_3d_triplane_preview(
             pil_img = Image.fromarray(arr2d)
             return np.array(pil_img.resize((w, new_h), Image.BILINEAR))
 
-        if preview_file.endswith(('.nii', '.nii.gz')):
+        if preview_file.endswith(('.nii', '.nii.gz', '.npz')):
             slice_axial    = _scale_height(slice_axial,    dy, dx)  # 通常已是等向素
             slice_sagittal = _scale_height(slice_sagittal, dz, dy)  # 层厚/行间距校正
             slice_coronal  = _scale_height(slice_coronal,  dz, dx)  # 层厚/行间距校正

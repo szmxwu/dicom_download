@@ -559,7 +559,7 @@ class ProcessingTask:
                 'status': self.status,
                 'progress': self.progress,
                 'current_step': self.current_step,
-                'logs': self.logs[-5:]  # 只发送最新5条日志
+                'logs': self.logs[-100:]  # 发送最新100条日志，确保前端能看到完整历史
             })
         except Exception as e:
             logger.error(f"WebSocket发送失败: {str(e)}")
@@ -598,6 +598,86 @@ class ProcessingTask:
         
         # 通过WebSocket发送更新（强制发送状态变更）
         self._emit_update(force=True)
+
+
+class TaskLogHandler(logging.Handler):
+    """将标准日志输出捕获到 ProcessingTask 的日志队列中。
+
+    在任务处理期间临时安装到 root logger，使所有通过 logging
+    输出的日志（包括 Flask/Werkzeug 错误、第三方库日志等）
+    都能同步显示在 Web UI 的 process_log 容器中。
+    """
+    def __init__(self, task: ProcessingTask):
+        super().__init__()
+        self.task = task
+        # 捕获 INFO 及以上级别
+        self.setLevel(logging.INFO)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # 避免递归：若当前正在由 Task.add_log 触发，则跳过
+        if record.name == 'DICOMApp' and f"[Task {self.task.task_id}]" in record.getMessage():
+            return
+        # 过滤掉 Werkzeug 高频访问日志，避免刷屏
+        if record.name == 'werkzeug':
+            return
+        # 将日志级别映射为前端使用的级别名称
+        level_map = {
+            logging.DEBUG: 'debug',
+            logging.INFO: 'info',
+            logging.WARNING: 'warning',
+            logging.ERROR: 'error',
+            logging.CRITICAL: 'error',
+        }
+        level = level_map.get(record.levelno, 'info')
+        # 组装时间戳与消息
+        timestamp = time.strftime('%H:%M:%S', time.localtime(record.created))
+        message = self.format(record)
+        log_entry = {
+            'timestamp': timestamp,
+            'level': level,
+            'message': message,
+        }
+        self.task.logs.append(log_entry)
+        self.task._emit_update()
+
+
+def _attach_task_log_handler(task: ProcessingTask):
+    """为当前任务附加日志捕获 Handler，返回该 Handler 以便后续移除。
+
+    附加到 root logger 并临时将其级别降为 INFO，从而捕获所有模块的
+    INFO 及以上日志（包括 DICOMApp、Flask、第三方库等）。
+    """
+    handler = TaskLogHandler(task)
+    formatter = logging.Formatter(
+        '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+    )
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    # 保存原始级别并在任务期间临时设为 INFO
+    original_level = root.level
+    if original_level > logging.INFO:
+        root.setLevel(logging.INFO)
+
+    root.addHandler(handler)
+    return handler, original_level
+
+
+def _detach_task_log_handler(handler_and_level):
+    """移除任务日志捕获 Handler 并恢复 root logger 原始级别。"""
+    if not handler_and_level:
+        return
+    handler, original_level = handler_and_level
+    if handler:
+        try:
+            logging.getLogger().removeHandler(handler)
+        except Exception:
+            pass
+    try:
+        logging.getLogger().setLevel(original_level)
+    except Exception:
+        pass
+
 
 @app.route('/api/debug/test-connection')
 def test_connection():
@@ -1353,6 +1433,7 @@ def process_single_task(task):
     """处理单个AccessionNumber任务 - 修复版，支持取消检查"""
     client_logged_in = False
     task_client = None
+    task_log_handler = _attach_task_log_handler(task)
     
     try:
         # 立即更新状态，确保WebSocket发送
@@ -1582,11 +1663,13 @@ def process_single_task(task):
             except Exception as e:
                 task.add_log(f"Error during logout: {str(e)}", 'warning')
                 logger.warning(f"登出失败: {str(e)}")
+        _detach_task_log_handler(task_log_handler)
 
 def process_batch_task(task):
     """处理批量AccessionNumber任务 - 修复版，支持去重和取消检查"""
     client_logged_in = False
     task_client = None  # 初始化变量
+    task_log_handler = _attach_task_log_handler(task)
     try:
         accession_numbers = task.parameters['accession_numbers']
         options = task.parameters.get('options', {})
@@ -1798,9 +1881,11 @@ def process_batch_task(task):
                 task.add_log("Logged out from DICOM service")
             except Exception as e:
                 task.add_log(f"Error during logout: {str(e)}", 'warning')
+        _detach_task_log_handler(task_log_handler)
 
 def process_upload_task(task):
     """处理上传文件任务 - 修复版，支持取消检查"""
+    task_log_handler = _attach_task_log_handler(task)
     try:
         filepath = task.parameters['filepath']
         options = task.parameters['options']
@@ -1881,6 +1966,8 @@ def process_upload_task(task):
         task.update_status('failed')
         task.error = str(e)
         task.end_time = time.time()
+    finally:
+        _detach_task_log_handler(task_log_handler)
 
 
 # WebSocket事件处理

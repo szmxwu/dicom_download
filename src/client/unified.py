@@ -483,7 +483,9 @@ class DICOMDownloadClient:
                                 # Modality 过滤
                                 if modality_filter:
                                     # 支持逗号分隔的多个模态，如 "MR,CT"
-                                    allowed_modalities = [m.strip().upper() for m in modality_filter.split(',')]
+                                    # 自动展开同义词组，解决 PACS 命名不规范问题
+                                    from src.core.constants import expand_modality_filter
+                                    allowed_modalities = expand_modality_filter(modality_filter)
                                     if series_modality.upper() not in allowed_modalities:
                                         continue
 
@@ -609,7 +611,9 @@ class DICOMDownloadClient:
 
                 logger.info(f"📊 Find {len(series_metadata)} Series (after filtering)")
                 if modality_filter:
-                    logger.debug(f"   (Modality filter: {modality_filter})")
+                    from src.core.constants import expand_modality_filter
+                    expanded = expand_modality_filter(modality_filter)
+                    logger.debug(f"   (Modality filter: {modality_filter} → expanded: {expanded})")
                 if min_series_files and min_series_files > 0:
                     logger.debug(f"   (Min files filter: {min_series_files})")
                 if exclude_derived:
