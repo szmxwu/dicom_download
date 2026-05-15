@@ -248,6 +248,10 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
         series_desc = str(row.get('SeriesDescription', '')).lower()
         if any(k in img_type for k in derived_keywords):
             return 'DERIVED'
+        # P1: 识别二次成像/非诊断序列
+        secondary_img_keywords = ['efilm', 'filming', 'screen save', 'motion curve', 'report']
+        if any(k in img_type or k in series_desc for k in secondary_img_keywords):
+            return 'DERIVED'
         if any(k in img_type or k in protocol_name or k in series_desc for k in localizer_keywords):
             return 'LOCALIZER'
         if all(k in img_type for k in original_requires):
@@ -380,7 +384,7 @@ def classify_sequence(row, cfg: dict):
         return False
 
     localizer_rule = ruleA.get('LOCALIZER', {})
-    localizer_keywords = [str(x).lower() for x in localizer_rule.get('protocol_keywords', ['localizer', 'survey', 'scout'])]
+    localizer_keywords = [str(x).lower() for x in localizer_rule.get('protocol_keywords', ['localizer', 'survey', 'scout', 'loc'])]
     localizer_img_type = str(localizer_rule.get('refinedImageType', 'LOCALIZER'))
     if any(k in name for k in localizer_keywords) or any(k in SeriesDescription for k in localizer_keywords) or img_type == localizer_img_type:
         base_class = 'LOCALIZER'
@@ -538,8 +542,10 @@ def classify_sequence(row, cfg: dict):
             base_class = 'T2_FLAIR'
         elif 'stir' in combined_name:
             base_class = 'T2_STIR'
-        elif 'dwi' in combined_name or 'diff' in combined_name or 'ep2d' in combined_name:
+        elif 'dwi' in combined_name or 'diff' in combined_name or 'ep2d' in combined_name or 'trace' in combined_name or 'resolve' in combined_name or 'muse' in combined_name:
             base_class = 'DWI'
+        elif 'magic' in combined_name:
+            base_class = 'T2_TSE'  # GE MAGiC: multi-contrast, closest to T2
 
     # --- 4. 后处理：附加属性后缀 ---
     if base_class != 'UNKNOWN':

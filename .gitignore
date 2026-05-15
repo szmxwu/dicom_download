@@ -202,3 +202,4 @@ kimi.txt
 uploads
 results/
 !results/.gitkeep
+test/*

@@ -84,7 +84,7 @@
   "classification": {
     "ruleA": {
       "LOCALIZER": {
-        "protocol_keywords": ["localizer", "survey", "scout"],
+        "protocol_keywords": ["localizer", "survey", "scout", "loc"],
         "refinedImageType": "LOCALIZER"
       },
       "T1_MAP": { "protocol_keywords": ["t1_map", "t1map"] },

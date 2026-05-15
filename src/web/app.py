@@ -2210,59 +2210,6 @@ def _ensure_ssl_cert(ssl_dir):
     return cert_path, key_path
 
 
-if __name__ == '__main__':
-    logger.info("="*60)
-    logger.info("🏥 DICOM处理Web应用启动")
-    logger.info("="*60)
-
-    enable_https = os.getenv('ENABLE_HTTPS', 'false').lower() in ('true', '1', 'yes')
-    ssl_context = None
-    protocol = 'http'
-    if enable_https:
-        ssl_dir = os.path.join(project_root, 'ssl')
-        try:
-            cert_path, key_path = _ensure_ssl_cert(ssl_dir)
-            ssl_context = (cert_path, key_path)
-            protocol = 'https'
-            logger.info(f"🔒 HTTPS 已启用 (证书: {cert_path})")
-            logger.info("   ⚠️  首次访问时浏览器会提示证书不受信任，点击'高级→继续访问'即可")
-        except Exception as ssl_err:
-            logger.error(f"❌ HTTPS 启动失败，回退为 HTTP: {ssl_err}")
-
-    logger.info(f"📡 访问地址: {protocol}://172.17.250.136:5005")
-    
-    # 检查DICOM服务连接状态
-    try:
-        checker = DICOMDownloadClient()
-        if checker.check_status():
-            logger.info("✅ PACS服务连接正常")
-            logger.info(f"   - PACS IP: {checker.pacs_config['PACS_IP']}")
-            logger.info(f"   - PACS Port: {checker.pacs_config['PACS_PORT']}")
-            logger.info(f"   - Calling AET: {checker.pacs_config['CALLING_AET']}")
-            logger.info(f"   - Called AET: {checker.pacs_config['CALLED_AET']}")
-        else:
-            logger.warning("⚠️  PACS服务连接异常，下载功能可能不可用")
-    except Exception as e:
-        logger.error(f"⚠️  无法连接PACS服务: {str(e)}")
-        logger.info("   仅支持本地文件上传处理")
-    
-    logger.info("="*60)
-    if os.getenv('DICOM_USERNAME') or os.getenv('DICOM_PASSWORD'):
-        logger.info("🔐 已从环境变量读取DICOM登录信息")
-    else:
-        logger.info("🔐 未配置DICOM登录信息（当前实现无需真实认证）")
-    logger.info("🚀 系统已就绪，等待用户请求...")
-    logger.info("📡 访问地址:")
-    logger.info(f"   - {protocol}://localhost:5005")
-    logger.info(f"   - {protocol}://127.0.0.1:5005")
-    logger.info(f"   - {protocol}://172.17.250.136:5005")
-    logger.info("="*60)
-
-    # 启动应用
-    socketio.run(app, host='0.0.0.0', port=5005, debug=False,
-                 allow_unsafe_werkzeug=True, ssl_context=ssl_context)
-
-
 # ========== 衍生序列过滤关键词配置 API ==========
 
 @app.route('/api/filter-keywords', methods=['GET'])
@@ -2316,3 +2263,56 @@ def reset_filter_keywords():
         'keywords': keywords,
         'count': len(keywords)
     })
+
+
+if __name__ == '__main__':
+    logger.info("="*60)
+    logger.info("🏥 DICOM处理Web应用启动")
+    logger.info("="*60)
+
+    enable_https = os.getenv('ENABLE_HTTPS', 'false').lower() in ('true', '1', 'yes')
+    ssl_context = None
+    protocol = 'http'
+    if enable_https:
+        ssl_dir = os.path.join(project_root, 'ssl')
+        try:
+            cert_path, key_path = _ensure_ssl_cert(ssl_dir)
+            ssl_context = (cert_path, key_path)
+            protocol = 'https'
+            logger.info(f"🔒 HTTPS 已启用 (证书: {cert_path})")
+            logger.info("   ⚠️  首次访问时浏览器会提示证书不受信任，点击'高级→继续访问'即可")
+        except Exception as ssl_err:
+            logger.error(f"❌ HTTPS 启动失败，回退为 HTTP: {ssl_err}")
+
+    logger.info(f"📡 访问地址: {protocol}://172.17.250.136:5005")
+    
+    # 检查DICOM服务连接状态
+    try:
+        checker = DICOMDownloadClient()
+        if checker.check_status():
+            logger.info("✅ PACS服务连接正常")
+            logger.info(f"   - PACS IP: {checker.pacs_config['PACS_IP']}")
+            logger.info(f"   - PACS Port: {checker.pacs_config['PACS_PORT']}")
+            logger.info(f"   - Calling AET: {checker.pacs_config['CALLING_AET']}")
+            logger.info(f"   - Called AET: {checker.pacs_config['CALLED_AET']}")
+        else:
+            logger.warning("⚠️  PACS服务连接异常，下载功能可能不可用")
+    except Exception as e:
+        logger.error(f"⚠️  无法连接PACS服务: {str(e)}")
+        logger.info("   仅支持本地文件上传处理")
+    
+    logger.info("="*60)
+    if os.getenv('DICOM_USERNAME') or os.getenv('DICOM_PASSWORD'):
+        logger.info("🔐 已从环境变量读取DICOM登录信息")
+    else:
+        logger.info("🔐 未配置DICOM登录信息（当前实现无需真实认证）")
+    logger.info("🚀 系统已就绪，等待用户请求...")
+    logger.info("📡 访问地址:")
+    logger.info(f"   - {protocol}://localhost:5005")
+    logger.info(f"   - {protocol}://127.0.0.1:5005")
+    logger.info(f"   - {protocol}://172.17.250.136:5005")
+    logger.info("="*60)
+
+    # 启动应用
+    socketio.run(app, host='0.0.0.0', port=5005, debug=False,
+                 allow_unsafe_werkzeug=True, ssl_context=ssl_context)
