@@ -135,6 +135,8 @@ def organize_dicom_files(
         files_in_dir = os.listdir(series_path)
         logger.info(f"   📂 Series {series_folder}: found {len(files_in_dir)} files")
         for file in files_in_dir:
+            if file.startswith('.'):
+                continue
             filepath = os.path.join(series_path, file)
             if os.path.isfile(filepath) and client._is_dicom_file(filepath):
                 normalized_path = filepath
@@ -319,6 +321,8 @@ def process_single_series(
         for attempt in range(3):
             dicom_files = []
             for file in os.listdir(series_path):
+                if file.startswith('.'):
+                    continue
                 filepath = os.path.join(series_path, file)
                 if os.path.isfile(filepath) and client._is_dicom_file(filepath):
                     normalized_path = filepath

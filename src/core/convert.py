@@ -379,6 +379,8 @@ def convert_dicom_to_nifti(
             dicom_files = []
             try:
                 for file in os.listdir(series_dir):
+                    if file.startswith('.'):
+                        continue
                     filepath = os.path.join(series_dir, file)
                     if os.path.isfile(filepath) and client._is_dicom_file(filepath):
                         dicom_files.append(filepath)
@@ -700,6 +702,8 @@ def convert_with_dcm2niix(
             for attempt in range(3):
                 dicom_files = []
                 for file in os.listdir(series_dir):
+                    if file.startswith('.'):
+                        continue
                     filepath = os.path.join(series_dir, file)
                     if file.endswith('.dcm') and os.path.isfile(filepath):
                         dicom_files.append(filepath)
@@ -859,6 +863,8 @@ def convert_with_dcm2niix(
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
 
                 for file in os.listdir(series_dir):
+                    if file.startswith('.'):
+                        continue
                     if file.endswith('.dcm'):
                         try:
                             os.remove(os.path.join(series_dir, file))

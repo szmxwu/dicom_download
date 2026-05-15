@@ -1443,6 +1443,8 @@ class DICOMDownloadClient:
 
             dicom_files = []
             for file in os.listdir(series_dir):
+                if file.startswith('.'):
+                    continue
                 filepath = os.path.join(series_dir, file)
                 if os.path.isfile(filepath) and self._is_dicom_file(filepath):
                     dicom_files.append(filepath)

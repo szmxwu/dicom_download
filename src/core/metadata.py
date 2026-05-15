@@ -133,6 +133,8 @@ def extract_dicom_metadata(
 
         dicom_files: List[str] = []
         for file in os.listdir(series_path):
+            if file.startswith('.'):
+                continue
             filepath = os.path.join(series_path, file)
             if file.endswith('.dcm') and os.path.isfile(filepath):
                 dicom_files.append(filepath)
