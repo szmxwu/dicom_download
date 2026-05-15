@@ -17,16 +17,29 @@
     "protocol_keywords": ["fs", "fatsat", "spair", "stir", "fat sep", "dixon"]
   },
   "atomic_features": {
-    "contrast_protocol_regex": "\\+c|post|gd|enh|contrast|\\u589e\\u5f3a|dyn",
-    "motion_correction_protocol_regex": "propeller|blade|radial|star"
+    "contrast_protocol_regex": "\\+c|post|gd|enh|contrast|增强|dyn",
+    "motion_correction_protocol_regex": "propeller|blade|radial|star",
+    "refined_image_type": {
+      "derived_keywords": ["derived", "secondary"],
+      "localizer_keywords": ["localizer", "survey", "scout"],
+      "original_requires": ["original", "primary"],
+      "default": "OTHER"
+    }
   },
   "subtype_suffix": {
     "water_tokens": ["WATER", " W ", "water"],
     "fat_tokens": ["FAT", " F ", "fat"],
     "inphase_tokens": ["INPHASE", " IP ", "in_phase", "inphase"],
     "outphase_tokens": ["OUTPHASE", " OP ", "out_phase", "outphase"],
+    "image_type_tokens": {
+      "WATER": "_WATER",
+      "FAT": "_FAT",
+      "INPHASE": "_INPHASE",
+      "OUTPHASE": "_OUTPHASE"
+    },
     "t2_star_echo_marker": "t2_star_echo",
-    "t2_star_echo_split_token": "echo"
+    "t2_star_echo_split_token": "echo",
+    "echo_suffix_template": "_ECHO{echo_num}"
   },
   "thresholds": {
     "field_strength": {
@@ -74,19 +87,22 @@
         "protocol_keywords": ["localizer", "survey", "scout"],
         "refinedImageType": "LOCALIZER"
       },
-      "T1_MAP": {"protocol_keywords": ["t1_map", "t1map"]},
-      "T2_MAP": {"protocol_keywords": ["t2_map", "t2map"]},
-      "ADC": {"protocol_keywords": ["adc"]},
-      "FA_MAP": {"protocol_keywords": ["fa_map"]},
-      "SUBTRACTION": {"protocol_keywords": ["sub", "subtract"]},
-      "MRA": {"protocol_keywords": ["mra", "mrv", "tof"]},
-      "SWI": {"protocol_keywords": ["swi", "swan"]},
-      "PWI": {"protocol_keywords": ["pwi", "perf", "dsc"]},
-      "MRS": {"protocol_keywords": ["mrs", "svs", "csi", "spectro"]},
-      "BREATH MOVEMENT": {"series_description_keywords": ["resp"]},
-      "MIP": {"series_description_keywords": ["mip"]}
+      "T1_MAP": { "protocol_keywords": ["t1_map", "t1map"] },
+      "T2_MAP": { "protocol_keywords": ["t2_map", "t2map"] },
+      "ADC": { "protocol_keywords": ["adc"] },
+      "FA_MAP": { "protocol_keywords": ["fa_map"] },
+      "SUBTRACTION": { "protocol_keywords": ["sub", "subtract"] },
+      "MRA": { "protocol_keywords": ["mra", "mrv", "tof"] },
+      "SWI": { "protocol_keywords": ["swi", "swan"] },
+      "PWI": { "protocol_keywords": ["pwi", "perf", "dsc"] },
+      "MRS": { "protocol_keywords": ["mrs", "svs", "csi", "spectro"] },
+      "BREATH MOVEMENT": { "series_description_keywords": ["resp"] },
+      "MIP": { "series_description_keywords": ["mip"] }
     },
     "dwi_b_value_min": 50,
+    "dti_name_keyword": "dti",
+    "dti_class": "DTI",
+    "dwi_class": "DWI",
     "fmri": {
       "scan_seq_token": "ep",
       "protocol_keywords": ["fmri", "bold"],
@@ -100,51 +116,75 @@
       "single_shot_protocol_keywords": ["haste", "ssfse"],
       "single_shot_etl_min": 128
     },
+    "ge_propeller": {
+      "scanning_sequence_token": "rm",
+      "etl_gt_1_family": "TSE",
+      "etl_lte_1_family": "SE"
+    },
     "fallback": {
       "tse_dark_fluid_to_flair": "tse_dark_fluid",
       "tse_tokens": ["tse", "fse"],
       "se_token": "se",
       "mpr_iso_tokens": ["mpr", "iso"],
-      "requires_dimension_for_flash3d": "3D"
+      "requires_dimension_for_flash3d": "3D",
+      "class_names": {
+        "t2_name_based": "T2_NAME_BASED",
+        "t1_name_based": "T1_NAME_BASED",
+        "t2_tse": "T2_TSE",
+        "t2_se": "T2_SE",
+        "t1_tse": "T1_TSE",
+        "t1_se": "T1_SE",
+        "t1_gre_flash3d": "T1_GRE_FLASH3D"
+      }
     },
     "motion_correction": {
       "protocol_keywords": ["blade", "propeller"],
       "suffix": "_MC"
     }
   },
-  "dynamic": {
-    "exclude_sequence_classes": [
-      "DWI",
-      "DTI",
-      "ADC",
-      "FA",
-      "MRS",
-      "PWI",
-      "ASL",
-      "LOCALIZER",
-      "DERIVED",
-      "SUBTRACTION",
-      "MAP",
-      "fMRI_BOLD",
-      "SWI",
-      "T2"
+  "hardware": {
+    "field_strength_bins": {
+      "bins": [-999999, 1.0, 2.0, 4.0, 999999],
+      "labels": ["Low-Field", "1.5T", "3.0T", "High-Field"],
+      "right": false
+    },
+    "manufacturer_map": [
+      {"pattern": "siemens", "name": "Siemens"},
+      {"pattern": "philips", "name": "Philips"},
+      {"pattern": "ge medical|ge healthcare", "name": "GE"},
+      {"pattern": "uih|united imaging", "name": "UIH"},
+      {"pattern": "anke", "name": "Anke"},
+      {"pattern": "canon", "name": "Canon"},
+      {"pattern": "fujifilm", "name": "Fujifilm"},
+      {"pattern": "hitachi", "name": "Hitachi"},
+      {"pattern": "mindray", "name": "Mindray"},
+      {"pattern": "shimadzu", "name": "Shimadzu"}
     ],
+    "manufacturer_default": "Other"
+  },
+  "dynamic": {
+    "exclude_sequence_classes": ["DWI", "DTI", "ADC", "FA", "MRS", "PWI", "ASL", "LOCALIZER", "DERIVED", "SUBTRACTION", "MAP", "fMRI_BOLD", "SWI", "T2"],
     "numeric_cols": ["RepetitionTime", "EchoTime", "FlipAngle", "SliceThickness", "SeriesTime"],
     "spatial_cols": ["ImagePositionPatient", "ImageOrientationPatient"],
     "list_round_decimals": 2,
     "numeric_round_decimals": 1,
-    "fingerprint_cols": [
-      "ImagePositionPatient_str",
-      "ImageOrientationPatient_str",
-      "sequenceClass",
-      "SliceThickness",
-      "RepetitionTime",
-      "EchoTime",
-      "FlipAngle"
-    ],
-    "contrast_protocol_regex": "\\+c|post|gd|enh|contrast|\\u589e\\u5f3a|dyn",
+    "fingerprint_cols": ["ImagePositionPatient_str", "ImageOrientationPatient_str", "sequenceClass", "SliceThickness", "RepetitionTime", "EchoTime", "FlipAngle"],
+    "contrast_protocol_regex": "\\+c|post|gd|enh|contrast|增强|dyn",
     "contrast_agent_exclude_regex": "no",
-    "exclude_sequence_regex": "DWI|T2|LOCALIZER"
+    "exclude_sequence_regex": "DWI|T2|LOCALIZER",
+    "phase_labels": {
+      "pre": "PRE",
+      "post_template": "POST_{index}"
+    }
+  },
+  "post_processing": {
+    "contrast_enhancement_override": {
+      "enabled": true,
+      "protocol_prefix": "t1",
+      "contrast_bolus_required": true,
+      "contrast_bolus_exclude_regex": "no",
+      "case_sensitive": false
+    }
   },
   "propagate": {
     "t1_contains": "T1",
