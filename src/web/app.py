@@ -1651,19 +1651,20 @@ def process_single_task(task):
                 if options.get('rename_mr_series') and results.get('organized_dir') and results.get('excel_file'):
                     task.add_log('Renaming MR series folders...')
                     try:
-                        rename_ok = task_client.rename_mr_series_folders(
+                        rename_map = task_client.rename_mr_series_folders(
                             results['organized_dir'],
                             results['excel_file']
                         )
-                        if rename_ok:
+                        if rename_map:
                             task.add_log('MR series folders renamed successfully')
-                            # 更新 series_info 以反映新的目录名
+                            # 仅更新原有 series_info 中的序列，避免引入被 organize 过滤掉的目录
                             if results.get('series_info'):
                                 updated_series_info = {}
-                                for item in os.listdir(results['organized_dir']):
-                                    item_path = os.path.join(results['organized_dir'], item)
-                                    if os.path.isdir(item_path):
-                                        updated_series_info[item] = {"path": item_path}
+                                for old_name, info in results['series_info'].items():
+                                    new_name = rename_map.get(old_name, old_name)
+                                    new_path = os.path.join(results['organized_dir'], new_name)
+                                    if os.path.isdir(new_path):
+                                        updated_series_info[new_name] = {"path": new_path}
                                 results['series_info'] = updated_series_info
                         else:
                             task.add_log('MR series rename skipped or failed', 'warning')
@@ -1867,17 +1868,18 @@ def process_batch_task(task):
                 # --- MR 序列重命名 ---
                 if options.get('rename_mr_series') and result and result.get('organized_dir') and result.get('excel_file'):
                     try:
-                        task_client.rename_mr_series_folders(
+                        rename_map = task_client.rename_mr_series_folders(
                             result['organized_dir'],
                             result['excel_file']
                         )
-                        # 更新 series_info
-                        if result.get('series_info'):
+                        # 仅更新原有 series_info 中的序列
+                        if rename_map and result.get('series_info'):
                             updated_series_info = {}
-                            for item in os.listdir(result['organized_dir']):
-                                item_path = os.path.join(result['organized_dir'], item)
-                                if os.path.isdir(item_path):
-                                    updated_series_info[item] = {"path": item_path}
+                            for old_name, info in result['series_info'].items():
+                                new_name = rename_map.get(old_name, old_name)
+                                new_path = os.path.join(result['organized_dir'], new_name)
+                                if os.path.isdir(new_path):
+                                    updated_series_info[new_name] = {"path": new_path}
                             result['series_info'] = updated_series_info
                     except Exception as rename_e:
                         task.add_log(f'{accno}: MR rename failed: {rename_e}', 'warning')

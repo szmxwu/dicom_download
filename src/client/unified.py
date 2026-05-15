@@ -1606,7 +1606,7 @@ class DICOMDownloadClient:
             excel_path: metadata Excel 路径
 
         Returns:
-            bool: 是否成功重命名
+            dict: 旧名称到新名称的映射字典，失败时返回空 dict
         """
         import pandas as pd
         import shutil
@@ -1615,17 +1615,17 @@ class DICOMDownloadClient:
         try:
             if not os.path.isfile(excel_path):
                 logger.warning("[MR_RENAME] Excel not found, skipping rename")
-                return False
+                return {}
 
             # 读取 metadata
             df = pd.read_excel(excel_path, sheet_name='DICOM_Metadata')
             if df.empty or 'Modality' not in df.columns:
-                return False
+                return {}
 
             mr_df = df[df['Modality'].astype(str).str.upper() == 'MR'].copy()
             if mr_df.empty:
                 logger.info("[MR_RENAME] No MR series found, skipping rename")
-                return False
+                return {}
 
             logger.info(f"[MR_RENAME] Processing {len(mr_df)} MR series for rename...")
 
@@ -1667,7 +1667,7 @@ class DICOMDownloadClient:
 
             if not rename_map:
                 logger.info("[MR_RENAME] No folders need renaming")
-                return True
+                return {}
 
             # 执行重命名
             renamed_count = 0
@@ -1697,10 +1697,10 @@ class DICOMDownloadClient:
                     df.to_excel(writer, sheet_name='DICOM_Metadata', index=False)
                 logger.info(f"[MR_RENAME] Updated Excel with {renamed_count} renamed folders")
 
-            return True
+            return rename_map
         except Exception as e:
             logger.error(f"[MR_RENAME] MR series rename failed: {e}")
-            return False
+            return {}
 
     def process_upload_workflow(self, zip_path, base_output_dir, options=None):
         """上传ZIP流程：extract -> organize -> convert -> metadata。"""
