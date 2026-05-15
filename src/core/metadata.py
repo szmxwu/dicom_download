@@ -138,6 +138,7 @@ def extract_dicom_metadata(
                 dicom_files.append(filepath)
 
         if not dicom_files:
+            logger.info(f"[META] No DICOM files in {series_folder}, trying cache")
             cache_path = os.path.join(series_path, "dicom_metadata_cache.json")
             if os.path.exists(cache_path):
                 cache_loaded = False
@@ -150,6 +151,7 @@ def extract_dicom_metadata(
                     sample_tags = cache.get('sample_tags') or {}
                     current_keywords = get_keywords(cached_modality) if cached_modality else []
                     read_all = cached_modality in ['DR', 'MG', 'DX', 'CR']
+                    logger.info(f"[META] Cache loaded for {series_folder}: modality={cached_modality}, records={len(cached_records)}, sample_tags_keys={list(sample_tags.keys()) if sample_tags else []}")
 
                     if cached_records:
                         for record in cached_records:
@@ -236,9 +238,11 @@ def extract_dicom_metadata(
                     for record in cached_records:
                         all_metadata.append(record)
                     cache_loaded = True
+                    logger.info(f"[META] Added {len(cached_records)} cached records for {series_folder}")
                     continue
                     
                 except Exception as e:
+                    logger.error(f"[META] Failed to load cache for {series_folder}: {e}")
                     print(f"     ⚠️  Failed to load cache for {series_folder}: {e}")
                     # If we have cached_records, still use them even if QC failed
                     if cached_records:
@@ -266,11 +270,13 @@ def extract_dicom_metadata(
 
         try:
             sample_file = dicom_files[0]
+            logger.info(f"[META] Reading DICOM for {series_folder}: {sample_file}, total_dicom_files={len(dicom_files)}")
             dcm = pydicom.dcmread(sample_file, force=True)
             modality = getattr(dcm, 'Modality', '')
             need_read_all = modality in ['DR', 'MG', 'DX', 'CR']
 
             current_keywords = get_keywords(modality)
+            logger.info(f"[META] DICOM read OK for {series_folder}: modality={modality}, keywords={len(current_keywords)}")
 
             # Get AccessionNumber from the sample DICOM
             accession_number = getattr(dcm, 'AccessionNumber', '')

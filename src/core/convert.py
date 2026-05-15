@@ -386,6 +386,7 @@ def convert_dicom_to_nifti(
                 dicom_files = []
 
         if dicom_files:
+            logger.info(f"[CONVERT_CACHE] Caching metadata before conversion: series={series_name}, files={len(dicom_files)}, modality={modality}")
             client._cache_metadata_for_series(series_dir, series_name, dicom_files, modality)
             client._write_minimal_cache(
                 series_dir,
@@ -394,6 +395,8 @@ def convert_dicom_to_nifti(
                 sample_dcm=sample_dcm,
                 file_count=len(dicom_files)
             )
+        else:
+            logger.warning(f"[CONVERT_CACHE] No dicom_files to cache for {series_name} before conversion")
 
         nifti_result = convert_with_dcm2niix(
             client, series_dir, series_name,

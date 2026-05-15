@@ -1036,11 +1036,15 @@ class DICOMDownloadClient:
     def _build_sample_tags(self, dcm):
         """从样本DICOM构建可序列化的tag信息。"""
         tags = {}
-        for tag_name in self._get_required_tag_names():
+        required_tags = self._get_required_tag_names()
+        logger.info(f"[TAGS] Building sample tags, required_tags_count={len(required_tags)}")
+        for tag_name in required_tags:
             try:
                 tags[tag_name] = self._normalize_tag_value(getattr(dcm, tag_name, None))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[TAGS] Failed to get tag {tag_name}: {e}")
                 tags[tag_name] = None
+        logger.info(f"[TAGS] Built {len(tags)} tags")
         return tags
 
     def _load_sample_tags_from_cache(self, series_dir):
@@ -1094,6 +1098,7 @@ class DICOMDownloadClient:
     def _write_minimal_cache(self, series_dir, series_name, modality, sample_dcm=None, file_count=0):
         cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
         if os.path.exists(cache_path):
+            logger.info(f"[MINIMAL_CACHE] Skipping minimal cache for {series_name}: cache already exists")
             return
 
         sample_tags = None
@@ -1102,7 +1107,8 @@ class DICOMDownloadClient:
                 sample_tags = self._build_sample_tags(sample_dcm)
                 if not sample_tags.get('Modality'):
                     sample_tags['Modality'] = modality
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[MINIMAL_CACHE] Failed to build sample_tags for {series_name}: {e}")
             sample_tags = None
 
         payload = {
@@ -1120,7 +1126,9 @@ class DICOMDownloadClient:
         try:
             with open(cache_path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception:
+            logger.info(f"[MINIMAL_CACHE] Written minimal cache for {series_name}: file_count={file_count}, sample_tags={'present' if sample_tags else 'None'}")
+        except Exception as e:
+            logger.error(f"[MINIMAL_CACHE] Failed to write minimal cache for {series_name}: {e}")
             return
     
     def _is_dicom_file(self, filepath):
@@ -1259,18 +1267,23 @@ class DICOMDownloadClient:
 
     def _cache_metadata_for_series(self, series_dir, series_name, dicom_files, modality):
         """缓存DICOM元数据，避免删除后无法提取标签"""
+        logger.info(f"[CACHE] _cache_metadata_for_series called: series={series_name}, modality={modality}, dicom_files_count={len(dicom_files) if dicom_files else 0}")
         try:
             if not dicom_files:
+                logger.warning(f"[CACHE] Skipping cache for {series_name}: dicom_files is empty")
                 return
 
             read_all = modality in ['DR', 'MG', 'DX', 'CR']
+            logger.info(f"[CACHE] Collecting metadata for {series_name}, read_all={read_all}")
             records = self._collect_metadata_from_dicoms(
                 dicom_files=dicom_files,
                 series_folder=series_name,
                 modality=modality,
                 read_all=read_all
             )
+            logger.info(f"[CACHE] _collect_metadata_from_dicoms returned {len(records)} records for {series_name}")
             if not records:
+                logger.warning(f"[CACHE] records empty for {series_name}, creating fallback record")
                 records = [
                     {
                         'SeriesFolder': series_name,
@@ -1282,11 +1295,14 @@ class DICOMDownloadClient:
 
             sample_tags = None
             try:
+                logger.info(f"[CACHE] Reading sample DICOM for tags: {dicom_files[0]}")
                 sample_dcm = pydicom.dcmread(dicom_files[0], force=True)
                 sample_tags = self._build_sample_tags(sample_dcm)
                 if not sample_tags.get('Modality'):
                     sample_tags['Modality'] = modality
-            except Exception:
+                logger.info(f"[CACHE] _build_sample_tags returned {len(sample_tags)} tags for {series_name}")
+            except Exception as e:
+                logger.warning(f"[CACHE] Failed to build sample_tags for {series_name}: {e}")
                 sample_tags = None
 
             cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
@@ -1297,7 +1313,9 @@ class DICOMDownloadClient:
             }
             with open(cache_path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception:
+            logger.info(f"[CACHE] Written cache for {series_name}: {len(records)} records, sample_tags={'present' if sample_tags else 'None'}")
+        except Exception as e:
+            logger.error(f"[CACHE] _cache_metadata_for_series failed for {series_name}: {e}")
             return
 
     def _collect_metadata_from_dicoms(self, dicom_files, series_folder, modality, read_all):
@@ -1305,9 +1323,11 @@ class DICOMDownloadClient:
         records = []
         try:
             if not dicom_files:
+                logger.warning(f"[COLLECT] dicom_files empty for {series_folder}")
                 return records
 
             current_keywords = self.get_keywords(modality)
+            logger.info(f"[COLLECT] series={series_folder}, modality={modality}, keywords_count={len(current_keywords)}, read_all={read_all}")
 
             if read_all:
                 for idx, dicom_file in enumerate(dicom_files):
@@ -1347,6 +1367,7 @@ class DICOMDownloadClient:
                         continue
             else:
                 sample_file = dicom_files[0]
+                logger.info(f"[COLLECT] Reading sample file for {series_folder}: {sample_file}")
                 dcm = pydicom.dcmread(sample_file, force=True)
                 metadata = {
                     'SeriesFolder': series_folder,
@@ -1377,7 +1398,9 @@ class DICOMDownloadClient:
                     metadata['Rows'] = metadata.get('Rows', '')
                     metadata['Columns'] = metadata.get('Columns', '')
                 records.append(metadata)
-        except Exception:
+                logger.info(f"[COLLECT] Appended metadata record for {series_folder} with {len(metadata)} fields")
+        except Exception as e:
+            logger.error(f"[COLLECT] Exception in _collect_metadata_from_dicoms for {series_folder}: {e}")
             return []
         return records
 

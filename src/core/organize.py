@@ -410,7 +410,7 @@ def process_single_series(
         except Exception:
             modality = ''
 
-    # 确保元数据缓存
+    logger.info(f"[ORG] Ensuring metadata cache for {series_folder}: modality={modality}, files={len(dicom_files)}")
     client._ensure_metadata_cache(series_path, series_folder, dicom_files, modality)
     client._write_minimal_cache(
         series_path,

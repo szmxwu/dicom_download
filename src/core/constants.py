@@ -14,7 +14,7 @@ DEFAULT_DERIVED_SERIES_KEYWORDS = [
     'REF', 'REFERENCE', 'LOC', 'BATCH',
     'AVERAGE', 'SUM', 'REFORMAT',
     'PROJECTION', 'RAYSUM', 'KEY', 'ROI','DOSE',
-    'TRACKER'
+    'TRACKER',"nodule","AI_"
 ]
 
 # 运行时可修改的过滤关键词（模块级可变状态）
