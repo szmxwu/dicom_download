@@ -223,7 +223,11 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
     df['isContrastEnhanced'] = df['protocolName_lower'].str.contains(contrast_regex, na=False, regex=True)
 
     motion_regex = str(atomic_cfg.get('motion_correction_protocol_regex', 'propeller|blade|radial|star'))
-    df['hasMotionCorrection'] = df['protocolName_lower'].str.contains(motion_regex, na=False, regex=True)
+    # P0 fix: 同时检查 ProtocolName 和 SeriesDescription，因为 ProtocolName 可能不包含 motion correction 关键词
+    df['hasMotionCorrection'] = (
+        df['protocolName_lower'].str.contains(motion_regex, na=False, regex=True)
+        | df.get('SeriesDescription', pd.Series(index=df.index)).astype(str).str.lower().str.contains(motion_regex, na=False, regex=True)
+    )
 
     # 4. 图像类型 (Refined ImageType)
     # 优先从权威的'ImageType'字段判断，若无则尝试从协议名猜测
@@ -427,6 +431,12 @@ def classify_sequence(row, cfg: dict):
                         seq_family = 'TSE'
                     else:
                         seq_family = 'SE'
+                # P0 fix: GE Propeller/BLADE 使用 ScanningSequence="RM"，本质是 FSE/TSE 家族
+                elif 'rm' in scan_seq:
+                    if etl > 1:
+                        seq_family = 'TSE'
+                    else:
+                        seq_family = 'SE'
 
                 # 3b. 根据家族和TR/TE判断对比度
                 if seq_family == 'SE_SingleShot':
@@ -442,7 +452,10 @@ def classify_sequence(row, cfg: dict):
     # --- 规则C: 兜底方案 - 基于名称的最终猜测 (仅当以上规则全部失败) ---
     if base_class == 'UNKNOWN':
         fallback_cfg = classification_cfg.get('fallback', {})
-        if 't2' in name:
+        # P0 fix: 当 ProtocolName 不包含关键词时，回退检查 SeriesDescription
+        desc = str(row.get('SeriesDescription', '')).lower()
+        combined_name = name + ' ' + desc
+        if 't2' in combined_name:
             if seq_family == 'UNKNOWN':
                 tse_tokens = [str(x).lower() for x in fallback_cfg.get('tse_tokens', ['tse', 'fse'])]
                 if any(t in name for t in tse_tokens):
@@ -454,9 +467,9 @@ def classify_sequence(row, cfg: dict):
             else:
                 base_class = 'T2_' + seq_family
 
-        if str(fallback_cfg.get('tse_dark_fluid_to_flair', 'tse_dark_fluid')).lower() in name:
+        if str(fallback_cfg.get('tse_dark_fluid_to_flair', 'tse_dark_fluid')).lower() in combined_name:
             base_class = 'T2_FLAIR'
-        elif 't1' in name:
+        elif 't1' in combined_name:
             if seq_family == 'UNKNOWN':
                 tse_tokens = [str(x).lower() for x in fallback_cfg.get('tse_tokens', ['tse', 'fse'])]
                 if any(t in name for t in tse_tokens):
@@ -472,13 +485,13 @@ def classify_sequence(row, cfg: dict):
                     base_class = 'T1_NAME_BASED'
             else:
                 base_class = 'T1_' + seq_family
-        elif 'pd' in name:
+        elif 'pd' in combined_name:
             base_class = 'PD_' + seq_family
-        elif 'flair' in name:
+        elif 'flair' in combined_name:
             base_class = 'T2_FLAIR'
-        elif 'stir' in name:
+        elif 'stir' in combined_name:
             base_class = 'T2_STIR'
-        elif 'dwi' in name or 'diff' in name:
+        elif 'dwi' in combined_name or 'diff' in combined_name:
             base_class = 'DWI'
 
     # --- 4. 后处理：附加属性后缀 ---
