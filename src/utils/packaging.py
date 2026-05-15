@@ -68,6 +68,8 @@ def create_result_zip(
                     continue
                 for root, _, files in os.walk(subdir_path):
                     for file in files:
+                        if file == '.processing_lock':
+                            continue
                         file_path = os.path.join(root, file)
                         arc_name = os.path.relpath(file_path, source_dir)
                         zipf.write(file_path, arc_name)
@@ -75,6 +77,8 @@ def create_result_zip(
             # 打包源目录中的所有文件（原有行为）
             for root, _, files in os.walk(source_dir):
                 for file in files:
+                    if file == '.processing_lock':
+                        continue
                     file_path = os.path.join(root, file)
                     arc_name = os.path.relpath(file_path, source_dir)
                     zipf.write(file_path, arc_name)

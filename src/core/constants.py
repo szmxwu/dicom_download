@@ -17,6 +17,14 @@ DEFAULT_DERIVED_SERIES_KEYWORDS = [
     'TRACKER',"nodule","AI_"
 ]
 
+# 当 ImageType[0] == 'DERIVED' 时，部分临床有意义的序列不应被过滤。
+# 白名单用于保留 ADC/Dixon 等后处理序列。
+DERIVED_IMAGE_TYPE_WHITELIST = [
+    'ADC', 'EADC', 'WATER', 'FAT',
+    'IN PHASE', 'INPHASE', 'OUT PHASE', 'OUTPHASE',
+    'IDEAL', 'T1 MAP', 'T2 MAP', 'FA MAP',
+]
+
 # 运行时可修改的过滤关键词（模块级可变状态）
 # 通过 get_derived_keywords() / set_derived_keywords() 访问
 _runtime_derived_keywords = list(DEFAULT_DERIVED_SERIES_KEYWORDS)

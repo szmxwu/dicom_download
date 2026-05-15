@@ -123,8 +123,10 @@
     },
     "fallback": {
       "tse_dark_fluid_to_flair": "tse_dark_fluid",
-      "tse_tokens": ["tse", "fse"],
+      "tse_tokens": ["tse", "fse", "space", "cube", "haste", "ssfse"],
       "se_token": "se",
+      "gre_tokens": ["gre", "gr", "vibe", "lava", "bravo", "flash", "ffe", "tfe", "spgr", "mprage"],
+      "steady_state_tokens": ["truefisp", "fiesta", "bffe", "balanced", "steady_state"],
       "mpr_iso_tokens": ["mpr", "iso"],
       "requires_dimension_for_flash3d": "3D",
       "class_names": {

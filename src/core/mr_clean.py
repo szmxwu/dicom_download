@@ -200,12 +200,12 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
         print("Stage 1: extracting atomic features...")
 
     # -- 预处理 --
-    # 为关键词匹配准备小写、无空值的列
-    df['protocolName_lower'] = df['ProtocolName'].astype(
-        str).str.lower().fillna('')
+    # 为关键词匹配准备小写、无空值的列（保护缺失列）
+    df['protocolName_lower'] = df.get('ProtocolName', pd.Series(
+        index=df.index, dtype=str)).astype(str).str.lower().fillna('')
     # ImageType是权威的DICOM标签，应优先使用
     df['imageType_lower'] = df.get('ImageType', pd.Series(
-        index=df.index)).astype(str).str.lower().fillna('')
+        index=df.index, dtype=str)).astype(str).str.lower().fillna('')
 
     # -- 特征提取 --
     atomic_cfg = cfg.get('atomic_features', {})
@@ -215,19 +215,23 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
 
     # 2. 维度 (Dimension)
     df['standardDimension'] = df.get('MRAcquisitionType', pd.Series(
-        index=df.index)).astype(str).fillna('UNKNOWN')
+        index=df.index, dtype=str)).astype(str).fillna('UNKNOWN')
 
     # 3. 附加技术特征 (布尔型)
     df['isFatSuppressed'] = df.apply(lambda r: detect_fat_suppression(r, cfg), axis=1)
 
     contrast_regex = str(atomic_cfg.get('contrast_protocol_regex', r'\+c|post|gd|enh|contrast|增强|dyn'))
-    df['isContrastEnhanced'] = df['protocolName_lower'].str.contains(contrast_regex, na=False, regex=True)
+    # P1 fix: 同时检查 ProtocolName 和 SeriesDescription
+    df['isContrastEnhanced'] = (
+        df['protocolName_lower'].str.contains(contrast_regex, na=False, regex=True)
+        | df.get('SeriesDescription', pd.Series(index=df.index, dtype=str)).astype(str).str.lower().str.contains(contrast_regex, na=False, regex=True)
+    )
 
     motion_regex = str(atomic_cfg.get('motion_correction_protocol_regex', 'propeller|blade|radial|star'))
     # P0 fix: 同时检查 ProtocolName 和 SeriesDescription，因为 ProtocolName 可能不包含 motion correction 关键词
     df['hasMotionCorrection'] = (
         df['protocolName_lower'].str.contains(motion_regex, na=False, regex=True)
-        | df.get('SeriesDescription', pd.Series(index=df.index)).astype(str).str.lower().str.contains(motion_regex, na=False, regex=True)
+        | df.get('SeriesDescription', pd.Series(index=df.index, dtype=str)).astype(str).str.lower().str.contains(motion_regex, na=False, regex=True)
     )
 
     # 4. 图像类型 (Refined ImageType)
@@ -241,9 +245,10 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
     def get_refined_type(row):
         img_type = row['imageType_lower']
         protocol_name = row['protocolName_lower']
+        series_desc = str(row.get('SeriesDescription', '')).lower()
         if any(k in img_type for k in derived_keywords):
             return 'DERIVED'
-        if any(k in img_type or k in protocol_name for k in localizer_keywords):
+        if any(k in img_type or k in protocol_name or k in series_desc for k in localizer_keywords):
             return 'LOCALIZER'
         if all(k in img_type for k in original_requires):
             return 'ORIGINAL'
@@ -296,7 +301,8 @@ def get_subtype_suffix(row, cfg: dict):
         'OUTPHASE': '_OUTPHASE'
     })
     for token, suffix in image_type_tokens.items():
-        if token in img_type_parts or any(t in desc for t in subtype_cfg.get(f'{token.lower()}_tokens', [token])):
+        search_tokens = [str(t).lower() for t in subtype_cfg.get(f'{token.lower()}_tokens', [token])]
+        if token in img_type_parts or any(t in desc for t in search_tokens):
             return suffix
 
     # --- 识别其他可能的多回波/多参数输出 ---
@@ -340,6 +346,7 @@ def classify_sequence(row, cfg: dict):
     img_type = row.get('refinedImageType', '')
     field_strength = row.get('standardFieldStrength', 'default')
     standardDimension= row.get('standardDimension', '')
+    combined_name = name + ' ' + SeriesDescription  # 提前定义，供 RuleB/C 共用
 
     tr = safe_to_numeric(row.get('RepetitionTime'))
     te = safe_to_numeric(row.get('EchoTime'))
@@ -363,28 +370,37 @@ def classify_sequence(row, cfg: dict):
     # --- 规则A: 优先处理基于名称的、明确的特殊序列 ---
     ruleA = classification_cfg.get('ruleA', {})
 
+    # Helper: check keywords against both ProtocolName and SeriesDescription
+    def _check_keywords(rule_name, default_keywords, check_name=True, check_desc=True):
+        keywords = [str(x).lower() for x in ruleA.get(rule_name, {}).get('protocol_keywords', default_keywords)]
+        if check_name and any(k in name for k in keywords):
+            return True
+        if check_desc and any(k in SeriesDescription for k in keywords):
+            return True
+        return False
+
     localizer_rule = ruleA.get('LOCALIZER', {})
     localizer_keywords = [str(x).lower() for x in localizer_rule.get('protocol_keywords', ['localizer', 'survey', 'scout'])]
     localizer_img_type = str(localizer_rule.get('refinedImageType', 'LOCALIZER'))
-    if any(k in name for k in localizer_keywords) or img_type == localizer_img_type:
+    if any(k in name for k in localizer_keywords) or any(k in SeriesDescription for k in localizer_keywords) or img_type == localizer_img_type:
         base_class = 'LOCALIZER'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('T1_MAP', {}).get('protocol_keywords', ['t1_map', 't1map'])]):
+    elif _check_keywords('T1_MAP', ['t1_map', 't1map']):
         base_class = 'T1_MAP'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('T2_MAP', {}).get('protocol_keywords', ['t2_map', 't2map'])]):
+    elif _check_keywords('T2_MAP', ['t2_map', 't2map']):
         base_class = 'T2_MAP'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('ADC', {}).get('protocol_keywords', ['adc'])]):
+    elif _check_keywords('ADC', ['adc']):
         base_class = 'ADC'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('FA_MAP', {}).get('protocol_keywords', ['fa_map'])]):
+    elif _check_keywords('FA_MAP', ['fa_map']):
         base_class = 'FA_MAP'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('SUBTRACTION', {}).get('protocol_keywords', ['sub', 'subtract'])]):
+    elif _check_keywords('SUBTRACTION', ['sub', 'subtract']):
         base_class = 'SUBTRACTION'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('MRA', {}).get('protocol_keywords', ['mra', 'mrv', 'tof'])]):
+    elif _check_keywords('MRA', ['mra', 'mrv', 'tof']):
         base_class = 'MRA'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('SWI', {}).get('protocol_keywords', ['swi', 'swan'])]):
+    elif _check_keywords('SWI', ['swi', 'swan']):
         base_class = 'SWI'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('PWI', {}).get('protocol_keywords', ['pwi', 'perf', 'dsc'])]):
+    elif _check_keywords('PWI', ['pwi', 'perf', 'dsc']):
         base_class = 'PWI'
-    elif any(k in name for k in [str(x).lower() for x in ruleA.get('MRS', {}).get('protocol_keywords', ['mrs', 'svs', 'csi', 'spectro'])]):
+    elif _check_keywords('MRS', ['mrs', 'svs', 'csi', 'spectro']):
         base_class = 'MRS'
     elif any(k in SeriesDescription for k in [str(x).lower() for x in ruleA.get('BREATH MOVEMENT', {}).get('series_description_keywords', ['resp'])]):
         base_class = 'BREATH MOVEMENT'
@@ -398,13 +414,13 @@ def classify_sequence(row, cfg: dict):
         dti_class = str(classification_cfg.get('dti_class', 'DTI'))
         dwi_class = str(classification_cfg.get('dwi_class', 'DWI'))
         if b_val > dwi_min:
-            base_class = dti_class if dti_keyword in name else dwi_class
+            base_class = dti_class if (dti_keyword in name or dti_keyword in SeriesDescription) else dwi_class
         else:
             fmri_cfg = classification_cfg.get('fmri', {})
             fmri_seq_token = str(fmri_cfg.get('scan_seq_token', 'ep')).lower()
             fmri_name_keywords = [str(x).lower() for x in fmri_cfg.get('protocol_keywords', ['fmri', 'bold'])]
             fmri_class = str(fmri_cfg.get('class', 'fMRI_BOLD'))
-            if fmri_seq_token in scan_seq and any(k in name for k in fmri_name_keywords):
+            if fmri_seq_token in scan_seq and (any(k in name for k in fmri_name_keywords) or any(k in SeriesDescription for k in fmri_name_keywords)):
                 base_class = fmri_class
 
         # 物理规则2/3: 仅当仍未知时，继续形态学判断
@@ -437,16 +453,23 @@ def classify_sequence(row, cfg: dict):
                 elif se_token in scan_seq:
                     single_shot_keywords = [str(x).lower() for x in fam_cfg.get('single_shot_protocol_keywords', ['haste', 'ssfse'])]
                     single_shot_etl_min = safe_to_numeric(fam_cfg.get('single_shot_etl_min', 128))
-                    if any(k in name for k in single_shot_keywords) or etl > single_shot_etl_min:
+                    # P1 fix: 3D TSE (SPACE/CUBE) 的ETL也可能很大，不应误判为单发
+                    is_3d = str(standardDimension).upper() == '3D'
+                    has_single_shot_name = any(k in name for k in single_shot_keywords) or any(k in SeriesDescription for k in single_shot_keywords)
+                    has_single_shot_etl = pd.notnull(etl) and etl > single_shot_etl_min and not is_3d
+                    if has_single_shot_name or has_single_shot_etl:
                         seq_family = 'SE_SingleShot'
-                    elif etl > 1:
+                    elif pd.notnull(etl) and etl > 1:
                         seq_family = 'TSE'
                     else:
                         seq_family = 'SE'
                 ge_prop_cfg = classification_cfg.get('ge_propeller', {})
                 ge_prop_token = str(ge_prop_cfg.get('scanning_sequence_token', 'rm')).lower()
                 if ge_prop_token in scan_seq:
-                    if etl > 1:
+                    if pd.notnull(etl) and etl > 1:
+                        seq_family = str(ge_prop_cfg.get('etl_gt_1_family', 'TSE'))
+                    elif pd.isnull(etl):
+                        # ETL缺失时，Propeller默认归为TSE（临床常规）
                         seq_family = str(ge_prop_cfg.get('etl_gt_1_family', 'TSE'))
                     else:
                         seq_family = str(ge_prop_cfg.get('etl_lte_1_family', 'SE'))
@@ -458,8 +481,12 @@ def classify_sequence(row, cfg: dict):
                     if te > safe_to_numeric(P.get('t2_te_min')):
                         base_class = 'T2_' + seq_family
                     elif tr < safe_to_numeric(P.get('t1_tr_max')) and te < safe_to_numeric(P.get('t1_te_max')):
-                        base_class = 'T1_' + seq_family
-                    elif tr > safe_to_numeric(P.get('t2_tr_min')) and te < safe_to_numeric(P.get('pd_te_max')) and 'pd' in name:
+                        # P1 fix: TrueFISP/bFFE/FIESTA 等 steady state 序列若名称含 t2，归为 T2
+                        if 't2' in combined_name and seq_family in ('GRE_STEADY_STATE', 'GRE'):
+                            base_class = 'T2_' + seq_family
+                        else:
+                            base_class = 'T1_' + seq_family
+                    elif tr > safe_to_numeric(P.get('t2_tr_min')) and te < safe_to_numeric(P.get('pd_te_max')) and ('pd' in name or 'pd' in SeriesDescription or 'proton' in name or 'proton' in SeriesDescription):
                         base_class = 'PD_' + seq_family
 
     # --- 规则C: 兜底方案 - 基于名称的最终猜测 (仅当以上规则全部失败) ---
@@ -475,14 +502,12 @@ def classify_sequence(row, cfg: dict):
         t1_gre_flash3d = str(class_names.get('t1_gre_flash3d', 'T1_GRE_FLASH3D'))
 
         # P0 fix: 当 ProtocolName 不包含关键词时，回退检查 SeriesDescription
-        desc = str(row.get('SeriesDescription', '')).lower()
-        combined_name = name + ' ' + desc
         if 't2' in combined_name:
             if seq_family == 'UNKNOWN':
-                tse_tokens = [str(x).lower() for x in fallback_cfg.get('tse_tokens', ['tse', 'fse'])]
-                if any(t in name for t in tse_tokens):
+                tse_tokens = [str(x).lower() for x in fallback_cfg.get('tse_tokens', ['tse', 'fse', 'space', 'cube', 'haste', 'ssfse'])]
+                if any(t in combined_name for t in tse_tokens):
                     base_class = t2_tse
-                elif str(fallback_cfg.get('se_token', 'se')).lower() in name:
+                elif str(fallback_cfg.get('se_token', 'se')).lower() in combined_name:
                     base_class = t2_se
                 else:
                     base_class = t2_name_based
@@ -493,10 +518,10 @@ def classify_sequence(row, cfg: dict):
             base_class = 'T2_FLAIR'
         elif 't1' in combined_name:
             if seq_family == 'UNKNOWN':
-                tse_tokens = [str(x).lower() for x in fallback_cfg.get('tse_tokens', ['tse', 'fse'])]
-                if any(t in name for t in tse_tokens):
+                tse_tokens = [str(x).lower() for x in fallback_cfg.get('tse_tokens', ['tse', 'fse', 'space', 'cube', 'haste', 'ssfse'])]
+                if any(t in combined_name for t in tse_tokens):
                     base_class = t1_tse
-                elif str(fallback_cfg.get('se_token', 'se')).lower() in name:
+                elif str(fallback_cfg.get('se_token', 'se')).lower() in combined_name:
                     base_class = t1_se
                 elif (
                     all(t in name for t in [str(x).lower() for x in fallback_cfg.get('mpr_iso_tokens', ['mpr', 'iso'])])
@@ -507,13 +532,13 @@ def classify_sequence(row, cfg: dict):
                     base_class = t1_name_based
             else:
                 base_class = 'T1_' + seq_family
-        elif 'pd' in combined_name:
+        elif 'pd' in combined_name or 'proton' in combined_name:
             base_class = 'PD_' + seq_family
-        elif 'flair' in combined_name:
+        elif 'flair' in combined_name or 'tirm' in combined_name:
             base_class = 'T2_FLAIR'
         elif 'stir' in combined_name:
             base_class = 'T2_STIR'
-        elif 'dwi' in combined_name or 'diff' in combined_name:
+        elif 'dwi' in combined_name or 'diff' in combined_name or 'ep2d' in combined_name:
             base_class = 'DWI'
 
     # --- 4. 后处理：附加属性后缀 ---
@@ -532,7 +557,7 @@ def classify_sequence(row, cfg: dict):
     return 'UNKNOWN'
 
 
-def extract_hardware_features(df, progress_callback=None):
+def extract_hardware_features(df, cfg: dict, progress_callback=None):
     """
     阶段三：提取硬件环境与高级参数特征。
 
@@ -678,6 +703,11 @@ def analyze_dynamic_series(df, cfg: dict, progress_callback=None):
         ['ImagePositionPatient_str', 'ImageOrientationPatient_str', 'sequenceClass', 'SliceThickness', 'RepetitionTime', 'EchoTime', 'FlipAngle'],
     )
 
+    # 确保 fingerprint 所需列都存在
+    for col in fingerprint_cols:
+        if col not in df_eligible.columns:
+            df_eligible[col] = 'NA'
+
     # 临时填充空值以确保它们能被包含在指纹中
     temp_fp_df = df_eligible[fingerprint_cols].copy()
     numeric_round_decimals = int(dynamic_cfg.get('numeric_round_decimals', 1))
@@ -690,6 +720,12 @@ def analyze_dynamic_series(df, cfg: dict, progress_callback=None):
     df_eligible['fingerprint'] = temp_fp_df.astype(str).agg('_'.join, axis=1)
 
     # --- 4. 按研究（Study）分组并识别动态集合 ---
+    if 'StudyInstanceUID' not in df_eligible.columns:
+        if progress_callback:
+            progress_callback("Warning: StudyInstanceUID column missing, skipping dynamic analysis.", "warning_missing_study_uid")
+        else:
+            print("Warning: StudyInstanceUID column missing, skipping dynamic analysis.")
+        return df
     grouped = df_eligible.groupby('StudyInstanceUID')
     next_dynamic_group_id = 1
 
@@ -734,11 +770,18 @@ def analyze_dynamic_series(df, cfg: dict, progress_callback=None):
     agent_exclude_regex = str(dynamic_cfg.get('contrast_agent_exclude_regex', 'no'))
     exclude_seq_regex = str(dynamic_cfg.get('exclude_sequence_regex', 'DWI|T2|LOCALIZER'))
 
+    # 保护 ContrastBolusAgent 列缺失的情况
+    contrast_bolus_present = df.get('ContrastBolusAgent', pd.Series(index=df.index)).notna()
+    contrast_bolus_valid = ~df.get('ContrastBolusAgent', pd.Series(index=df.index, dtype=str)).astype(str).str.contains(agent_exclude_regex, case=False, na=True, regex=True)
+    # P1 fix: 同时检查 ProtocolName 和 SeriesDescription 中的增强关键词
+    has_contrast_keyword = (
+        df['protocolName_lower'].str.contains(contrast_regex, na=False, regex=True)
+        | df.get('SeriesDescription', pd.Series(index=df.index, dtype=str)).astype(str).str.lower().str.contains(contrast_regex, na=False, regex=True)
+    )
     df['isContrastEnhanced'] = (
-        (df['dynamicPhase'].str.startswith('POST', na=False)
-         | df['protocolName_lower'].str.contains(contrast_regex, na=False, regex=True))
-        & df['ContrastBolusAgent'].notna()
-        & (~df['ContrastBolusAgent'].astype(str).str.contains(agent_exclude_regex, case=False, na=True, regex=True))
+        (df['dynamicPhase'].str.startswith('POST', na=False) | has_contrast_keyword)
+        & contrast_bolus_present
+        & contrast_bolus_valid
         & (~df['sequenceClass'].astype(str).str.contains(exclude_seq_regex, case=False, na=True, regex=True))
     )
     # done message already handled above
@@ -766,6 +809,12 @@ def propagate_enhancement_status(df, cfg: dict, progress_callback=None):
         print("Stage 5: propagating enhancement status to detect delayed single-phase enhancement...")
 
     # 在同一个Study内部进行状态传播
+    if 'StudyInstanceUID' not in df.columns:
+        if progress_callback:
+            progress_callback("Warning: StudyInstanceUID column missing, skipping enhancement propagation.", "warning_missing_study_uid")
+        else:
+            print("Warning: StudyInstanceUID column missing, skipping enhancement propagation.")
+        return df
     grouped = df.groupby('StudyInstanceUID')
 
     for study_id, group in grouped:
@@ -826,7 +875,7 @@ def process_mri_dataframe(df, cfg: Optional[Dict] = None, config_path: Optional[
     df_featured = extract_atomic_features(df_copy, cfg, progress_callback=progress_callback)
 
     # Stage 2: hardware features
-    df_hardware_featured = extract_hardware_features(df_featured, progress_callback=progress_callback)
+    df_hardware_featured = extract_hardware_features(df_featured, cfg, progress_callback=progress_callback)
 
     # Stage 3: classification
     if progress_callback:
@@ -848,9 +897,11 @@ def process_mri_dataframe(df, cfg: Optional[Dict] = None, config_path: Optional[
 
         mask = df_dynamic['protocolName_lower'].str.startswith(protocol_prefix, na=False)
         if bolus_required:
-            mask = mask & df_dynamic['ContrastBolusAgent'].notna()
-            mask = mask & (~df_dynamic['ContrastBolusAgent'].astype(str).str.contains(bolus_exclude, flags=flags, na=True, regex=True))
-        df_dynamic['isContrastEnhanced'] = mask
+            bolus_series = df_dynamic.get('ContrastBolusAgent', pd.Series(index=df_dynamic.index))
+            mask = mask & bolus_series.notna()
+            mask = mask & (~bolus_series.astype(str).str.contains(bolus_exclude, flags=flags, na=True, regex=True))
+        # P1 fix: 只更新符合条件的行，不覆盖 Stage 4 已识别的增强序列
+        df_dynamic.loc[mask, 'isContrastEnhanced'] = True
     else:
         # 保持 analyze_dynamic_series 计算的值
         pass
