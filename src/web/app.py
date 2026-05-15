@@ -51,6 +51,10 @@ import secrets
 # 导入我们的DICOM处理客户端
 from src.client.unified import DICOMDownloadClient
 from src.utils.packaging import create_result_zip
+from src.utils.cache import (
+    get_cache_dir, cache_exists, copy_from_cache,
+    save_to_cache, clear_all_cache, get_cache_stats
+)
 from src.core.constants import (
     DEFAULT_DERIVED_SERIES_KEYWORDS,
     get_derived_keywords,
@@ -1109,6 +1113,27 @@ def system_status():
     return jsonify(response)
 
 
+@app.route('/api/cache/stats')
+def cache_stats():
+    """获取磁盘缓存统计信息"""
+    stats = get_cache_stats(app.config['RESULT_FOLDER'])
+    return jsonify(stats)
+
+
+@app.route('/api/cache/clear', methods=['POST'])
+def clear_cache():
+    """后台异步清除磁盘缓存"""
+    def do_clear():
+        try:
+            result = clear_all_cache(app.config['RESULT_FOLDER'])
+            logger.info(f"Cache cleared: {result['message']}")
+        except Exception as e:
+            logger.error(f"Cache clear failed: {e}")
+
+    threading.Thread(target=do_clear, daemon=True).start()
+    return jsonify({'status': 'started', 'message': 'Cache clearing started in background'})
+
+
 @app.route('/api/system/monitoring')
 def get_system_monitoring():
     """Get detailed system monitoring information for the monitoring dashboard."""
@@ -1545,7 +1570,26 @@ def process_single_task(task):
         result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id)
         os.makedirs(result_dir, exist_ok=True)
         task.add_log(f"Created result directory: {result_dir}")
-        
+
+        # --- 磁盘缓存检查 ---
+        cache_dir = get_cache_dir(app.config['RESULT_FOLDER'], accession_number, options)
+        if cache_exists(cache_dir):
+            task.update_status('running', 30, 'Loading from disk cache')
+            task.add_log(f"Cache hit for {accession_number}, loading from disk...")
+            try:
+                cached_results = copy_from_cache(cache_dir, result_dir, task.task_id)
+                if cached_results.get('success'):
+                    task.result = cached_results
+                    task.update_status('completed', 100, 'Completed (from cache)')
+                    task.add_log('✅ Loaded from disk cache successfully!', 'success')
+                    task.end_time = time.time()
+                    _record_task_completion(task)
+                    logger.info(f"Task {task.task_id} loaded from cache: {cache_dir}")
+                    return
+            except Exception as e:
+                task.add_log(f"Cache load failed, will download from PACS: {e}", 'warning')
+                logger.warning(f"Cache load failed for {task.task_id}: {e}")
+
         # 设置处理步骤
         task.steps = ['Connect Service', 'Query Data', 'Download Files', 'Organize Files', 'NIfTI Conversion', 'Extract Metadata']
         
@@ -1602,6 +1646,30 @@ def process_single_task(task):
             if results and results.get('success'):
                 task.update_status('running', 90, 'Generating results')
                 task.add_log('Process successful, generating results...')
+
+                # --- MR 序列重命名 ---
+                if options.get('rename_mr_series') and results.get('organized_dir') and results.get('excel_file'):
+                    task.add_log('Renaming MR series folders...')
+                    try:
+                        rename_ok = task_client.rename_mr_series_folders(
+                            results['organized_dir'],
+                            results['excel_file']
+                        )
+                        if rename_ok:
+                            task.add_log('MR series folders renamed successfully')
+                            # 更新 series_info 以反映新的目录名
+                            if results.get('series_info'):
+                                updated_series_info = {}
+                                for item in os.listdir(results['organized_dir']):
+                                    item_path = os.path.join(results['organized_dir'], item)
+                                    if os.path.isdir(item_path):
+                                        updated_series_info[item] = {"path": item_path}
+                                results['series_info'] = updated_series_info
+                        else:
+                            task.add_log('MR series rename skipped or failed', 'warning')
+                    except Exception as rename_e:
+                        logger.warning(f"MR rename error: {rename_e}")
+                        task.add_log(f'MR series rename failed: {rename_e}', 'warning')
                 
                 # 创建结果ZIP文件
                 if results.get('organized_dir'):
@@ -1623,6 +1691,19 @@ def process_single_task(task):
                         task.add_log(f'Failed to create ZIP: {str(zip_e)}', 'error')
                         raise
                 
+                # --- 保存到磁盘缓存 ---
+                try:
+                    save_to_cache(
+                        results['organized_dir'],
+                        cache_dir,
+                        zip_path=results.get('result_zip'),
+                        excel_path=results.get('excel_file')
+                    )
+                    task.add_log(f"Saved result to disk cache")
+                    logger.info(f"Task {task.task_id} saved to cache: {cache_dir}")
+                except Exception as cache_e:
+                    logger.warning(f"Failed to save cache for {task.task_id}: {cache_e}")
+
                 task.result = results
                 task.update_status('completed', 100, 'Completed')
                 task.add_log('✅ Process completed successfully!', 'success')
@@ -1755,6 +1836,19 @@ def process_batch_task(task):
             # 创建单独的结果目录
             result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id, accno)
             os.makedirs(result_dir, exist_ok=True)
+
+            # --- 磁盘缓存检查 ---
+            cache_dir = get_cache_dir(app.config['RESULT_FOLDER'], accno, options)
+            if cache_exists(cache_dir):
+                task.add_log(f"{accno}: Cache hit, loading from disk...")
+                try:
+                    cached_result = copy_from_cache(cache_dir, result_dir, task.task_id)
+                    if cached_result.get('success'):
+                        results.append(cached_result)
+                        task.add_log(f'{accno}: Loaded from cache')
+                        continue
+                except Exception as e:
+                    task.add_log(f"{accno}: Cache load failed, will download: {e}", 'warning')
             
             try:
                 result = task_client.process_complete_workflow(
@@ -1769,6 +1863,47 @@ def process_batch_task(task):
                     min_series_files=min_series_files,
                     exclude_derived=exclude_derived
                 )
+
+                # --- MR 序列重命名 ---
+                if options.get('rename_mr_series') and result and result.get('organized_dir') and result.get('excel_file'):
+                    try:
+                        task_client.rename_mr_series_folders(
+                            result['organized_dir'],
+                            result['excel_file']
+                        )
+                        # 更新 series_info
+                        if result.get('series_info'):
+                            updated_series_info = {}
+                            for item in os.listdir(result['organized_dir']):
+                                item_path = os.path.join(result['organized_dir'], item)
+                                if os.path.isdir(item_path):
+                                    updated_series_info[item] = {"path": item_path}
+                            result['series_info'] = updated_series_info
+                    except Exception as rename_e:
+                        task.add_log(f'{accno}: MR rename failed: {rename_e}', 'warning')
+
+                # --- 保存到磁盘缓存 ---
+                if result and result.get('success') and result.get('organized_dir'):
+                    try:
+                        zip_path = None
+                        if result.get('organized_dir'):
+                            zip_path = create_result_zip(
+                                result['organized_dir'],
+                                task.task_id,
+                                app.config['RESULT_FOLDER'],
+                                extra_files=[result.get('excel_file')],
+                                include_subdirs=set(result.get('series_info', {}).keys())
+                            )
+                            result['result_zip'] = zip_path
+                        save_to_cache(
+                            result['organized_dir'],
+                            cache_dir,
+                            zip_path=zip_path,
+                            excel_path=result.get('excel_file')
+                        )
+                    except Exception as cache_e:
+                        logger.warning(f"Batch cache save failed for {accno}: {cache_e}")
+
                 results.append(result)
                 task.add_log(f'{accno} Process completed')
                 

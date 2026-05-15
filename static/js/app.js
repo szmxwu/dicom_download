@@ -50,6 +50,7 @@ class DICOMProcessor {
         this.updateCurrentTime();
         this.loadSystemStatus();
         this.loadFilterKeywords();
+        this.loadCacheStats();
         
         // 防抖包装的方法
         this.debouncedLoadSystemStatus = this.debounce(() => this.loadSystemStatus(), 1000);
@@ -1136,7 +1137,8 @@ class DICOMProcessor {
             auto_metadata: document.getElementById('autoMetadata').checked,
             keep_zip: document.getElementById('keepZip').checked,
             keep_extracted: document.getElementById('keepExtracted').checked,
-            output_format: document.querySelector('input[name="outputFormat"]:checked')?.value || 'nifti'
+            output_format: document.querySelector('input[name="outputFormat"]:checked')?.value || 'nifti',
+            rename_mr_series: document.getElementById('renameMRSeries')?.checked || false
         };
     }
 
@@ -2041,6 +2043,41 @@ class DICOMProcessor {
         }
         if (this.successModal) {
             this.successModal.show();
+        }
+    }
+
+    // 加载并显示缓存统计
+    async loadCacheStats() {
+        try {
+            const response = await fetch('/api/cache/stats');
+            const data = await response.json();
+            const statsEl = document.getElementById('cacheStats');
+            if (statsEl && data.entries !== undefined) {
+                statsEl.style.display = 'block';
+                statsEl.textContent = `Cache: ${data.entries} entries, ${data.size_gb.toFixed(2)} GB`;
+            }
+        } catch (e) {
+            console.warn('Failed to load cache stats:', e);
+        }
+    }
+
+    // 清除磁盘缓存
+    async clearDiskCache() {
+        if (!confirm('Are you sure you want to clear all disk cache?')) {
+            return;
+        }
+        try {
+            const response = await fetch('/api/cache/clear', { method: 'POST' });
+            const data = await response.json();
+            if (response.ok) {
+                this.showSuccess('Cache clearing started in background. It may take a while.');
+                // 刷新统计显示
+                setTimeout(() => this.loadCacheStats(), 3000);
+            } else {
+                this.showError(data.error || 'Failed to clear cache');
+            }
+        } catch (e) {
+            this.showError('Network error: ' + e.message);
         }
     }
 

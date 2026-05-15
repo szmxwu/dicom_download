@@ -811,6 +811,54 @@ def process_mri_dataframe(df, cfg: Optional[Dict] = None, config_path: Optional[
     return df_final
 
 
+def generate_standardized_name(row):
+    """
+    根据 MR_clean 输出的一行数据，生成标准化的序列名称。
+
+    格式: {sequenceClass}_{standardOrientation}_{standardDimension}{suffixes}
+    例如: T1_GRE_AX_3D_FS_C+
+
+    Args:
+        row (pd.Series): 包含 MR_clean 后字段的一行数据。
+
+    Returns:
+        str: 标准化序列名称。
+    """
+    parts = []
+
+    # 1. 核心序列分类
+    seq_class = str(row.get('sequenceClass', 'UNKNOWN')).strip()
+    if seq_class and seq_class != 'UNKNOWN':
+        parts.append(seq_class)
+    else:
+        parts.append('UNKNOWN')
+
+    # 2. 方位
+    orientation = str(row.get('standardOrientation', '')).strip().upper()
+    if orientation and orientation != 'UNKNOWN':
+        parts.append(orientation)
+
+    # 3. 维度
+    dimension = str(row.get('standardDimension', '')).strip().upper()
+    if dimension and dimension != 'UNKNOWN':
+        parts.append(dimension)
+
+    # 4. 附加特征后缀
+    suffixes = []
+    if row.get('isFatSuppressed'):
+        suffixes.append('FS')
+    if row.get('isContrastEnhanced'):
+        suffixes.append('C+')
+
+    name = '_'.join(parts)
+    if suffixes:
+        name += '_' + '_'.join(suffixes)
+
+    # 清理非法文件名字符
+    name = "".join(c for c in name if c.isalnum() or c in "_-+.").strip()
+    return name if name else 'UNKNOWN'
+
+
 if __name__ == '__main__':
     # ================== 使用示例 ==================
     # 假设你有一个名为 'mri_data.csv' 的文件

@@ -861,6 +861,27 @@ download_list(
                             </div>
 
                             <div class="accordion-item">
+                                <h2 class="accordion-header" id="headingMRRename">
+                                    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseMRRename" aria-expanded="false" aria-controls="collapseMRRename">
+                                        <span data-i18n="mr_rename_settings">MR Sequence Rename</span>
+                                    </button>
+                                </h2>
+                                <div id="collapseMRRename" class="accordion-collapse collapse" aria-labelledby="headingMRRename" data-bs-parent="#processOptionsAccordion">
+                                    <div class="accordion-body pt-2">
+                                        <div class="form-check mb-2">
+                                            <input class="form-check-input" type="checkbox" id="renameMRSeries">
+                                            <label class="form-check-label" for="renameMRSeries" data-i18n="rename_mr_series">
+                                                Rename MR Series (using MR_clean standardized labels)
+                                            </label>
+                                        </div>
+                                        <small class="form-text text-muted" data-i18n="rename_mr_help">
+                                            When enabled, MR series folders will be renamed to [SeriesNumber]_[StandardizedName] format.
+                                        </small>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="accordion-item">
                                 <h2 class="accordion-header" id="headingDicomServerConfig">
                                     <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseDicomServerConfig" aria-expanded="false" aria-controls="collapseDicomServerConfig">
                                         <span data-i18n="dicom_server_config">DICOM Server Config</span>
@@ -964,7 +985,11 @@ TRACKER</textarea>
                                 <button type="button" class="btn btn-outline-secondary btn-sm" onclick="exportSettings()">
                                     <i class="fas fa-download"></i> <span data-i18n="export_config">Export Config</span>
                                 </button>
+                                <button type="button" class="btn btn-outline-danger btn-sm" onclick="clearDiskCache()">
+                                    <i class="fas fa-trash-alt"></i> <span data-i18n="clear_cache">Clear Cache</span>
+                                </button>
                             </div>
+                            <div id="cacheStats" class="small text-muted mt-2" style="display:none;"></div>
                         </div>
 
                         <!-- 系统信息 -->

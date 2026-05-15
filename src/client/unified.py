@@ -1596,6 +1596,112 @@ class DICOMDownloadClient:
         except Exception as e:
             print(f"⚠️  MR_clean skipped/failed: {e}")
 
+    def rename_mr_series_folders(self, organized_dir, excel_path):
+        """
+        对 MR 序列目录进行重命名，使用 MR_clean 生成的标准化名称。
+        新名称格式: {SeriesNumber:03d}_{StandardizedName}
+
+        Args:
+            organized_dir: organized 目录路径
+            excel_path: metadata Excel 路径
+
+        Returns:
+            bool: 是否成功重命名
+        """
+        import pandas as pd
+        import shutil
+        from src.core.mr_clean import process_mri_dataframe, generate_standardized_name
+
+        try:
+            if not os.path.isfile(excel_path):
+                logger.warning("[MR_RENAME] Excel not found, skipping rename")
+                return False
+
+            # 读取 metadata
+            df = pd.read_excel(excel_path, sheet_name='DICOM_Metadata')
+            if df.empty or 'Modality' not in df.columns:
+                return False
+
+            mr_df = df[df['Modality'].astype(str).str.upper() == 'MR'].copy()
+            if mr_df.empty:
+                logger.info("[MR_RENAME] No MR series found, skipping rename")
+                return False
+
+            logger.info(f"[MR_RENAME] Processing {len(mr_df)} MR series for rename...")
+
+            # 运行 MR_clean 获取分类结果
+            try:
+                cleaned_df = process_mri_dataframe(mr_df, progress_callback=self.progress_callback)
+            except TypeError:
+                cleaned_df = process_mri_dataframe(mr_df)
+
+            # 生成标准化名称
+            cleaned_df['standardizedName'] = cleaned_df.apply(generate_standardized_name, axis=1)
+
+            # 建立旧名称到新名称的映射
+            rename_map = {}
+            for _, row in cleaned_df.iterrows():
+                old_folder = str(row.get('SeriesFolder', '')).strip()
+                series_num = row.get('SeriesNumber', '')
+                std_name = str(row.get('standardizedName', 'UNKNOWN')).strip()
+
+                if not old_folder:
+                    continue
+
+                # SeriesNumber 格式化
+                try:
+                    num_str = f"{int(float(series_num)):03d}"
+                except (ValueError, TypeError):
+                    num_str = str(series_num).zfill(3) if series_num else '000'
+
+                new_folder = f"{num_str}_{std_name}"
+                # 避免重复名称
+                base_new = new_folder
+                counter = 1
+                while new_folder in rename_map.values() or new_folder == old_folder:
+                    new_folder = f"{base_new}_{counter}"
+                    counter += 1
+
+                if old_folder != new_folder:
+                    rename_map[old_folder] = new_folder
+
+            if not rename_map:
+                logger.info("[MR_RENAME] No folders need renaming")
+                return True
+
+            # 执行重命名
+            renamed_count = 0
+            for old_name, new_name in rename_map.items():
+                old_path = os.path.join(organized_dir, old_name)
+                new_path = os.path.join(organized_dir, new_name)
+
+                if not os.path.isdir(old_path):
+                    logger.warning(f"[MR_RENAME] Source folder not found: {old_path}")
+                    continue
+
+                if os.path.exists(new_path):
+                    logger.warning(f"[MR_RENAME] Target already exists, skipping: {new_path}")
+                    continue
+
+                try:
+                    shutil.move(old_path, new_path)
+                    logger.info(f"[MR_RENAME] Renamed: {old_name} -> {new_name}")
+                    renamed_count += 1
+                except Exception as e:
+                    logger.error(f"[MR_RENAME] Failed to rename {old_name}: {e}")
+
+            # 更新 Excel 中的 SeriesFolder
+            if renamed_count > 0:
+                df['SeriesFolder'] = df['SeriesFolder'].astype(str).replace(rename_map)
+                with pd.ExcelWriter(excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+                    df.to_excel(writer, sheet_name='DICOM_Metadata', index=False)
+                logger.info(f"[MR_RENAME] Updated Excel with {renamed_count} renamed folders")
+
+            return True
+        except Exception as e:
+            logger.error(f"[MR_RENAME] MR series rename failed: {e}")
+            return False
+
     def process_upload_workflow(self, zip_path, base_output_dir, options=None):
         """上传ZIP流程：extract -> organize -> convert -> metadata。"""
         options = options or {}
