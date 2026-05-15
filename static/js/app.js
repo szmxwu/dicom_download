@@ -150,6 +150,7 @@ class DICOMProcessor {
                 'history_tasks': 'History Tasks',
                 'refresh': 'Refresh',
                 'task_id': 'Task ID',
+                'accession_number': 'AccessionNumber',
                 'task_type': 'Type',
                 'task_summary': 'Summary',
                 'completed_time': 'Completed Time',
@@ -324,6 +325,7 @@ class DICOMProcessor {
                 'history_tasks': '历史任务',
                 'refresh': '刷新',
                 'task_id': '任务ID',
+                'accession_number': '检查号',
                 'task_type': '类型',
                 'task_summary': '摘要',
                 'completed_time': '完成时间',
@@ -2310,13 +2312,23 @@ class DICOMProcessor {
         tbody.innerHTML = tasks.map(task => {
             const statusColor = statusColors[task.status] || 'secondary';
             const duration = task.elapsed_seconds ? this.formatElapsedTime(task.elapsed_seconds) : '--';
+            // 显示 AccessionNumber（优先）或回退到 task_id
+            const accLabel = task.accession_number || task.task_id.substring(0, 8);
+            // 失败状态显示简短原因，其他显示状态文本
+            let statusHtml = '';
+            if (task.status === 'failed' && task.error_summary) {
+                statusHtml = `<span class="badge bg-${statusColor}" title="${task.status}">${task.error_summary}</span>`;
+            } else {
+                const statusText = t[`status_${task.status}`] || task.status;
+                statusHtml = `<span class="badge bg-${statusColor}">${statusText}</span>`;
+            }
 
             return `
                 <tr>
-                    <td><small>${task.task_id.substring(0, 8)}...</small></td>
-                    <td>${task.type}</td>
-                    <td><span class="badge bg-${statusColor}">${task.status}</span></td>
-                    <td>${duration}</td>
+                    <td><small class="text-truncate d-inline-block" style="max-width: 140px;" title="${task.accession_number || ''}">${accLabel}</small></td>
+                    <td><small>${task.type}</small></td>
+                    <td>${statusHtml}</td>
+                    <td><small>${duration}</small></td>
                 </tr>
             `;
         }).join('');

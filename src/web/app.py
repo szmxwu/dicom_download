@@ -1307,10 +1307,43 @@ def get_system_monitoring():
         all_tasks = []
         for task_id, task in processing_tasks.items():
             if task.status in ['completed', 'failed', 'cancelled']:
+                # 提取 AccessionNumber 或标识
+                accession_number = ''
+                if task.task_type == 'single':
+                    accession_number = task.parameters.get('accession_number', '')
+                elif task.task_type == 'batch':
+                    acc_list = task.parameters.get('accession_numbers', []) or []
+                    accession_number = f"{len(acc_list)} studies" if len(acc_list) != 1 else acc_list[0]
+                elif task.task_type == 'upload':
+                    accession_number = task.parameters.get('filename', '')
+
+                # 提取简短错误原因（仅 failed 状态）
+                error_summary = ''
+                if task.status == 'failed' and task.error:
+                    err = str(task.error)
+                    if 'No series found in PACS' in err:
+                        error_summary = 'No series found'
+                    elif 'timeout' in err.lower() or 'timed out' in err.lower():
+                        error_summary = 'Timeout'
+                    elif 'connection' in err.lower() or 'network' in err.lower():
+                        error_summary = 'Connection error'
+                    elif 'cancelled' in err.lower() or '取消' in err:
+                        error_summary = 'Cancelled'
+                    elif 'disk full' in err.lower() or 'no space' in err.lower():
+                        error_summary = 'Disk full'
+                    elif 'permission' in err.lower():
+                        error_summary = 'Permission denied'
+                    else:
+                        # 取第一个句子或前 30 字符
+                        err_short = err.split('.')[0].split('\n')[0].strip()
+                        error_summary = err_short[:30] + ('...' if len(err_short) > 30 else '')
+
                 all_tasks.append({
                     'task_id': task_id,
                     'type': task.task_type,
                     'status': task.status,
+                    'accession_number': accession_number,
+                    'error_summary': error_summary,
                     'end_time': task.end_time,
                     'elapsed_seconds': round(task.end_time - task.start_time, 1) if task.end_time and task.start_time else None
                 })

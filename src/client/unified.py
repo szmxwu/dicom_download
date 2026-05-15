@@ -127,6 +127,17 @@ class AssociationManager:
             except Exception as e:
                 logger.warning(f"Error releasing association: {e}")
 
+    def reconnect(self, max_retries: int = 3, base_delay: float = 2.0):
+        """P0: 在关联断开时重新建立连接（用于 C-MOVE 过程中关联意外断开）"""
+        if self.assoc and self.assoc.is_established:
+            try:
+                self.assoc.release()
+            except Exception:
+                pass
+        self.assoc = None
+        logger.info("🔄 Rebuilding PACS association for C-MOVE retry...")
+        return self.connect(max_retries=max_retries, base_delay=base_delay)
+
 
 class QueueWatchdog:
     """P2: 队列看门狗，防止死锁"""
@@ -289,6 +300,14 @@ class DICOMDownloadClient:
     # 类级别的C-MOVE锁：防止多个实例同时启动C-STORE SCP导致端口冲突
     # C-MOVE协议要求客户端启动SCP服务器接收图像，固定端口无法支持并发
     _cmove_lock = threading.Lock()
+    _cmove_waiter_count = 0
+    _cmove_waiter_lock = threading.Lock()
+    _cmove_base_timeouts = {
+        'localizer': 60,      # 定位像/Scout 小文件快速超时
+        'standard': 120,      # 常规序列（10-200 文件）
+        'large': 240,         # 大序列（>200 文件或 3D）
+        'maximum': 300,       # 网络层绝对上限
+    }
     
     def _load_keywords(self, tags_dir="dicom_tags"):
         """加载不同模态的DICOM字段列表"""
@@ -779,174 +798,262 @@ class DICOMDownloadClient:
         # P0: 使用类级别的锁确保C-MOVE操作串行化
         # C-MOVE协议需要启动C-STORE SCP服务器接收图像，固定端口无法支持并发
         # 如果两个任务同时使用同一端口，会导致图像混杂到错误的目录
-        logger.info(f"🔒 Acquiring C-MOVE lock for {accession_number}...")
-        with DICOMDownloadClient._cmove_lock:
+        # P2: 增加排队追踪，让日志更透明
+        wait_start = time.time()
+        with DICOMDownloadClient._cmove_waiter_lock:
+            DICOMDownloadClient._cmove_waiter_count += 1
+            waiters_ahead = DICOMDownloadClient._cmove_waiter_count - 1
+        if waiters_ahead > 0:
+            logger.info(f"⏳ {accession_number} waiting for C-MOVE lock ({waiters_ahead} task(s) ahead)...")
+        else:
+            logger.info(f"🔒 Acquiring C-MOVE lock for {accession_number}...")
+
+        DICOMDownloadClient._cmove_lock.acquire()
+        wait_sec = time.time() - wait_start
+        with DICOMDownloadClient._cmove_waiter_lock:
+            DICOMDownloadClient._cmove_waiter_count -= 1
+
+        if wait_sec > 3:
+            logger.info(f"🔓 C-MOVE lock acquired for {accession_number} after waiting {wait_sec:.1f}s, starting download...")
+        else:
             logger.info(f"🔓 C-MOVE lock acquired for {accession_number}, starting download...")
 
-            # 启动C-STORE SCP
-            ae_scp = AE(ae_title=self.pacs_config['CALLING_AET'])
-            ae_scp.supported_contexts = AllStoragePresentationContexts
-            ae_scp.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+        # 启动C-STORE SCP
+        ae_scp = AE(ae_title=self.pacs_config['CALLING_AET'])
+        ae_scp.supported_contexts = AllStoragePresentationContexts
+        ae_scp.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
 
-            server = ae_scp.start_server(
-                ('', self.pacs_config['CALLING_PORT']),
-                block=False,
-                evt_handlers=[(evt.EVT_C_STORE, handle_store)]
-            )
+        server = ae_scp.start_server(
+            ('', self.pacs_config['CALLING_PORT']),
+            block=False,
+            evt_handlers=[(evt.EVT_C_STORE, handle_store)]
+        )
 
-            # P0: 跟踪失败的序列以便重试
-            failed_series = []
+        # P0: 跟踪失败的序列以便重试
+        failed_series = []
 
-            try:
-                # P1: 使用上下文管理器管理关联
-                with AssociationManager(self.ae, self.pacs_config) as assoc:
-                    # 下载每个Series（P0: 失败隔离）
-                    for i, series in enumerate(series_metadata):
-                        series_num = series.get('SeriesNumber', f'Series{i+1}')
-                        series_desc = series.get('SeriesDescription', 'Unknown')
-                        series_uid = series.get('SeriesInstanceUID')
-                        series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
+        try:
+            # P1: 使用上下文管理器管理关联
+            with AssociationManager(self.ae, self.pacs_config) as assoc:
+                # 下载每个Series（P0: 失败隔离）
+                for i, series in enumerate(series_metadata):
+                    series_num = series.get('SeriesNumber', f'Series{i+1}')
+                    series_desc = series.get('SeriesDescription', 'Unknown')
+                    series_uid = series.get('SeriesInstanceUID')
+                    series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
 
-                        # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
-                        # 这避免了竞态条件：C-STORE可能在下一个Series的循环开始后才到达
-                        if series_uid:
-                            storage_state['series_uid_to_dir'][series_uid] = series_dir
-                            logger.debug(f"   Registered series_uid mapping: {series_uid[:20]}... -> {series_dir}")
-                        else:
-                            logger.warning(f"   Series {series_num} has no SeriesInstanceUID, cannot register mapping")
-                        storage_state['current_path'] = series_dir
-                        storage_state['current_series_uid'] = series_uid
-                        storage_state['current_series_files'] = set()  # 重置当前序列文件集合
+                    # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
+                    # 这避免了竞态条件：C-STORE可能在下一个Series的循环开始后才到达
+                    if series_uid:
+                        storage_state['series_uid_to_dir'][series_uid] = series_dir
+                        logger.debug(f"   Registered series_uid mapping: {series_uid[:20]}... -> {series_dir}")
+                    else:
+                        logger.warning(f"   Series {series_num} has no SeriesInstanceUID, cannot register mapping")
+                    storage_state['current_path'] = series_dir
+                    storage_state['current_series_uid'] = series_uid
+                    storage_state['current_series_files'] = set()  # 重置当前序列文件集合
 
+                    try:
+                        logger.info(f"📥 Downloading series {i+1}/{len(series_metadata)}: {series_num} - {series_desc}")
+
+                        # 当磁盘空间达到高水位时，暂停下载以等待转换/清理
                         try:
-                            logger.info(f"📥 Downloading series {i+1}/{len(series_metadata)}: {series_num} - {series_desc}")
+                            self._wait_for_disk_low(output_path)
+                        except Exception:
+                            pass
 
-                            # 当磁盘空间达到高水位时，暂停下载以等待转换/清理
+                        # P2: 动态 C-MOVE 超时：根据 series 大小和类型调整
+                        cmove_timeout = self._get_series_cmove_timeout(series)
+                        # 同时调整网络层和应用层超时
+                        assoc.dimse_timeout = cmove_timeout
+                        assoc.network_timeout = min(cmove_timeout + 30, self._cmove_base_timeouts['maximum'])
+                        logger.info(f"   ⏱️  C-MOVE timeout set to {cmove_timeout}s for Series {series_num}")
+
+                        # P2: 关联健康检查，如果断开则直接失败，由外层重试阶段重建
+                        if not assoc.is_established:
+                            logger.warning(f"   ⚠️  Association lost before Series {series_num}, will retry with fresh connection")
+                            raise ConnectionError(f"Association lost for series {series_num}, will retry")
+
+                        # 发送C-MOVE请求
+                        move_ds = Dataset()
+                        move_ds.QueryRetrieveLevel = 'SERIES'
+                        move_ds.StudyInstanceUID = series['StudyInstanceUID']
+                        move_ds.SeriesInstanceUID = series_uid
+
+                        logger.info(f"   Sending C-MOVE request for Series {series_num}...")
+
+                        # 报告下载进度
+                        if callable(self.download_progress_callback):
                             try:
-                                self._wait_for_disk_low(output_path)
-                            except Exception:
-                                pass
+                                progress_pct = 40 + int((i / len(series_metadata)) * 40)
+                                self.download_progress_callback(i + 1, len(series_metadata), series_desc, progress_pct)
+                            except Exception as cb_e:
+                                logger.warning(f"   Progress callback error: {cb_e}")
 
-                            # 发送C-MOVE请求
-                            move_ds = Dataset()
-                            move_ds.QueryRetrieveLevel = 'SERIES'
-                            move_ds.StudyInstanceUID = series['StudyInstanceUID']
-                            move_ds.SeriesInstanceUID = series_uid
+                        # P2: 记录该 series 下载前的文件计数，用于后续判断是否有实际进展
+                        files_before = storage_state['files_received']
 
-                            logger.info(f"   Sending C-MOVE request for Series {series_num}...")
+                        responses = assoc.send_c_move(
+                            move_ds,
+                            self.pacs_config['CALLING_AET'],
+                            query_model=StudyRootQueryRetrieveInformationModelMove
+                        )
 
-                            # 报告下载进度
-                            if callable(self.download_progress_callback):
-                                try:
-                                    progress_pct = 40 + int((i / len(series_metadata)) * 40)
-                                    self.download_progress_callback(i + 1, len(series_metadata), series_desc, progress_pct)
-                                except Exception as cb_e:
-                                    logger.warning(f"   Progress callback error: {cb_e}")
-
-                            responses = assoc.send_c_move(
-                                move_ds,
-                                self.pacs_config['CALLING_AET'],
-                                query_model=StudyRootQueryRetrieveInformationModelMove
-                            )
-
-                            # 跟踪C-MOVE响应状态
-                            move_status = None
-                            error_messages = []
-                            for (status, identifier) in responses:
-                                if status:
-                                    move_status = status.Status
-                                    if status.Status == 0x0000:
-                                        logger.info(f"   Series {series_num} C-MOVE completed successfully")
-                                        self.download_stats.completed_series += 1
-                                    elif status.Status != 0xFF00:  # 0xFF00 是Pending状态
-                                        error_msg = f"0x{status.Status:04X}"
-                                        error_messages.append(error_msg)
-                                        logger.warning(f"   Series {series_num} C-MOVE status: {error_msg}")
-
-                            if move_status is None:
-                                logger.warning(f"   ⚠️  Series {series_num}: No C-MOVE response received (timeout or network issue)")
-                                raise TimeoutError(f"No C-MOVE response for series {series_num}")
-
-                            # 检查是否有错误状态
-                            if error_messages and move_status != 0x0000:
-                                raise RuntimeError(f"C-MOVE failed with status: {error_messages[-1]}")
-
-                            time.sleep(0.1)  # 短暂延迟，让文件写入完成（C-STORE 回调已同步写入）
-
-                            # 通知外部：该Series下载完成
-                            if callable(on_series_downloaded):
-                                try:
-                                    on_series_downloaded(series_dir, series)
-                                except Exception as e:
-                                    logger.warning(f"⚠️  Series callback failed: {e}")
-
-                        except Exception as e:
-                            # P0: 失败隔离 - 记录错误但继续处理下一个序列
-                            logger.error(f"❌ Series {series_num} download failed: {e}")
-                            self.failed_series_tracker.add(series_uid, series, e)
-                            failed_series.append(series)
-                            self.download_stats.failed_series += 1
-                            self.download_stats.errors.append({
-                                'series': series_num,
-                                'error': str(e),
-                                'timestamp': time.time()
-                            })
-                            # 继续处理下一个序列，不中断整个下载流程
-                            continue
-
-                # P0: 尝试重试失败的序列
-                retryable = self.failed_series_tracker.get_retryable_series()
-                if retryable:
-                    logger.info(f"🔄 Attempting to retry {len(retryable)} failed series...")
-                    for series_uid, series_info in retryable:
-                        try:
-                            series_num = series_info.get('SeriesNumber', 'Unknown')
-                            series_desc = series_info.get('SeriesDescription', 'Unknown')
-                            series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
-
-                            # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
-                            storage_state['series_uid_to_dir'][series_uid] = series_dir
-                            storage_state['current_path'] = series_dir
-                            storage_state['current_series_uid'] = series_uid
-                            storage_state['current_series_files'] = set()
-
-                            logger.info(f"🔄 Retrying Series {series_num}...")
-
-                            move_ds = Dataset()
-                            move_ds.QueryRetrieveLevel = 'SERIES'
-                            move_ds.StudyInstanceUID = series_info['StudyInstanceUID']
-                            move_ds.SeriesInstanceUID = series_uid
-
-                            responses = assoc.send_c_move(
-                                move_ds,
-                                self.pacs_config['CALLING_AET'],
-                                query_model=StudyRootQueryRetrieveInformationModelMove
-                            )
-
-                            for (status, identifier) in responses:
-                                if status and status.Status == 0x0000:
-                                    logger.info(f"   Series {series_num} retry successful")
+                        # 跟踪C-MOVE响应状态
+                        move_status = None
+                        error_messages = []
+                        for (status, identifier) in responses:
+                            if status:
+                                move_status = status.Status
+                                if status.Status == 0x0000:
+                                    logger.info(f"   Series {series_num} C-MOVE completed successfully")
                                     self.download_stats.completed_series += 1
-                                    self.download_stats.failed_series -= 1
-                                    if callable(on_series_downloaded):
-                                        on_series_downloaded(series_dir, series_info)
-                                    break
-                            else:
-                                logger.warning(f"   Series {series_num} retry failed")
+                                elif status.Status != 0xFF00:  # 0xFF00 是Pending状态
+                                    error_msg = f"0x{status.Status:04X}"
+                                    error_messages.append(error_msg)
+                                    logger.warning(f"   Series {series_num} C-MOVE status: {error_msg}")
 
-                            time.sleep(0.5)
+                        if move_status is None:
+                            logger.warning(f"   ⚠️  Series {series_num}: No C-MOVE response received (timeout or network issue)")
+                            raise TimeoutError(f"No C-MOVE response for series {series_num}")
 
-                        except Exception as e:
-                            logger.error(f"❌ Series {series_info.get('SeriesNumber')} retry failed: {e}")
+                        # 检查是否有错误状态
+                        if error_messages and move_status != 0x0000:
+                            raise RuntimeError(f"C-MOVE failed with status: {error_messages[-1]}")
 
-            except ConnectionError as e:
-                logger.error(f"❌ Failed to establish PACS connection: {e}")
-                return None
-            except Exception as e:
-                logger.error(f"❌ Download error: {e}", exc_info=True)
-                return None
-            finally:
-                server.shutdown()
+                        # P2: 检查是否有实际文件接收（防止 PACS 返回 0x0000 但无文件）
+                        files_after = storage_state['files_received']
+                        if files_after == files_before:
+                            logger.warning(f"   ⚠️  Series {series_num}: C-MOVE completed but 0 files received")
+                            # 不立即报错，某些 PACS 可能返回空序列，让后续流程处理
+
+                        time.sleep(0.1)  # 短暂延迟，让文件写入完成（C-STORE 回调已同步写入）
+
+                        # 通知外部：该Series下载完成
+                        if callable(on_series_downloaded):
+                            try:
+                                on_series_downloaded(series_dir, series)
+                            except Exception as e:
+                                logger.warning(f"⚠️  Series callback failed: {e}")
+
+                    except Exception as e:
+                        # P0: 失败隔离 - 记录错误但继续处理下一个序列
+                        logger.error(f"❌ Series {series_num} download failed: {e}")
+                        self.failed_series_tracker.add(series_uid, series, e)
+                        failed_series.append(series)
+                        self.download_stats.failed_series += 1
+                        self.download_stats.errors.append({
+                            'series': series_num,
+                            'error': str(e),
+                            'timestamp': time.time()
+                        })
+                        # P2: 如果是连接错误，后续 series 也无法下载，跳出循环等待重试阶段统一处理
+                        if isinstance(e, (ConnectionError, OSError)):
+                            logger.warning(f"   ⚠️  Connection lost during Series {series_num}, breaking loop to retry with fresh association")
+                            break
+                        # 继续处理下一个序列，不中断整个下载流程
+                        continue
+
+            # P0: 尝试重试失败的序列
+            # P2: 增强重试——重试前清理旧文件，并使用新关联
+            retryable = self.failed_series_tracker.get_retryable_series()
+            if retryable:
+                logger.info(f"🔄 Attempting to retry {len(retryable)} failed series...")
+                # 为重试创建新的关联（避免使用可能已断开的旧关联）
+                retry_assoc_mgr = AssociationManager(self.ae, self.pacs_config)
+                if retry_assoc_mgr.connect(max_retries=2, base_delay=2.0):
+                    retry_assoc = retry_assoc_mgr.assoc
+                    try:
+                        for series_uid, series_info in retryable:
+                            try:
+                                series_num = series_info.get('SeriesNumber', 'Unknown')
+                                series_desc = series_info.get('SeriesDescription', 'Unknown')
+                                series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
+
+                                # P2: 重试前清理旧文件
+                                removed = self._cleanup_series_dir(series_dir)
+                                if removed > 0:
+                                    logger.info(f"   🧹 Cleaned {removed} old file(s) before retrying Series {series_num}")
+
+                                # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
+                                storage_state['series_uid_to_dir'][series_uid] = series_dir
+                                storage_state['current_path'] = series_dir
+                                storage_state['current_series_uid'] = series_uid
+                                storage_state['current_series_files'] = set()
+
+                                logger.info(f"🔄 Retrying Series {series_num}...")
+
+                                # P2: 动态超时
+                                cmove_timeout = self._get_series_cmove_timeout(series_info)
+                                retry_assoc.dimse_timeout = cmove_timeout
+                                retry_assoc.network_timeout = min(cmove_timeout + 30, self._cmove_base_timeouts['maximum'])
+
+                                # P2: 重试前检查关联健康
+                                if not retry_assoc.is_established:
+                                    logger.warning(f"   ⚠️  Retry association lost, attempting reconnect...")
+                                    if not retry_assoc_mgr.reconnect(max_retries=2, base_delay=2.0):
+                                        logger.error(f"❌ Failed to reconnect for retry of Series {series_num}")
+                                        continue
+                                    retry_assoc = retry_assoc_mgr.assoc
+
+                                move_ds = Dataset()
+                                move_ds.QueryRetrieveLevel = 'SERIES'
+                                move_ds.StudyInstanceUID = series_info['StudyInstanceUID']
+                                move_ds.SeriesInstanceUID = series_uid
+
+                                responses = retry_assoc.send_c_move(
+                                    move_ds,
+                                    self.pacs_config['CALLING_AET'],
+                                    query_model=StudyRootQueryRetrieveInformationModelMove
+                                )
+
+                                move_status = None
+                                for (status, identifier) in responses:
+                                    if status:
+                                        move_status = status.Status
+                                        if status.Status == 0x0000:
+                                            logger.info(f"   Series {series_num} retry successful")
+                                            self.download_stats.completed_series += 1
+                                            self.download_stats.failed_series -= 1
+                                            if callable(on_series_downloaded):
+                                                on_series_downloaded(series_dir, series_info)
+                                            break
+                                        elif status.Status != 0xFF00:
+                                            logger.warning(f"   Series {series_num} retry status: 0x{status.Status:04X}")
+
+                                if move_status is None:
+                                    logger.warning(f"   Series {series_num} retry: No C-MOVE response")
+                                elif move_status != 0x0000:
+                                    logger.warning(f"   Series {series_num} retry failed with status 0x{move_status:04X}")
+
+                                time.sleep(0.5)
+
+                            except Exception as e:
+                                logger.error(f"❌ Series {series_info.get('SeriesNumber')} retry failed: {e}")
+                    finally:
+                        if retry_assoc and retry_assoc.is_established:
+                            try:
+                                retry_assoc.release()
+                            except Exception as e:
+                                logger.warning(f"Error releasing retry association: {e}")
+                else:
+                    logger.error("❌ Failed to establish PACS connection for retry phase")
+
+        except ConnectionError as e:
+            logger.error(f"❌ Failed to establish PACS connection: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Download error: {e}", exc_info=True)
+            return None
+        finally:
+            server.shutdown()
+            # P2: 确保锁被释放（防御性编程，防止异常导致死锁）
+            if DICOMDownloadClient._cmove_lock.locked():
+                try:
+                    DICOMDownloadClient._cmove_lock.release()
+                    logger.debug(f"🔓 C-MOVE lock released for {accession_number}")
+                except RuntimeError:
+                    pass  # 锁已被释放
 
         # 打印下载统计
         stats_summary = self.download_stats.get_summary()
@@ -1147,6 +1254,8 @@ class DICOMDownloadClient:
             or lower_path.endswith(".bmp")
             or lower_path.endswith(".gif")
             or lower_path.endswith(".webp")
+            or lower_path.endswith(".processing_lock")
+            or lower_path.endswith(".processing_lock.dcm")
         ):
             return False
         try:
@@ -1244,6 +1353,64 @@ class DICOMDownloadClient:
         name = name.strip('.')
 
         return name if name else "Unknown"
+
+    def _get_series_cmove_timeout(self, series: Dict) -> int:
+        """根据 series 特征计算动态 C-MOVE 超时（秒）
+
+        策略：
+        - Localizer/Scout/Survey（<10 文件或关键词匹配）：60 秒
+        - 标准序列（10-200 文件）：120 秒
+        - 大序列（>200 文件或 3D/MRA/DWI 等）：240 秒
+        - 绝对上限：300 秒（网络层硬限制）
+        """
+        desc = series.get('SeriesDescription', '').upper()
+        instance_count = series.get('NumberOfSeriesRelatedInstances', 0)
+        modality = series.get('Modality', '').upper()
+
+        # 尝试解析文件数
+        try:
+            num_files = int(instance_count) if instance_count else 0
+        except (ValueError, TypeError):
+            num_files = 0
+
+        # Localizer / Scout / Survey / Locator 快速超时
+        localizer_keywords = ['LOCALIZER', 'SCOUT', 'SURVEY', 'LOC ', 'LOCATOR',
+                              'TOPOGRAM', 'PLANNING', 'PLAN']
+        if num_files > 0 and num_files < 10:
+            return self._cmove_base_timeouts['localizer']
+        if any(kw in desc for kw in localizer_keywords):
+            return self._cmove_base_timeouts['localizer']
+
+        # 大序列特征
+        large_keywords = ['3D', 'MRA', 'CEMRA', 'DWI', 'DTI', 'DIFFUSION',
+                          'WHOLE BODY', 'WHOLE-BODY', 'VIBE', 'LAVA', 'BRAVO',
+                          'SPACE', 'CUBE', 'VOLUMETRIC', 'CINE']
+        if num_files > 200 or any(kw in desc for kw in large_keywords):
+            return self._cmove_base_timeouts['large']
+
+        # 标准序列
+        return self._cmove_base_timeouts['standard']
+
+    @staticmethod
+    def _cleanup_series_dir(series_dir: str) -> int:
+        """清理 series 目录中的旧 DICOM 文件，返回删除文件数"""
+        if not os.path.isdir(series_dir):
+            return 0
+        removed = 0
+        try:
+            for fname in os.listdir(series_dir):
+                if fname.startswith('.'):
+                    continue
+                fpath = os.path.join(series_dir, fname)
+                if os.path.isfile(fpath):
+                    try:
+                        os.remove(fpath)
+                        removed += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to cleanup series dir {series_dir}: {e}")
+        return removed
     
     def organize_dicom_files(self, extract_dir, organized_dir=None, output_format='nifti', min_series_files=None):
         """按Series整理DICOM文件并转换为指定格式 (nifti 或 npz)"""
