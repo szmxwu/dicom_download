@@ -432,25 +432,45 @@ class DICOMDownloadClient:
         print(f"✅ Logout successful: {self.username}")
         return True
     
-    def check_status(self):
-        """检查PACS连接状态"""
-        try:
-            assoc = self.ae.associate(
-                self.pacs_config['PACS_IP'],
-                self.pacs_config['PACS_PORT'],
-                ae_title=self.pacs_config['CALLED_AET']
-            )
-            
-            if assoc.is_established:
-                assoc.release()
-                logger.debug("PACS connection status: OK")
-                return True
-            else:
-                logger.warning("Unable to connect to PACS")
-                return False
-        except Exception as e:
-            logger.error(f"PACS connection error: {e}")
-            return False
+    def check_status(self, retries=1, base_delay=2.0):
+        """检查PACS连接状态，支持重试
+
+        Args:
+            retries: 重试次数（默认1，即不额外重试）
+            base_delay: 基础退避延迟（秒），每次重试翻倍
+        """
+        last_error = None
+        for attempt in range(retries):
+            try:
+                assoc = self.ae.associate(
+                    self.pacs_config['PACS_IP'],
+                    self.pacs_config['PACS_PORT'],
+                    ae_title=self.pacs_config['CALLED_AET']
+                )
+
+                if assoc.is_established:
+                    assoc.release()
+                    if attempt > 0:
+                        logger.info(f"PACS connection OK after {attempt + 1} attempts")
+                    else:
+                        logger.debug("PACS connection status: OK")
+                    return True
+                else:
+                    logger.warning(f"PACS connection attempt {attempt + 1}/{retries} failed: not established")
+            except Exception as e:
+                last_error = e
+                logger.warning(f"PACS connection attempt {attempt + 1}/{retries} error: {e}")
+
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.info(f"Waiting {delay:.1f}s before PACS retry...")
+                time.sleep(delay)
+
+        if last_error:
+            logger.error(f"PACS connection failed after {retries} attempts: {last_error}")
+        else:
+            logger.error(f"PACS connection failed after {retries} attempts: association not established")
+        return False
     
     def _query_series_metadata(self, accession_number, modality_filter=None, min_series_files=None, exclude_derived=True):
         """查询PACS获取Series元数据
@@ -1529,6 +1549,9 @@ class DICOMDownloadClient:
                         except Exception:
                             metadata['Rows'] = metadata.get('Rows', '')
                             metadata['Columns'] = metadata.get('Columns', '')
+                        # P0: 修复 Carestream BPE 乱码
+                        from src.core.metadata import repair_bodypart_examined
+                        repair_bodypart_examined(metadata)
                         records.append(metadata)
                     except Exception:
                         continue
@@ -1564,6 +1587,9 @@ class DICOMDownloadClient:
                 except Exception:
                     metadata['Rows'] = metadata.get('Rows', '')
                     metadata['Columns'] = metadata.get('Columns', '')
+                # P0: 修复 Carestream BPE 乱码
+                from src.core.metadata import repair_bodypart_examined
+                repair_bodypart_examined(metadata)
                 records.append(metadata)
                 logger.info(f"[COLLECT] Appended metadata record for {series_folder} with {len(metadata)} fields")
         except Exception as e:
@@ -1597,6 +1623,9 @@ class DICOMDownloadClient:
                     metadata[keyword] = ""
             except Exception:
                 metadata[keyword] = ""
+        # P0: 修复 Carestream BPE 乱码
+        from src.core.metadata import repair_bodypart_examined
+        repair_bodypart_examined(metadata)
         return metadata
 
     def _get_series_sample_dicom(self, series_dir):
@@ -2016,16 +2045,73 @@ class DICOMDownloadClient:
                     series_queue.task_done()
                     break
                 series_dir, series_folder = item
-                try:
-                    info = self._process_single_series(series_dir, series_folder, fmt, min_series_files=min_series_files)
-                    if info:
-                        with series_lock:
-                            series_info[series_folder] = info
-                    watchdog.update_activity()  # P2: 更新看门狗活动
-                except Exception as e:
-                    logger.warning(f"⚠️  Series organize failed: {series_folder}: {e}")
-                finally:
-                    series_queue.task_done()
+
+                # P0: 使用带超时的线程处理单个 series，防止 dcm2niix/pydicom 无限卡住
+                # 超时后检查已有输出，并尝试一次重试
+                def _run_with_timeout(target_func, timeout_sec):
+                    """在线程中运行目标函数，返回 (result, error, timed_out)"""
+                    result_holder = [None]
+                    error_holder = [None]
+
+                    def _wrapper():
+                        try:
+                            result_holder[0] = target_func()
+                        except Exception as e:
+                            error_holder[0] = e
+
+                    t = threading.Thread(target=_wrapper, daemon=True)
+                    t.start()
+                    t.join(timeout=timeout_sec)
+                    timed_out = t.is_alive()
+                    return result_holder[0], error_holder[0], timed_out
+
+                def _process_single():
+                    return self._process_single_series(
+                        series_dir, series_folder, fmt,
+                        min_series_files=min_series_files
+                    )
+
+                # 第一次尝试
+                info, err, timed_out = _run_with_timeout(_process_single, 600)
+
+                if timed_out:
+                    logger.error(
+                        f"   ❌ Series {series_folder} organize/conversion timed out after 600s (attempt 1/2)"
+                    )
+                    # 检查 dcm2niix 是否在超时前已生成输出
+                    existing_nifti = [
+                        f for f in os.listdir(series_dir)
+                        if f.endswith(('.nii.gz', '.nii')) and not f.startswith('.')
+                    ]
+                    if existing_nifti:
+                        logger.info(
+                            f"   ✅ Series {series_folder} has existing NIfTI output despite timeout, using it: {existing_nifti[0]}"
+                        )
+                        info = {
+                            'path': series_dir,
+                            'file_count': 0,  # 未知，但非关键
+                            'files': []
+                        }
+                    else:
+                        # 重试一次（dcm2niix 可能在 Windows 上因句柄问题卡住，重试可能成功）
+                        logger.warning(f"   🔄 Retrying series {series_folder} (attempt 2/2)...")
+                        info, err, timed_out2 = _run_with_timeout(_process_single, 600)
+                        if timed_out2:
+                            logger.error(
+                                f"   ❌ Series {series_folder} still timed out after retry. "
+                                f"Skipping this series. The daemon thread may remain stuck in background."
+                            )
+                            info = None
+                            err = f"Timed out after 2 attempts (1200s total)"
+
+                if info:
+                    with series_lock:
+                        series_info[series_folder] = info
+                if err:
+                    logger.warning(f"⚠️  Series organize failed: {series_folder}: {err}")
+
+                watchdog.update_activity()  # P2: 更新看门狗活动
+                series_queue.task_done()
 
         if parallel_pipeline and auto_organize:
             # P0: 原地处理 - 不再创建 organized 子目录
@@ -2047,9 +2133,15 @@ class DICOMDownloadClient:
                 # 通知整理线程退出（放入与 worker 数相同的哨兵）
                 for _ in range(len(organizer_threads)):
                     series_queue.put(None)
-                series_queue.join()
+                # P0: 不再调用 series_queue.join()（Python Queue.join 无 timeout 参数，会永久等待）
+                # 直接等待 worker 线程完成，带超时
                 for t in organizer_threads:
-                    t.join()
+                    t.join(timeout=600)
+                    if t.is_alive():
+                        logger.warning(
+                            "Organize worker did not exit within 600s timeout. "
+                            "It may be stuck in a subprocess or I/O operation."
+                        )
             finally:
                 # P2: 停止看门狗（确保异常时也能停止，避免线程泄漏）
                 watchdog.stop()

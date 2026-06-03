@@ -31,11 +31,135 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import pydicom
+import re
 
 from src.core.qc import ImageQualityResult, assess_converted_file_quality as _default_assess_file_qc, assess_series_quality_converted as _default_assess_series_qc
 
 # Create logger for metadata module - use DICOMApp to match Flask app logging
 logger = logging.getLogger('DICOMApp')
+
+# ==================== BPE 乱码检测与修复 ====================
+
+_BPE_GARBAGE_PATTERNS = [
+    r'^$',              # 空字符串
+    r'^nan$',           # "nan"
+    r'^n/a$',           # "N/A"
+    r'^none$',          # "none"
+    r'^null$',          # "null"
+    r'^_+$',            # 纯下划线（任意长度）
+    r'^\d+$',           # 纯数字
+    r'^_(\d+_+)+$',    # _数字_下划线 变体（如 _3___, _5______）
+    r'^__+.*$',         # 以下划线开头的填充码
+]
+
+_BPE_GARBAGE_REGEX = re.compile(
+    '|'.join(f'({p})' for p in _BPE_GARBAGE_PATTERNS),
+    re.IGNORECASE
+)
+
+# SeriesDescription → BodyPartExamined 推断规则（按优先级排序，先匹配具体部位）
+_BPE_INFERENCE_RULES = [
+    # 头颅
+    ('SKULL', ['SKULL', 'CRANIUM']),
+    ('HEAD', ['HEAD', 'CRANIAL']),
+
+    # 颜面骨
+    ('FACIAL BONES', ['FACIAL', 'ZYGOMATIC', 'MANDIBLE', 'MAXILLA', 'MALAR', 'ORBIT']),
+    ('NOSE', ['NOSE', 'NASAL BONE']),
+    ('SINUS', ['SINUS', 'PARANASAL']),
+
+    # 脊柱（从上到下，先匹配具体节段）
+    ('C-SPINE', ['C-SPINE', 'CERVICAL SPINE', 'C SPINE']),
+    ('T-SPINE', ['T-SPINE', 'THORACIC SPINE', 'T SPINE']),
+    ('L-SPINE', ['L-SPINE', 'LUMBAR SPINE', 'L SPINE', 'LUMBOSACRAL']),
+    ('SPINE', ['SPINE', 'VERTEBRA', 'SACRUM', 'SACRAL']),
+
+    # 胸部
+    ('CHEST', ['CHEST', 'THORAX']),
+    ('RIB', ['RIB']),
+    ('LUNG', ['LUNG', 'PNEUMO', 'PNEUMOTHORAX']),
+
+    # 腹部/盆腔
+    ('ABDOMEN', ['ABDOMEN', 'ABDOMINAL', 'KUB']),
+    ('PELVIS', ['PELVIS', 'PELVIC']),
+
+    # 上肢（从肩到指）
+    ('SHOULDER', ['SHOULDER', 'CLAVICLE', 'AC JOINT']),
+    ('ARM', ['ARM', 'HUMERUS']),
+    ('ELBOW', ['ELBOW']),
+    ('FOREARM', ['FOREARM', 'RADIUS', 'ULNA']),
+    ('WRIST', ['WRIST', 'CARPAL']),
+    ('HAND', ['HAND']),
+    ('FINGER', ['FINGER', 'PHALANX']),
+
+    # 下肢（从髋到趾）
+    # 注意：FULL LOWER LIMB 必须在 LEG 之前，否则 "LongLeg" 会被匹配为 LEG
+    ('FULL LOWER LIMB', ['LONGLEG', 'LONG LEG', 'LOWER LIMB']),
+    ('HIP', ['HIP']),
+    ('FEMUR', ['FEMUR', 'THIGH']),
+    ('KNEE', ['KNEE', 'PATELLA']),
+    ('LEG', ['LEG', 'TIBIA', 'FIBULA']),
+    ('ANKLE', ['ANKLE']),
+    ('FOOT', ['FOOT', 'CALCANEUS', 'TARSAL', 'METATARSAL']),
+    ('TOE', ['TOE']),
+]
+
+
+def _is_bpe_garbage(bpe_value: str) -> bool:
+    """检测 BodyPartExamined 是否为乱码/填充值。"""
+    if bpe_value is None:
+        return True
+    bpe = str(bpe_value).strip()
+    if not bpe:
+        return True
+    return bool(_BPE_GARBAGE_REGEX.match(bpe))
+
+
+def _infer_bodypart_from_sd(series_description: str) -> Optional[str]:
+    """从 SeriesDescription 推断 BodyPartExamined。
+
+    按优先级顺序匹配规则列表，第一个匹配到的规则胜出。
+    匹配不区分大小写。
+    """
+    if not series_description:
+        return None
+    sd_upper = str(series_description).upper()
+    for bpe_value, keywords in _BPE_INFERENCE_RULES:
+        for kw in keywords:
+            if kw.upper() in sd_upper:
+                return bpe_value
+    return None
+
+
+def repair_bodypart_examined(record: Dict) -> bool:
+    """修复 record 中的 BodyPartExamined 乱码。
+
+    如果 BPE 是乱码/填充值，尝试从 SeriesDescription 推断真实部位。
+    修复后会添加标记字段：
+      - BodyPartExamined_Inferred = True
+      - BodyPartExamined_Original = 原始乱码值
+
+    Args:
+        record: 包含 BodyPartExamined 和 SeriesDescription 的元数据字典
+
+    Returns:
+        bool: 是否执行了修复
+    """
+    bpe = str(record.get('BodyPartExamined', '')).strip()
+    if not _is_bpe_garbage(bpe):
+        return False
+
+    sd = str(record.get('SeriesDescription', '')).strip()
+    inferred = _infer_bodypart_from_sd(sd)
+    if inferred:
+        record['BodyPartExamined'] = inferred
+        record['BodyPartExamined_Inferred'] = True
+        record['BodyPartExamined_Original'] = bpe if bpe else ''
+        logger.debug(
+            f"[BPE_REPAIR] Repaired: '{bpe}' → '{inferred}' from SD='{sd}'"
+        )
+        return True
+    return False
 
 
 def _extract_quality_value(result: Union[ImageQualityResult, int]) -> Tuple[int, str]:
@@ -455,6 +579,15 @@ def extract_dicom_metadata(
         logger.error(f"❌ No metadata extracted from {organized_dir}")
         logger.error(f"   Series folders found: {len(series_folders)}")
         return None
+
+    # P0: 修复 BodyPartExamined 乱码（Carestream 设备填充值问题）
+    repaired_count = 0
+    for record in all_metadata:
+        if repair_bodypart_examined(record):
+            repaired_count += 1
+    if repaired_count > 0:
+        logger.info(f"[BPE_REPAIR] Repaired {repaired_count}/{len(all_metadata)} records with garbage BodyPartExamined")
+        print(f"   🔧 Repaired BodyPartExamined for {repaired_count} records (inferred from SeriesDescription)")
 
     try:
         df = pd.DataFrame(all_metadata)

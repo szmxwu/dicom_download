@@ -44,6 +44,86 @@ logger = logging.getLogger('DICOMApp')
 dcm2niix_global_lock = threading.Lock()
 
 
+def _run_subprocess_with_timeout(cmd, timeout, capture_output=True, text=True):
+    """
+    运行子进程并设置超时，超时后强制终止进程。
+    在 Windows 上使用 taskkill 确保进程树被彻底终止，避免句柄泄漏。
+    """
+    import subprocess
+    import sys
+    import time
+
+    stdout = None
+    stderr = None
+
+    if capture_output:
+        stdout = subprocess.PIPE
+        stderr = subprocess.PIPE
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, text=text)
+    except Exception as e:
+        class FakeResult:
+            returncode = -1
+            stdout = ''
+            stderr = str(e)
+        return FakeResult()
+
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        class Result:
+            pass
+        result = Result()
+        result.returncode = proc.returncode
+        result.stdout = out or ''
+        result.stderr = err or ''
+        return result
+    except subprocess.TimeoutExpired:
+        logger.warning(f"dcm2niix timeout after {timeout}s, forcing termination (PID={proc.pid})")
+        # 先尝试优雅终止
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+        # 如果还在运行，强制 kill
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+        # Windows: 使用 taskkill 确保进程树被彻底终止
+        if sys.platform.startswith('win') and proc.poll() is None:
+            try:
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                               capture_output=True, timeout=5)
+            except Exception:
+                pass
+
+        # 最后一次等待
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+        # 收集已输出的内容
+        try:
+            out, err = proc.communicate(timeout=1)
+        except Exception:
+            out, err = '', ''
+
+        class Result:
+            pass
+        result = Result()
+        result.returncode = -1
+        result.stdout = out or ''
+        result.stderr = err or f"Timeout after {timeout}s"
+        return result
+
+
 def _build_conversion_entry(output_file: str, dcm: FileDataset, file_index: Optional[int] = None, source_file: Optional[str] = None) -> Dict[str, str]:
     entry: Dict[str, str] = {
         'output_file': output_file
@@ -764,7 +844,7 @@ def convert_with_dcm2niix(
                     result = None
                     for attempt in range(3):
                         with dcm2niix_global_lock:
-                            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                            result = _run_subprocess_with_timeout(cmd, timeout=60)
                         if result.returncode == 0:
                             break
                         if attempt < 2:
@@ -848,7 +928,7 @@ def convert_with_dcm2niix(
         result = None
         for attempt in range(3):
             with dcm2niix_global_lock:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                result = _run_subprocess_with_timeout(cmd, timeout=300)
             if result.returncode == 0:
                 break
             if attempt < 2:

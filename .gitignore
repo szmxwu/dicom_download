@@ -203,3 +203,4 @@ uploads
 results/
 !results/.gitkeep
 test/*
+*.log.*

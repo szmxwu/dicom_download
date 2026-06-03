@@ -290,190 +290,197 @@ def process_single_series(
     except Exception:
         pass  # 如果无法创建锁文件，继续处理
 
-    # P3: 尝试从缓存加载元数据（如果 use_cached_metadata=True）
-    cached_metadata = None
-    if use_cached_metadata:
-        cache_file = os.path.join(series_path, "dicom_metadata_cache.json")
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cached_metadata = json.load(f)
-            except Exception:
-                pass
-
-    # P3: 如果有缓存的校验和文件，加载它
-    checksum_cache = {}
-    checksum_file = os.path.join(os.path.dirname(series_path), '.checksums.json')
-    if os.path.exists(checksum_file) and use_cached_metadata:
+    # 内部辅助函数：确保锁文件被清理
+    def _cleanup_lock():
         try:
-            with open(checksum_file, 'r', encoding='utf-8') as f:
-                checksum_cache = json.load(f)
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
         except Exception:
             pass
 
-    # 收集 DICOM 文件（最多重试3次，应对文件系统延迟）
-    dicom_files: List[str] = []
-
-    # P3: 如果有缓存的文件列表，直接使用
-    if cached_metadata and cached_metadata.get('records') and use_cached_metadata:
-        # 从缓存重建文件列表
-        cached_files = set()
-        for record in cached_metadata['records']:
-            if 'FileName' in record:
-                filepath = os.path.join(series_path, record['FileName'])
-                if os.path.exists(filepath):
-                    cached_files.add(filepath)
-
-        # 如果缓存的文件都存在，直接使用
-        if cached_files and len(cached_files) == len(cached_metadata['records']):
-            dicom_files = sorted(list(cached_files))
-            print(f"   ✅ Using {len(dicom_files)} files from cached metadata for {series_folder}")
-
-    # 如果没有缓存或缓存不完整，扫描目录
-    if not dicom_files:
-        for attempt in range(3):
-            dicom_files = []
-            for file in os.listdir(series_path):
-                if file.startswith('.'):
-                    continue
-                filepath = os.path.join(series_path, file)
-                if os.path.isfile(filepath) and client._is_dicom_file(filepath):
-                    normalized_path = filepath
-                    file_root, file_ext = os.path.splitext(filepath)
-                    if file_ext != '.dcm':
-                        target_path = f"{file_root}.dcm"
-                        if target_path != filepath:
-                            try:
-                                os.rename(filepath, target_path)
-                                normalized_path = target_path
-                            except Exception:
-                                normalized_path = filepath
-                    dicom_files.append(normalized_path)
-
-            if dicom_files:
-                break
-
-            if attempt < 2:
-                print(f"   ⚠️ No DICOM files found in {series_folder}, retrying in 0.5s... (attempt {attempt + 1}/3)")
-                time.sleep(0.5)
-
-    if not dicom_files:
-        return None
-
-    # 整理阶段二次过滤衍生序列（从实际 DICOM 文件验证，PACS 返回的 SeriesDescription 可能不完整）
     try:
-        import pydicom as _pd
-        _hdr = _pd.dcmread(dicom_files[0], force=True, stop_before_pixels=True)
-        _desc = str(getattr(_hdr, 'SeriesDescription', '') or '')
-        _itype = getattr(_hdr, 'ImageType', None)
-        if _is_derived_series(_desc, _itype):
-            logger.info(f"   🚫 Filtered derived series (organize stage): '{_desc}' ({series_folder})")
-            try:
-                if os.path.exists(lock_file):
-                    os.remove(lock_file)
-            except Exception:
-                pass
-            return None
-    except Exception:
-        pass
-
-    # 整理阶段验证：检查实际文件数是否满足最小要求
-    # 注意：只对3D模态（CT/MR等）应用此验证，2D模态（DX/DR等）跳过
-    if min_series_files and min_series_files > 0:
-        volume_modalities = {'CT', 'MR', 'MRI', 'PT', 'NM', 'US'}
-
-        # 从缓存或文件中获取模态
-        check_modality = ''
-        if cached_metadata and use_cached_metadata:
-            check_modality = cached_metadata.get('modality', '').upper()
-
-        if check_modality in volume_modalities or not check_modality:
-            actual_count = len(dicom_files)
-            if actual_count < min_series_files:
-                print(f"   🚫 Series {series_folder} filtered during organize: "
-                      f"{actual_count} files < {min_series_files} min "
-                      f"(PACS reported count may be unreliable)")
-                # 清理锁文件
+        # P3: 尝试从缓存加载元数据（如果 use_cached_metadata=True）
+        cached_metadata = None
+        if use_cached_metadata:
+            cache_file = os.path.join(series_path, "dicom_metadata_cache.json")
+            if os.path.exists(cache_file):
                 try:
-                    if os.path.exists(lock_file):
-                        os.remove(lock_file)
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cached_metadata = json.load(f)
                 except Exception:
                     pass
-                return None
 
-    # P3: 如果有缓存的模态信息，直接使用，避免重新读取DICOM
-    sample_dcm = None
-    modality = ''
-    if cached_metadata and use_cached_metadata:
-        # 从缓存获取模态
-        cached_modality = cached_metadata.get('modality', '')
-        if cached_modality:
-            modality = cached_modality
-            print(f"   ✅ Using cached modality: {modality}")
+        # P3: 如果有缓存的校验和文件，加载它
+        checksum_cache = {}
+        checksum_file = os.path.join(os.path.dirname(series_path), '.checksums.json')
+        if os.path.exists(checksum_file) and use_cached_metadata:
+            try:
+                with open(checksum_file, 'r', encoding='utf-8') as f:
+                    checksum_cache = json.load(f)
+            except Exception:
+                pass
 
-        # 从缓存获取样本标签
-        sample_tags = cached_metadata.get('sample_tags', {})
-        if sample_tags:
-            # 创建模拟的DICOM对象（SimpleNamespace）供后续使用
-            from types import SimpleNamespace
-            sample_dcm = SimpleNamespace(**sample_tags)
+        # 收集 DICOM 文件（最多重试3次，应对文件系统延迟）
+        dicom_files: List[str] = []
 
-    # 如果没有缓存的模态信息，重新读取样本文件
-    if not modality:
+        # P3: 如果有缓存的文件列表，直接使用
+        if cached_metadata and cached_metadata.get('records') and use_cached_metadata:
+            # 从缓存重建文件列表
+            cached_files = set()
+            for record in cached_metadata['records']:
+                if 'FileName' in record:
+                    filepath = os.path.join(series_path, record['FileName'])
+                    if os.path.exists(filepath):
+                        cached_files.add(filepath)
+
+            # 如果缓存的文件都存在，直接使用
+            if cached_files and len(cached_files) == len(cached_metadata['records']):
+                dicom_files = sorted(list(cached_files))
+                print(f"   ✅ Using {len(dicom_files)} files from cached metadata for {series_folder}")
+
+        # 如果没有缓存或缓存不完整，扫描目录
+        if not dicom_files:
+            for attempt in range(3):
+                dicom_files = []
+                for file in os.listdir(series_path):
+                    if file.startswith('.'):
+                        continue
+                    filepath = os.path.join(series_path, file)
+                    if os.path.isfile(filepath) and client._is_dicom_file(filepath):
+                        normalized_path = filepath
+                        file_root, file_ext = os.path.splitext(filepath)
+                        if file_ext != '.dcm':
+                            target_path = f"{file_root}.dcm"
+                            if target_path != filepath:
+                                try:
+                                    os.rename(filepath, target_path)
+                                    normalized_path = target_path
+                                except Exception:
+                                    normalized_path = filepath
+                        dicom_files.append(normalized_path)
+
+                if dicom_files:
+                    break
+
+                if attempt < 2:
+                    print(f"   ⚠️ No DICOM files found in {series_folder}, retrying in 0.5s... (attempt {attempt + 1}/3)")
+                    time.sleep(0.5)
+
+        if not dicom_files:
+            _cleanup_lock()
+            return None
+
+        # 整理阶段二次过滤衍生序列（从实际 DICOM 文件验证，PACS 返回的 SeriesDescription 可能不完整）
         try:
-            import pydicom
-            sample_dcm = pydicom.dcmread(dicom_files[0], force=True)
-            modality = str(getattr(sample_dcm, 'Modality', ''))
+            import pydicom as _pd
+            _hdr = _pd.dcmread(dicom_files[0], force=True, stop_before_pixels=True)
+            _desc = str(getattr(_hdr, 'SeriesDescription', '') or '')
+            _itype = getattr(_hdr, 'ImageType', None)
+            if _is_derived_series(_desc, _itype):
+                logger.info(f"   🚫 Filtered derived series (organize stage): '{_desc}' ({series_folder})")
+                _cleanup_lock()
+                return None
         except Exception:
-            modality = ''
+            pass
 
-    logger.info(f"[ORG] Ensuring metadata cache for {series_folder}: modality={modality}, files={len(dicom_files)}")
-    client._ensure_metadata_cache(series_path, series_folder, dicom_files, modality)
-    client._write_minimal_cache(
-        series_path,
-        series_folder,
-        modality,
-        sample_dcm=sample_dcm if isinstance(sample_dcm, pydicom.Dataset) else None,
-        file_count=len(dicom_files)
-    )
+        # 整理阶段验证：检查实际文件数是否满足最小要求
+        # 注意：只对3D模态（CT/MR等）应用此验证，2D模态（DX/DR等）跳过
+        if min_series_files and min_series_files > 0:
+            volume_modalities = {'CT', 'MR', 'MRI', 'PT', 'NM', 'US'}
 
-    # P3: 数据完整性校验（如果缓存中有校验和）
-    if checksum_cache and use_cached_metadata:
-        verified_count = 0
-        corrupted_files = []
-        for filepath in dicom_files:
-            if filepath in checksum_cache:
-                current_checksum = compute_file_checksum(filepath)
-                if current_checksum == checksum_cache[filepath]:
-                    verified_count += 1
-                else:
-                    corrupted_files.append(os.path.basename(filepath))
+            # 从缓存或文件中获取模态
+            check_modality = ''
+            if cached_metadata and use_cached_metadata:
+                check_modality = cached_metadata.get('modality', '').upper()
 
-        if corrupted_files:
-            print(f"   ⚠️  {len(corrupted_files)} files may be corrupted: {corrupted_files[:5]}...")
-        else:
-            print(f"   ✅ All {verified_count} files verified with checksums")
+            if check_modality in volume_modalities or not check_modality:
+                actual_count = len(dicom_files)
+                if actual_count < min_series_files:
+                    print(f"   🚫 Series {series_folder} filtered during organize: "
+                          f"{actual_count} files < {min_series_files} min "
+                          f"(PACS reported count may be unreliable)")
+                    _cleanup_lock()
+                    return None
 
-    # 执行格式转换（传入已扫描的 dicom_files 和 sample_dcm/modality，避免重复 I/O）
-    if output_format == 'nifti':
-        client.convert_dicom_to_nifti(
-            series_path, series_folder,
-            dicom_files=dicom_files,
-            sample_dcm=sample_dcm,
-            modality=modality
+        # P3: 如果有缓存的模态信息，直接使用，避免重新读取DICOM
+        sample_dcm = None
+        modality = ''
+        if cached_metadata and use_cached_metadata:
+            # 从缓存获取模态
+            cached_modality = cached_metadata.get('modality', '')
+            if cached_modality:
+                modality = cached_modality
+                print(f"   ✅ Using cached modality: {modality}")
+
+            # 从缓存获取样本标签
+            sample_tags = cached_metadata.get('sample_tags', {})
+            if sample_tags:
+                # 创建模拟的DICOM对象（SimpleNamespace）供后续使用
+                from types import SimpleNamespace
+                sample_dcm = SimpleNamespace(**sample_tags)
+
+        # 如果没有缓存的模态信息，重新读取样本文件
+        if not modality:
+            try:
+                import pydicom
+                sample_dcm = pydicom.dcmread(dicom_files[0], force=True)
+                modality = str(getattr(sample_dcm, 'Modality', ''))
+            except Exception:
+                modality = ''
+
+        logger.info(f"[ORG] Ensuring metadata cache for {series_folder}: modality={modality}, files={len(dicom_files)}")
+        client._ensure_metadata_cache(series_path, series_folder, dicom_files, modality)
+        client._write_minimal_cache(
+            series_path,
+            series_folder,
+            modality,
+            sample_dcm=sample_dcm if isinstance(sample_dcm, pydicom.Dataset) else None,
+            file_count=len(dicom_files)
         )
-    elif output_format == 'npz':
-        client._convert_to_npz(
-            series_path, series_folder,
-            dicom_files=dicom_files,
-            sample_dcm=sample_dcm,
-            modality=modality
-        )
-    # P0: 原地处理 - 不再移动到 organized 子目录
-    # 文件已经在正确的位置，直接返回原路径
 
-    return {
-        'path': series_path,
-        'file_count': len(dicom_files),
-        'files': dicom_files
-    }
+        # P3: 数据完整性校验（如果缓存中有校验和）
+        if checksum_cache and use_cached_metadata:
+            verified_count = 0
+            corrupted_files = []
+            for filepath in dicom_files:
+                if filepath in checksum_cache:
+                    current_checksum = compute_file_checksum(filepath)
+                    if current_checksum == checksum_cache[filepath]:
+                        verified_count += 1
+                    else:
+                        corrupted_files.append(os.path.basename(filepath))
+
+            if corrupted_files:
+                print(f"   ⚠️  {len(corrupted_files)} files may be corrupted: {corrupted_files[:5]}...")
+            else:
+                print(f"   ✅ All {verified_count} files verified with checksums")
+
+        # 执行格式转换（传入已扫描的 dicom_files 和 sample_dcm/modality，避免重复 I/O）
+        try:
+            if output_format == 'nifti':
+                client.convert_dicom_to_nifti(
+                    series_path, series_folder,
+                    dicom_files=dicom_files,
+                    sample_dcm=sample_dcm,
+                    modality=modality
+                )
+            elif output_format == 'npz':
+                client._convert_to_npz(
+                    series_path, series_folder,
+                    dicom_files=dicom_files,
+                    sample_dcm=sample_dcm,
+                    modality=modality
+                )
+        except Exception as e:
+            logger.error(f"   ❌ Series {series_folder} conversion failed: {e}")
+        # P0: 原地处理 - 不再移动到 organized 子目录
+        # 文件已经在正确的位置，直接返回原路径
+
+        return {
+            'path': series_path,
+            'file_count': len(dicom_files),
+            'files': dicom_files
+        }
+    finally:
+        # 确保锁文件总是被清理，避免 WinError 5
+        _cleanup_lock()

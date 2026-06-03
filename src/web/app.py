@@ -12,6 +12,7 @@ Flask Web 应用主模块
 
 import os
 import sys
+import stat
 from concurrent.futures import ThreadPoolExecutor, Future
 from queue import Queue, Empty
 
@@ -407,19 +408,88 @@ def get_directory_size(directory):
         logger.warning(f"计算目录大小时出错: {str(e)}")
     return total_size / (1024 ** 3)  # 转换为GB
 
+def _remove_readonly(func, path, exc_info):
+    """shutil.rmtree 的 onerror 回调：尝试移除只读属性后重试删除"""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        func(path)
+    except Exception:
+        pass
+
+
+def _force_remove_file(filepath):
+    """强制删除单个文件，处理 Windows 句柄未释放问题"""
+    try:
+        os.chmod(filepath, stat.S_IWRITE)
+        os.remove(filepath)
+        return True
+    except PermissionError:
+        # Windows: 文件可能被占用，尝试重命名后删除（释放句柄的 trick）
+        try:
+            temp_name = filepath + '.deleteme'
+            os.rename(filepath, temp_name)
+            os.chmod(temp_name, stat.S_IWRITE)
+            os.remove(temp_name)
+            return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
+def _safe_rmtree(dirpath):
+    """安全删除目录树，处理 Windows 上的权限和句柄问题"""
+    if not os.path.exists(dirpath):
+        return True
+
+    # 策略1: 使用 onerror 回调的 shutil.rmtree
+    try:
+        shutil.rmtree(dirpath, onerror=_remove_readonly)
+        if not os.path.exists(dirpath):
+            return True
+    except Exception:
+        pass
+
+    # 策略2: 逐个文件删除，对顽固文件使用重命名 trick
+    failed_paths = []
+    for root, dirs, files in os.walk(dirpath, topdown=False):
+        for name in files:
+            fpath = os.path.join(root, name)
+            if not _force_remove_file(fpath):
+                failed_paths.append(fpath)
+        for name in dirs:
+            dpath = os.path.join(root, name)
+            try:
+                os.rmdir(dpath)
+            except OSError:
+                failed_paths.append(dpath)
+
+    try:
+        os.rmdir(dirpath)
+        return True
+    except OSError:
+        if os.path.exists(dirpath):
+            failed_paths.append(dirpath)
+
+    if failed_paths:
+        logger.warning(f"清理无法删除 {len(failed_paths)} 个路径（可能仍被占用）: {failed_paths[:3]}...")
+    return len(failed_paths) == 0
+
+
 def cleanup_old_results():
     """清理旧的结果文件，保持磁盘空间在合理范围内"""
     results_dir = app.config['RESULT_FOLDER']
     current_size = get_directory_size(results_dir)
-    
+
     if current_size < CLEANUP_THRESHOLD_GB:
         return
-    
+
     logger.info(f"结果目录大小: {current_size:.2f}GB, 启动自动清理")
-    
+
     # 获取所有子目录（任务目录和ZIP文件）
     items_to_check = []
-    
+
     try:
         # 扫描所有文件和目录
         for item in os.listdir(results_dir):
@@ -428,12 +498,12 @@ def cleanup_old_results():
                 # 获取最后访问时间
                 atime = os.path.getatime(item_path)
                 size = 0
-                
+
                 if os.path.isfile(item_path):
                     size = os.path.getsize(item_path) / (1024 ** 3)
                 elif os.path.isdir(item_path):
                     size = get_directory_size(item_path)
-                    
+
                 items_to_check.append({
                     'path': item_path,
                     'name': item,
@@ -441,15 +511,15 @@ def cleanup_old_results():
                     'size': size,
                     'is_dir': os.path.isdir(item_path)
                 })
-                
+
     except Exception as e:
         logger.error(f"扫描结果目录失败: {str(e)}")
         return
-    
+
     # 排除正在进行的任务
-    active_task_ids = [task.task_id for task in processing_tasks.values() 
+    active_task_ids = [task.task_id for task in processing_tasks.values()
                       if task.status in ['running', 'pending']]
-    
+
     # 过滤掉正在进行的任务
     items_to_clean = []
     for item in items_to_check:
@@ -459,37 +529,40 @@ def cleanup_old_results():
             if task_id in item['name']:
                 is_active = True
                 break
-        
+
         if not is_active:
             items_to_clean.append(item)
-    
+
     if not items_to_clean:
         logger.info("所有文件都属于活跃任务，跳过清理")
         return
-    
+
     # 按访问时间排序，先删除最旧的
     items_to_clean.sort(key=lambda x: x['atime'])
-    
+
     cleaned_size = 0
     target_to_clean = current_size - CLEANUP_TARGET_GB
-    
+
     for item in items_to_clean:
         if cleaned_size >= target_to_clean:
             break
-            
+
         try:
             logger.info(f"删除: {item['name']} ({item['size']:.2f}GB)")
-            
+
             if item['is_dir']:
-                shutil.rmtree(item['path'])
+                _safe_rmtree(item['path'])
             else:
-                os.remove(item['path'])
-                
-            cleaned_size += item['size']
-            
+                if not _force_remove_file(item['path']):
+                    logger.warning(f"无法删除文件（可能仍被占用）: {item['name']}")
+
+            # 如果删除成功，目录/文件应该不存在了
+            if not os.path.exists(item['path']):
+                cleaned_size += item['size']
+
         except Exception as e:
             logger.error(f"删除 {item['name']} 失败: {str(e)}")
-    
+
     final_size = get_directory_size(results_dir)
     logger.info(f"清理完成: {current_size:.2f}GB → {final_size:.2f}GB (清理了 {cleaned_size:.2f}GB)")
 
@@ -1521,17 +1594,38 @@ def process_single_task(task):
         # 检查取消标志
         task.check_cancellation("after_client_create")
         
-        # 检查PACS连接状态
+        # 检查PACS连接状态（带重试，应对偶发的网络抖动或PACS负载高峰）
         task.update_status('running', 8, 'Checking PACS connection')
         task.add_log("Checking PACS connection status...")
-        
-        try:
-            if not task_client.check_status():
-                raise Exception("PACS service unavailable, please check network and configuration")
-            task.add_log("PACS connection normal")
-        except Exception as e:
-            task.add_log(f"PACS connection check failed: {str(e)}", 'error')
-            raise
+
+        pacs_ok = False
+        last_error = None
+        for attempt in range(3):
+            try:
+                if task_client.check_status(retries=3, base_delay=2.0):
+                    pacs_ok = True
+                    if attempt > 0:
+                        task.add_log(f"PACS connection normal (recovered after {attempt + 1} attempts)")
+                    else:
+                        task.add_log("PACS connection normal")
+                    break
+                else:
+                    msg = f"PACS connection attempt {attempt + 1}/3 failed"
+                    task.add_log(msg, 'warning')
+                    last_error = "PACS association not established"
+            except Exception as e:
+                last_error = str(e)
+                task.add_log(f"PACS connection attempt {attempt + 1}/3 error: {last_error}", 'warning')
+
+            if attempt < 2:
+                delay = 2.0 * (2 ** attempt)
+                task.add_log(f"Retrying PACS connection in {delay:.0f}s...")
+                time.sleep(delay)
+
+        if not pacs_ok:
+            error_msg = f"PACS service unavailable after retries ({last_error}). Please check network and PACS configuration."
+            task.add_log(error_msg, 'error')
+            raise Exception(error_msg)
         
         # 检查取消标志
         task.check_cancellation("after_pacs_check")

@@ -23,6 +23,7 @@ DERIVED_IMAGE_TYPE_WHITELIST = [
     'ADC', 'EADC', 'WATER', 'FAT',
     'IN PHASE', 'INPHASE', 'OUT PHASE', 'OUTPHASE',
     'IDEAL', 'T1 MAP', 'T2 MAP', 'FA MAP',
+    'DWI', 'DIFF', 'DIFFUSION', 'EP2D', 'EPI',  # 保留 DWI/EPI 序列（即使 ImageType=DERIVED）
 ]
 
 # 运行时可修改的过滤关键词（模块级可变状态）
