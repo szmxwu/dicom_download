@@ -1900,40 +1900,51 @@ class DICOMDownloadClient:
 
     def process_upload_workflow(self, zip_path, base_output_dir, options=None):
         """上传ZIP流程：extract -> organize -> convert -> metadata。"""
-        options = options or {}
+        try:
+            options = options or {}
 
-        os.makedirs(base_output_dir, exist_ok=True)
+            os.makedirs(base_output_dir, exist_ok=True)
 
-        extract_dir = self.extract_zip(zip_path, os.path.join(base_output_dir, 'extracted'))
-        if not extract_dir:
+            extract_dir = self.extract_zip(zip_path, os.path.join(base_output_dir, 'extracted'))
+            if not extract_dir:
+                return {
+                    'success': False,
+                    'error': 'Failed to extract zip',
+                    'extract_dir': None
+                }
+
+            organized_dir = extract_dir
+            series_info = {}
+            excel_file = None
+
+            if options.get('auto_organize', True):
+                organized_dir, series_info = self.organize_dicom_files(
+                    extract_dir,
+                    output_format=options.get('output_format', 'nifti')
+                )
+
+            if options.get('auto_metadata', True):
+                excel_file = self.extract_dicom_metadata(organized_dir)
+
+            return {
+                'success': True,
+                'extract_dir': extract_dir,
+                'organized_dir': organized_dir,
+                'excel_file': excel_file,
+                'series_info': series_info,
+                'series_count': len(series_info)
+            }
+        except Exception as e:
+            logger.error(f"[UPLOAD_WORKFLOW] Upload workflow crashed for {zip_path}: {e}", exc_info=True)
             return {
                 'success': False,
-                'error': 'Failed to extract zip',
-                'extract_dir': None
+                'error': f'Upload workflow crashed: {e}',
+                'extract_dir': None,
+                'organized_dir': None,
+                'excel_file': None,
+                'series_info': {}
             }
 
-        organized_dir = extract_dir
-        series_info = {}
-        excel_file = None
-
-        if options.get('auto_organize', True):
-            organized_dir, series_info = self.organize_dicom_files(
-                extract_dir,
-                output_format=options.get('output_format', 'nifti')
-            )
-
-        if options.get('auto_metadata', True):
-            excel_file = self.extract_dicom_metadata(organized_dir)
-
-        return {
-            'success': True,
-            'extract_dir': extract_dir,
-            'organized_dir': organized_dir,
-            'excel_file': excel_file,
-            'series_info': series_info,
-            'series_count': len(series_info)
-        }
-    
     def process_complete_workflow(self, accession_number, base_output_dir="./downloads",
                                 auto_extract=True, auto_organize=True, auto_metadata=True,
                                 keep_zip=True, keep_extracted=False, output_format='nifti',
@@ -1968,278 +1979,286 @@ class DICOMDownloadClient:
             modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
             min_series_files: 可选，最小序列文件数，少于该值的序列将被跳过
         """
-        logger.info(f"\n{'='*80}")
-        logger.info(f"🚀 Starting full DICOM processing workflow")
-        logger.info(f"📋 AccessionNumber: {accession_number}")
-        if modality_filter:
-            logger.info(f"🔍 Modality filter: {modality_filter}")
-        if min_series_files:
-            logger.info(f"📊 Min series files: {min_series_files}")
-        if exclude_derived:
-            logger.info(f"🚫 Exclude derived series: enabled")
-        logger.info(f"{'='*80}")
-
-        # 确保输出目录存在
-        os.makedirs(base_output_dir, exist_ok=True)
-
-        # 步骤1: 下载DICOM文件
-        logger.info(f"\n📥 Step 1: Download DICOM files")
-
-        download_dir_holder = {'path': None}
-        # allow configuring pending-series limit to apply backpressure when conversion is slow
         try:
-            max_pending = int(os.getenv('MAX_PENDING_SERIES', '4'))
-            if max_pending <= 0:
-                max_pending = 4
-        except Exception:
-            max_pending = 4
-        series_queue = Queue(maxsize=max_pending)
-        series_info = {}
-        series_lock = threading.Lock()
-        download_done = threading.Event()
-
-        # P2: 队列看门狗，防止死锁
-        watchdog = QueueWatchdog(series_queue, timeout=300.0)
-
-        def _on_series_downloaded(series_dir, series_meta):
-            series_folder = os.path.basename(series_dir)
-            series_queue.put((series_dir, series_folder))
-            watchdog.update_activity()  # P2: 更新看门狗活动
-
-        def _download_worker():
+            logger.info(f"\n{'='*80}")
+            logger.info(f"🚀 Starting full DICOM processing workflow")
+            logger.info(f"📋 AccessionNumber: {accession_number}")
+            if modality_filter:
+                logger.info(f"🔍 Modality filter: {modality_filter}")
+            if min_series_files:
+                logger.info(f"📊 Min series files: {min_series_files}")
+            if exclude_derived:
+                logger.info(f"🚫 Exclude derived series: enabled")
+            logger.info(f"{'='*80}")
+    
+            # 确保输出目录存在
+            os.makedirs(base_output_dir, exist_ok=True)
+    
+            # 步骤1: 下载DICOM文件
+            logger.info(f"\n📥 Step 1: Download DICOM files")
+    
+            download_dir_holder = {'path': None}
+            # allow configuring pending-series limit to apply backpressure when conversion is slow
             try:
-                download_path = self.download_study(
+                max_pending = int(os.getenv('MAX_PENDING_SERIES', '4'))
+                if max_pending <= 0:
+                    max_pending = 4
+            except Exception:
+                max_pending = 4
+            series_queue = Queue(maxsize=max_pending)
+            series_info = {}
+            series_lock = threading.Lock()
+            download_done = threading.Event()
+    
+            # P2: 队列看门狗，防止死锁
+            watchdog = QueueWatchdog(series_queue, timeout=300.0)
+    
+            def _on_series_downloaded(series_dir, series_meta):
+                series_folder = os.path.basename(series_dir)
+                series_queue.put((series_dir, series_folder))
+                watchdog.update_activity()  # P2: 更新看门狗活动
+    
+            def _download_worker():
+                try:
+                    download_path = self.download_study(
+                        accession_number,
+                        base_output_dir,
+                        on_series_downloaded=_on_series_downloaded,
+                        modality_filter=modality_filter,
+                        min_series_files=min_series_files,
+                        exclude_derived=exclude_derived
+                    )
+                    download_dir_holder['path'] = download_path
+                finally:
+                    download_done.set()
+    
+            # organize worker: multiple workers supported to convert concurrently
+            try:
+                num_converters = int(os.getenv('NUM_CONVERTERS', '2'))
+                if num_converters <= 0:
+                    num_converters = 2
+            except Exception:
+                num_converters = 2
+    
+            def _organize_worker(fmt):
+                watchdog.update_activity()  # P2: 更新看门狗活动
+                while True:
+                    try:
+                        # P2: 使用超时获取，避免永久阻塞
+                        item = series_queue.get(timeout=60.0)
+                    except Empty:
+                        logger.warning("⏱️  Organize worker: queue empty timeout, checking status...")
+                        if download_done.is_set():
+                            logger.info("   Download done, worker exiting")
+                            break
+                        continue
+    
+                    if item is None:
+                        series_queue.task_done()
+                        break
+                    series_dir, series_folder = item
+    
+                    # P0: 使用带超时的线程处理单个 series，防止 dcm2niix/pydicom 无限卡住
+                    # 超时后检查已有输出，并尝试一次重试
+                    def _run_with_timeout(target_func, timeout_sec):
+                        """在线程中运行目标函数，返回 (result, error, timed_out)"""
+                        result_holder = [None]
+                        error_holder = [None]
+    
+                        def _wrapper():
+                            try:
+                                result_holder[0] = target_func()
+                            except Exception as e:
+                                error_holder[0] = e
+    
+                        t = threading.Thread(target=_wrapper, daemon=True)
+                        t.start()
+                        t.join(timeout=timeout_sec)
+                        timed_out = t.is_alive()
+                        return result_holder[0], error_holder[0], timed_out
+    
+                    def _process_single():
+                        return self._process_single_series(
+                            series_dir, series_folder, fmt,
+                            min_series_files=min_series_files
+                        )
+    
+                    # 第一次尝试
+                    info, err, timed_out = _run_with_timeout(_process_single, 600)
+    
+                    if timed_out:
+                        logger.error(
+                            f"   ❌ Series {series_folder} organize/conversion timed out after 600s (attempt 1/2)"
+                        )
+                        # 检查 dcm2niix 是否在超时前已生成输出
+                        existing_nifti = [
+                            f for f in os.listdir(series_dir)
+                            if f.endswith(('.nii.gz', '.nii')) and not f.startswith('.')
+                        ]
+                        if existing_nifti:
+                            logger.info(
+                                f"   ✅ Series {series_folder} has existing NIfTI output despite timeout, using it: {existing_nifti[0]}"
+                            )
+                            info = {
+                                'path': series_dir,
+                                'file_count': 0,  # 未知，但非关键
+                                'files': []
+                            }
+                        else:
+                            # 重试一次（dcm2niix 可能在 Windows 上因句柄问题卡住，重试可能成功）
+                            logger.warning(f"   🔄 Retrying series {series_folder} (attempt 2/2)...")
+                            info, err, timed_out2 = _run_with_timeout(_process_single, 600)
+                            if timed_out2:
+                                logger.error(
+                                    f"   ❌ Series {series_folder} still timed out after retry. "
+                                    f"Skipping this series. The daemon thread may remain stuck in background."
+                                )
+                                info = None
+                                err = f"Timed out after 2 attempts (1200s total)"
+    
+                    if info:
+                        with series_lock:
+                            series_info[series_folder] = info
+                    if err:
+                        logger.warning(f"⚠️  Series organize failed: {series_folder}: {err}")
+    
+                    watchdog.update_activity()  # P2: 更新看门狗活动
+                    series_queue.task_done()
+    
+            if parallel_pipeline and auto_organize:
+                # P0: 原地处理 - 不再创建 organized 子目录
+                # P2: 启动看门狗
+                watchdog.start()
+                try:
+                    download_thread = threading.Thread(target=_download_worker, daemon=True)
+                    # spawn multiple organizers
+                    organizer_threads = []
+                    for _ in range(num_converters):
+                        t = threading.Thread(target=_organize_worker, args=(output_format,), daemon=True)
+                        t.start()
+                        organizer_threads.append(t)
+    
+                    download_thread.start()
+    
+                    # 等待下载完成
+                    download_thread.join()
+                    # 通知整理线程退出（放入与 worker 数相同的哨兵）
+                    for _ in range(len(organizer_threads)):
+                        series_queue.put(None)
+                    # P0: 不再调用 series_queue.join()（Python Queue.join 无 timeout 参数，会永久等待）
+                    # 直接等待 worker 线程完成，带超时
+                    for t in organizer_threads:
+                        t.join(timeout=600)
+                        if t.is_alive():
+                            logger.warning(
+                                "Organize worker did not exit within 600s timeout. "
+                                "It may be stuck in a subprocess or I/O operation."
+                            )
+                finally:
+                    # P2: 停止看门狗（确保异常时也能停止，避免线程泄漏）
+                    watchdog.stop()
+    
+                download_dir = download_dir_holder['path']
+                if not download_dir:
+                    logger.error("❌ Download failed, workflow terminated")
+                    return None
+            else:
+                download_dir = self.download_study(
                     accession_number,
                     base_output_dir,
-                    on_series_downloaded=_on_series_downloaded,
                     modality_filter=modality_filter,
                     min_series_files=min_series_files,
                     exclude_derived=exclude_derived
                 )
-                download_dir_holder['path'] = download_path
-            finally:
-                download_done.set()
-
-        # organize worker: multiple workers supported to convert concurrently
-        try:
-            num_converters = int(os.getenv('NUM_CONVERTERS', '2'))
-            if num_converters <= 0:
-                num_converters = 2
-        except Exception:
-            num_converters = 2
-
-        def _organize_worker(fmt):
-            watchdog.update_activity()  # P2: 更新看门狗活动
-            while True:
-                try:
-                    # P2: 使用超时获取，避免永久阻塞
-                    item = series_queue.get(timeout=60.0)
-                except Empty:
-                    logger.warning("⏱️  Organize worker: queue empty timeout, checking status...")
-                    if download_done.is_set():
-                        logger.info("   Download done, worker exiting")
-                        break
-                    continue
-
-                if item is None:
-                    series_queue.task_done()
-                    break
-                series_dir, series_folder = item
-
-                # P0: 使用带超时的线程处理单个 series，防止 dcm2niix/pydicom 无限卡住
-                # 超时后检查已有输出，并尝试一次重试
-                def _run_with_timeout(target_func, timeout_sec):
-                    """在线程中运行目标函数，返回 (result, error, timed_out)"""
-                    result_holder = [None]
-                    error_holder = [None]
-
-                    def _wrapper():
-                        try:
-                            result_holder[0] = target_func()
-                        except Exception as e:
-                            error_holder[0] = e
-
-                    t = threading.Thread(target=_wrapper, daemon=True)
-                    t.start()
-                    t.join(timeout=timeout_sec)
-                    timed_out = t.is_alive()
-                    return result_holder[0], error_holder[0], timed_out
-
-                def _process_single():
-                    return self._process_single_series(
-                        series_dir, series_folder, fmt,
-                        min_series_files=min_series_files
-                    )
-
-                # 第一次尝试
-                info, err, timed_out = _run_with_timeout(_process_single, 600)
-
-                if timed_out:
-                    logger.error(
-                        f"   ❌ Series {series_folder} organize/conversion timed out after 600s (attempt 1/2)"
-                    )
-                    # 检查 dcm2niix 是否在超时前已生成输出
-                    existing_nifti = [
-                        f for f in os.listdir(series_dir)
-                        if f.endswith(('.nii.gz', '.nii')) and not f.startswith('.')
-                    ]
-                    if existing_nifti:
-                        logger.info(
-                            f"   ✅ Series {series_folder} has existing NIfTI output despite timeout, using it: {existing_nifti[0]}"
-                        )
-                        info = {
-                            'path': series_dir,
-                            'file_count': 0,  # 未知，但非关键
-                            'files': []
-                        }
-                    else:
-                        # 重试一次（dcm2niix 可能在 Windows 上因句柄问题卡住，重试可能成功）
-                        logger.warning(f"   🔄 Retrying series {series_folder} (attempt 2/2)...")
-                        info, err, timed_out2 = _run_with_timeout(_process_single, 600)
-                        if timed_out2:
-                            logger.error(
-                                f"   ❌ Series {series_folder} still timed out after retry. "
-                                f"Skipping this series. The daemon thread may remain stuck in background."
-                            )
-                            info = None
-                            err = f"Timed out after 2 attempts (1200s total)"
-
-                if info:
-                    with series_lock:
-                        series_info[series_folder] = info
-                if err:
-                    logger.warning(f"⚠️  Series organize failed: {series_folder}: {err}")
-
-                watchdog.update_activity()  # P2: 更新看门狗活动
-                series_queue.task_done()
-
-        if parallel_pipeline and auto_organize:
-            # P0: 原地处理 - 不再创建 organized 子目录
-            # P2: 启动看门狗
-            watchdog.start()
-            try:
-                download_thread = threading.Thread(target=_download_worker, daemon=True)
-                # spawn multiple organizers
-                organizer_threads = []
-                for _ in range(num_converters):
-                    t = threading.Thread(target=_organize_worker, args=(output_format,), daemon=True)
-                    t.start()
-                    organizer_threads.append(t)
-
-                download_thread.start()
-
-                # 等待下载完成
-                download_thread.join()
-                # 通知整理线程退出（放入与 worker 数相同的哨兵）
-                for _ in range(len(organizer_threads)):
-                    series_queue.put(None)
-                # P0: 不再调用 series_queue.join()（Python Queue.join 无 timeout 参数，会永久等待）
-                # 直接等待 worker 线程完成，带超时
-                for t in organizer_threads:
-                    t.join(timeout=600)
-                    if t.is_alive():
-                        logger.warning(
-                            "Organize worker did not exit within 600s timeout. "
-                            "It may be stuck in a subprocess or I/O operation."
-                        )
-            finally:
-                # P2: 停止看门狗（确保异常时也能停止，避免线程泄漏）
-                watchdog.stop()
-
-            download_dir = download_dir_holder['path']
-            if not download_dir:
-                logger.error("❌ Download failed, workflow terminated")
-                return None
-        else:
-            download_dir = self.download_study(
-                accession_number,
-                base_output_dir,
-                modality_filter=modality_filter,
-                min_series_files=min_series_files,
-                exclude_derived=exclude_derived
-            )
-            if not download_dir:
-                logger.error("❌ Download failed, workflow terminated")
-                return None
-
-        results = {
-            'accession_number': accession_number,
-            'zip_file': download_dir,  # 保持接口兼容性
-            'extract_dir': download_dir,  # 保持接口兼容性
-            'success': False
-        }
-
-        if auto_organize:
-            # 步骤2: 整理DICOM文件
-            logger.info(f"\n📁 Step 2: Organize DICOM files by series (format: {output_format})")
-            # P0: 原地处理 - organized_dir 就是 download_dir
-            organized_dir = download_dir
-            if parallel_pipeline:
-                # 使用流水线整理结果 - 原地处理，文件已经在正确的位置
-                results['organized_dir'] = organized_dir
-                results['series_info'] = series_info
-            else:
-                # 等待文件系统稳定（确保所有下载的文件已完全写入磁盘）
-                logger.info("   ⏳ Waiting for file system to stabilize...")
-                time.sleep(0.5)
-                # 检查下载目录中的文件状态
-                self._wait_for_files_stable(download_dir)
-                _, series_info = self.organize_dicom_files(download_dir, output_format=output_format, min_series_files=min_series_files)
-                if not series_info:
-                    # 区分真正的组织失败 vs 所有序列都被过滤掉
-                    import glob
-                    dicom_files = glob.glob(os.path.join(download_dir, '**', '*.dcm'), recursive=True)
-                    if dicom_files:
-                        logger.error(f"❌ All {len(dicom_files)} DICOM files were filtered out (min_files={min_series_files}). This accession has insufficient data.")
-                        raise ValueError(f"All series filtered out: only {len(dicom_files)} files found, min required is {min_series_files}. This may be a scout/locator scan or incomplete study.")
-                    else:
-                        logger.error("❌ File organization failed: no DICOM files found in download directory")
-                        raise ValueError("File organization failed: no DICOM files found")
-                results['organized_dir'] = organized_dir
-                results['series_info'] = series_info
-
-            if auto_metadata:
-                # 步骤3: 提取元数据 (独立线程)
-                logger.info(f"\n📊 Step 3: Extract DICOM metadata")
-                excel_name = f"dicom_metadata_{accession_number}.xlsx"
-                excel_path = os.path.join(organized_dir, excel_name)
-
-                excel_holder = {'path': None}
-
-                def _metadata_worker():
-                    try:
-                        excel_holder['path'] = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
-                    except Exception as e:
-                        logger.error(f"❌ Metadata extraction error: {e}")
-                        import traceback
-                        logger.error(f"Traceback: {traceback.format_exc()}")
-                        excel_holder['path'] = None
-
-                metadata_thread = threading.Thread(target=_metadata_worker, daemon=True)
-                metadata_thread.start()
-                metadata_thread.join()
-
-                excel_file = excel_holder['path']
-                if excel_file:
-                    results['excel_file'] = excel_file
-                    results['success'] = True
+                if not download_dir:
+                    logger.error("❌ Download failed, workflow terminated")
+                    return None
+    
+            results = {
+                'accession_number': accession_number,
+                'zip_file': download_dir,  # 保持接口兼容性
+                'extract_dir': download_dir,  # 保持接口兼容性
+                'success': False
+            }
+    
+            if auto_organize:
+                # 步骤2: 整理DICOM文件
+                logger.info(f"\n📁 Step 2: Organize DICOM files by series (format: {output_format})")
+                # P0: 原地处理 - organized_dir 就是 download_dir
+                organized_dir = download_dir
+                if parallel_pipeline:
+                    # 使用流水线整理结果 - 原地处理，文件已经在正确的位置
+                    results['organized_dir'] = organized_dir
+                    results['series_info'] = series_info
                 else:
-                    logger.warning("⚠️  Metadata extraction failed, previous steps completed")
-
-        # 打印最终结果
-        logger.info(f"\n{'='*80}")
-        if results['success']:
-            logger.info(f"🎉 Workflow completed!")
-            logger.info(f"📁 Organized directory: {results.get('organized_dir', 'N/A')}")
-            logger.info(f"📄 Excel file: {results.get('excel_file', 'N/A')}")
-            logger.info(f"📊 Series count: {len(results.get('series_info', {}))}")
-        else:
-            logger.warning(f"⚠️  Workflow partially completed")
-        logger.info(f"{'='*80}")
-
-        return results
-
-
+                    # 等待文件系统稳定（确保所有下载的文件已完全写入磁盘）
+                    logger.info("   ⏳ Waiting for file system to stabilize...")
+                    time.sleep(0.5)
+                    # 检查下载目录中的文件状态
+                    self._wait_for_files_stable(download_dir)
+                    _, series_info = self.organize_dicom_files(download_dir, output_format=output_format, min_series_files=min_series_files)
+                    if not series_info:
+                        # 区分真正的组织失败 vs 所有序列都被过滤掉
+                        import glob
+                        dicom_files = glob.glob(os.path.join(download_dir, '**', '*.dcm'), recursive=True)
+                        if dicom_files:
+                            logger.error(f"❌ All {len(dicom_files)} DICOM files were filtered out (min_files={min_series_files}). This accession has insufficient data.")
+                            raise ValueError(f"All series filtered out: only {len(dicom_files)} files found, min required is {min_series_files}. This may be a scout/locator scan or incomplete study.")
+                        else:
+                            logger.error("❌ File organization failed: no DICOM files found in download directory")
+                            raise ValueError("File organization failed: no DICOM files found")
+                    results['organized_dir'] = organized_dir
+                    results['series_info'] = series_info
+    
+                if auto_metadata:
+                    # 步骤3: 提取元数据 (独立线程)
+                    logger.info(f"\n📊 Step 3: Extract DICOM metadata")
+                    excel_name = f"dicom_metadata_{accession_number}.xlsx"
+                    excel_path = os.path.join(organized_dir, excel_name)
+    
+                    excel_holder = {'path': None}
+    
+                    def _metadata_worker():
+                        try:
+                            excel_holder['path'] = self.extract_dicom_metadata(organized_dir, output_excel=excel_path)
+                        except Exception as e:
+                            logger.error(f"❌ Metadata extraction error: {e}")
+                            import traceback
+                            logger.error(f"Traceback: {traceback.format_exc()}")
+                            excel_holder['path'] = None
+    
+                    metadata_thread = threading.Thread(target=_metadata_worker, daemon=True)
+                    metadata_thread.start()
+                    metadata_thread.join()
+    
+                    excel_file = excel_holder['path']
+                    if excel_file:
+                        results['excel_file'] = excel_file
+                        results['success'] = True
+                    else:
+                        logger.warning("⚠️  Metadata extraction failed, previous steps completed")
+    
+            # 打印最终结果
+            logger.info(f"\n{'='*80}")
+            if results['success']:
+                logger.info(f"🎉 Workflow completed!")
+                logger.info(f"📁 Organized directory: {results.get('organized_dir', 'N/A')}")
+                logger.info(f"📄 Excel file: {results.get('excel_file', 'N/A')}")
+                logger.info(f"📊 Series count: {len(results.get('series_info', {}))}")
+            else:
+                logger.warning(f"⚠️  Workflow partially completed")
+            logger.info(f"{'='*80}")
+    
+            return results
+        except Exception as workflow_e:
+            logger.error(f"[WORKFLOW] process_complete_workflow crashed for {accession_number}: {workflow_e}", exc_info=True)
+            return {
+                'accession_number': accession_number,
+                'success': False,
+                'error': str(workflow_e)
+            }
+    
+    
 def main():
     """主函数 - 演示完整工作流程"""
     print("🏥 Unified DICOM download and processing system")

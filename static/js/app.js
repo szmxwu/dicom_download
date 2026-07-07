@@ -1772,7 +1772,8 @@ class DICOMProcessor {
                 low_quality: Number((result && result.quality_distribution && result.quality_distribution.low_quality) || 0),
                 fixed: Number((result && result.quality_distribution && result.quality_distribution.fixed) || 0),
                 unknown: Number((result && result.quality_distribution && result.quality_distribution.unknown) || 0)
-            }
+            },
+            batch_results: []
         };
 
         if (result && result.series_info && typeof result.series_info === 'object') {
@@ -1781,6 +1782,20 @@ class DICOMProcessor {
             } catch (error) {
                 // ignore
             }
+        }
+
+        // 保留批量任务的逐条结果（用于前端展示失败项）
+        if (result && Array.isArray(result.batch_results)) {
+            safe.batch_results = result.batch_results.map(r => {
+                if (!r || typeof r !== 'object') {
+                    return { accession_number: '-', success: false, error: 'Invalid result entry' };
+                }
+                return {
+                    accession_number: String(r.accession_number || r.accno || '-'),
+                    success: Boolean(r.success),
+                    error: r.error ? String(r.error) : ''
+                };
+            });
         }
 
         return safe;
@@ -1948,15 +1963,47 @@ class DICOMProcessor {
                 <!-- 下载按钮 -->
                 <div class="mt-3">
                     <h6 class="text-success mb-3"><i class="fas fa-download"></i> 下载批量结果</h6>
+                    ${result.total_failed > 0 ? `
+                    <div class="alert alert-warning">
+                        <i class="fas fa-exclamation-triangle"></i>
+                        <strong>部分研究处理失败</strong>：${result.total_failed} 个检查未成功，下载包中仅包含成功研究的结果。
+                    </div>
+                    ` : ''}
                     <div class="d-grid">
                         ${result.result_zip ? `
                             <a href="/api/download/${this.currentTask.id}/zip" 
                                class="btn btn-primary">
                                 <i class="fas fa-file-archive"></i> 下载批量结果ZIP
                             </a>
-                        ` : ''}
+                        ` : `
+                            <button class="btn btn-secondary" disabled>
+                                <i class="fas fa-times-circle"></i> 批量结果ZIP不可用
+                            </button>
+                        `}
                     </div>
                 </div>
+
+                <!-- 失败列表 -->
+                ${result.total_failed > 0 && result.batch_results && result.batch_results.length > 0 ? `
+                <div class="mt-4">
+                    <h6 class="text-danger mb-2"><i class="fas fa-list"></i> 失败明细</h6>
+                    <div class="table-responsive">
+                        <table class="table table-sm table-bordered">
+                            <thead class="table-light">
+                                <tr><th>AccessionNumber</th><th>失败原因</th></tr>
+                            </thead>
+                            <tbody>
+                                ${result.batch_results.filter(r => !r.success && r.error).map(r => `
+                                    <tr>
+                                        <td><code>${this.escapeHtml(r.accession_number)}</code></td>
+                                        <td class="text-danger">${this.escapeHtml(r.error)}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                ` : ''}
             </div>
         `;
     }

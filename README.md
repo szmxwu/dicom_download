@@ -426,3 +426,29 @@ flowchart TD
    - **AX (Axial)**: X-Y plane → aspect = slice_spacing / pixel_spacing[1]
 3. **Automatic Transpose Correction**: Detects and corrects row/column mismatches based on DICOM metadata
 4. **Windowing Support**: Applies DICOM window center/width for proper contrast
+
+---
+
+## Troubleshooting
+
+### Application crashes on Windows
+
+If the web application exits unexpectedly after running for a while, check `logs/app.log` and look for the following markers:
+
+- **`[RUNTIME]`** — startup environment (Python version, platform, PID, working directory).
+- **`[SYS_SNAPSHOT]`** — recorded every 5 minutes. Contains RSS/VMS memory, thread count, open file count, CPU%, running/pending/total tasks. A rapidly growing `memory_rss_mb` or `threads` value indicates a memory leak or thread leak.
+- **`Unhandled exception:`** (CRITICAL level) — caught by the global exception hook right before a Python-level crash.
+- **`Fatal Python error:`** — written by `faulthandler` for low-level crashes such as access violations or stack overflows. It includes the C-level traceback of all threads.
+- **`[TASK_CRASH]`** / **`[WORKFLOW]`** — task-level crashes with full Python traceback.
+- **`[SUBPROCESS]`** — dcm2niix external-process failures/timeouts. Windows-specific `taskkill` messages also appear here.
+
+Additional Windows-specific checks:
+
+1. Check **Windows Event Viewer** → Windows Logs → Application for crashes of `python.exe`.
+2. If `python.exe` is killed without traceback, it is likely OOM. Lower `MAX_PENDING_SERIES` / `NUM_CONVERTERS` or reduce batch size.
+3. Disable or whitelist the project directory in antivirus software to rule out file-lock related crashes.
+4. Ensure the `logs/` directory is writable and not synced by cloud storage tools (OneDrive/Dropbox) while the app is running, which can interfere with log rotation.
+
+### Known Issues
+
+See the project `AGENTS.md` for a list of known quirks and architectural notes.

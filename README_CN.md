@@ -420,3 +420,29 @@ flowchart TD
    - **AX（轴位）**：X-Y 平面 → 纵横比 = slice_spacing / pixel_spacing[1]
 3. **自动行列校正**：根据 DICOM 元数据检测并校正行列颠倒
 4. **窗宽窗位支持**：应用 DICOM 窗位/窗宽实现正确对比度
+
+---
+
+## 故障排查
+
+### Windows 下运行一段时间后自动崩溃
+
+如果 Web 应用运行一段时间后意外退出，请查看 `logs/app.log`，并关注以下标记：
+
+- **`[RUNTIME]`** — 启动时记录的运行环境（Python 版本、平台、PID、工作目录）。
+- **`[SYS_SNAPSHOT]`** — 每 5 分钟记录一次，包含 RSS/VMS 内存、线程数、打开文件数、CPU 占用、运行/等待/总任务数。若 `memory_rss_mb` 或 `threads` 持续快速增长，说明存在内存泄漏或线程泄漏。
+- **`Unhandled exception:`**（CRITICAL 级别）— 全局未捕获异常钩子，在 Python 级别崩溃前记录完整 traceback。
+- **`Fatal Python error:`** — 由 `faulthandler` 写入，用于段错误、访问违规等底层崩溃，包含所有线程的 C 级 traceback。
+- **`[TASK_CRASH]`** / **`[WORKFLOW]`** — 任务级别崩溃及完整 Python traceback。
+- **`[SUBPROCESS]`** — dcm2niix 外部进程失败/超时日志，Windows 下的 `taskkill` 信息也会出现在这里。
+
+Windows 专属排查建议：
+
+1. 打开 **Windows 事件查看器** → Windows 日志 → 应用程序，查看 `python.exe` 的崩溃记录。
+2. 如果 `python.exe` 被直接终止且没有 traceback，大概率是 OOM。可降低 `.env` 中的 `MAX_PENDING_SERIES` / `NUM_CONVERTERS`，或减少批量任务数量。
+3. 将项目目录加入杀毒软件白名单，排除文件锁定导致的崩溃。
+4. 确保 `logs/` 目录可写，且不被 OneDrive / Dropbox 等云同步工具实时同步，否则会影响日志滚动。
+
+### 已知问题
+
+详见项目 `AGENTS.md` 中的已知问题与架构说明。
