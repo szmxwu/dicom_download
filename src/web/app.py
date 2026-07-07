@@ -13,8 +13,6 @@ Flask Web 应用主模块
 import os
 import sys
 import stat
-import platform
-import faulthandler
 from concurrent.futures import ThreadPoolExecutor, Future
 from queue import Queue, Empty
 
@@ -45,7 +43,6 @@ import uuid
 import threading
 import shutil
 import logging
-import traceback
 from logging.handlers import RotatingFileHandler
 from werkzeug.utils import secure_filename
 
@@ -123,34 +120,10 @@ def setup_logging():
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-
-    # 将 fatal error（段错误、访问违规等）输出到日志文件，便于 Windows 崩溃定位
-    try:
-        log_path = os.path.abspath('logs/app.log')
-        crash_log_fd = open(log_path, 'a', encoding='utf-8')
-        faulthandler.enable(crash_log_fd)
-    except Exception as e:
-        logger.warning(f"无法启用 faulthandler: {e}")
     
     return logger
 
 logger = setup_logging()
-
-
-def _log_unhandled_exception(exc_type, exc_value, exc_traceback):
-    """全局未捕获异常钩子：记录完整 traceback，便于定位崩溃原因。"""
-    if issubclass(exc_type, KeyboardInterrupt):
-        # 用户主动 Ctrl+C 不记录为崩溃
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-    logger.critical(
-        "Unhandled exception:\n" +
-        "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-    )
-
-
-sys.excepthook = _log_unhandled_exception
-
 
 # WebSocket支持
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -192,38 +165,6 @@ TASK_MAX_AGE_HOURS = 24  # 任务最大保留时间（小时）
 TASK_CLEANUP_INTERVAL = 3600  # 清理检查间隔（秒）
 
 
-def _log_system_snapshot():
-    """记录系统资源快照：进程内存、线程数、活跃任务等，便于定位 OOM/死锁。"""
-    try:
-        import psutil
-        proc = psutil.Process()
-        mem_info = proc.memory_info()
-        snapshot = {
-            'pid': proc.pid,
-            'memory_rss_mb': round(mem_info.rss / (1024 * 1024), 2),
-            'memory_vms_mb': round(mem_info.vms / (1024 * 1024), 2),
-            'threads': proc.num_threads(),
-            'open_files': len(proc.open_files()) if hasattr(proc, 'open_files') else None,
-            'cpu_percent': proc.cpu_percent(interval=0.1),
-            'task_running': _running_task_count,
-            'task_pending': task_queue.qsize(),
-            'task_total': len(processing_tasks),
-        }
-        logger.info(f"[SYS_SNAPSHOT] {snapshot}")
-    except Exception as e:
-        logger.warning(f"[SYS_SNAPSHOT] Failed to collect snapshot: {e}")
-
-
-def _system_snapshot_worker():
-    """后台线程：定期记录系统快照。"""
-    while True:
-        try:
-            time.sleep(300)  # 每 5 分钟记录一次
-            _log_system_snapshot()
-        except Exception as e:
-            logger.warning(f"[SYS_SNAPSHOT] Worker error: {e}")
-
-
 def _cleanup_old_tasks():
     """后台线程：定期清理过期任务"""
     while True:
@@ -232,7 +173,6 @@ def _cleanup_old_tasks():
             _do_cleanup_old_tasks()
         except Exception as e:
             logger.error(f"任务清理失败: {e}")
-            logger.error(traceback.format_exc())
 
 
 # ============ 任务队列管理函数 ============
@@ -338,13 +278,10 @@ def _process_queue():
         # 提交到线程池执行
         def _task_wrapper():
             global _running_task_count
-            logger.info(f"[TASK_START] {task.task_id} type={task.task_type} started in worker thread")
             try:
                 task_func(task)
-                logger.info(f"[TASK_END] {task.task_id} status={task.status} progress={task.progress}")
             except Exception as e:
-                logger.error(f"[TASK_CRASH] {task.task_id} execution error: {e}")
-                logger.error(traceback.format_exc())
+                logger.error(f"Task {task_id} execution error: {e}")
                 try:
                     task.update_status('failed')
                     task.error = str(e)
@@ -353,7 +290,6 @@ def _process_queue():
             finally:
                 with _queue_lock:
                     _running_task_count -= 1
-                logger.info(f"[TASK_WORKER] {task.task_id} worker finished; remaining_running={_running_task_count}")
                 # 尝试处理队列中的下一个任务
                 _process_queue()
 
@@ -393,13 +329,6 @@ def _do_cleanup_old_tasks():
 # 启动后台清理线程
 cleanup_thread = threading.Thread(target=_cleanup_old_tasks, daemon=True)
 cleanup_thread.start()
-
-# 启动系统资源快照线程，便于定位 Windows 崩溃/内存泄漏
-snapshot_thread = threading.Thread(target=_system_snapshot_worker, daemon=True)
-snapshot_thread.start()
-
-# 启动时记录一次系统快照
-_log_system_snapshot()
 
 # 创建DICOM客户端实例用于系统状态检查（不登录）
 dicom_client_checker = DICOMDownloadClient()
@@ -456,22 +385,13 @@ try:
 except Exception:
     CLEANUP_TARGET_GB = 40.0
 
-try:
-    CLEANUP_MIN_AGE_MINUTES = float(os.getenv('CLEANUP_MIN_AGE_MINUTES', '30'))
-    if CLEANUP_MIN_AGE_MINUTES < 0:
-        CLEANUP_MIN_AGE_MINUTES = 0.0
-except Exception:
-    CLEANUP_MIN_AGE_MINUTES = 30.0
-
 # 将读取到的默认值持久化到 .env，便于用户修改与持久化配置
 try:
     # 写入整数值时保留整型格式，浮点数保留原样
     thr_val = str(int(CLEANUP_THRESHOLD_GB) if float(CLEANUP_THRESHOLD_GB).is_integer() else CLEANUP_THRESHOLD_GB)
     tgt_val = str(int(CLEANUP_TARGET_GB) if float(CLEANUP_TARGET_GB).is_integer() else CLEANUP_TARGET_GB)
-    age_val = str(int(CLEANUP_MIN_AGE_MINUTES) if float(CLEANUP_MIN_AGE_MINUTES).is_integer() else CLEANUP_MIN_AGE_MINUTES)
     set_key(ENV_FILE_PATH, 'CLEANUP_THRESHOLD_GB', thr_val)
     set_key(ENV_FILE_PATH, 'CLEANUP_TARGET_GB', tgt_val)
-    set_key(ENV_FILE_PATH, 'CLEANUP_MIN_AGE_MINUTES', age_val)
 except Exception as e:
     logger.warning(f"无法将清理阈值写入 {ENV_FILE_PATH}: {e}")
 
@@ -558,15 +478,7 @@ def _safe_rmtree(dirpath):
 
 
 def cleanup_old_results():
-    """清理旧的结果文件，保持磁盘空间在合理范围内。
-
-    清理策略：
-    1. 仅在 results 目录总大小超过 CLEANUP_THRESHOLD_GB 时触发。
-    2. 保留 running/pending 任务对应的结果。
-    3. 保留最近 CLEANUP_MIN_AGE_MINUTES 分钟内产生/修改的结果，
-       避免刚完成的批量任务 ZIP 被立即删除。
-    4. 按 mtime（修改时间）升序删除最旧的项目，直到总大小低于 CLEANUP_TARGET_GB。
-    """
+    """清理旧的结果文件，保持磁盘空间在合理范围内"""
     results_dir = app.config['RESULT_FOLDER']
     current_size = get_directory_size(results_dir)
 
@@ -583,8 +495,8 @@ def cleanup_old_results():
         for item in os.listdir(results_dir):
             item_path = os.path.join(results_dir, item)
             if os.path.exists(item_path):
-                # 获取修改时间（mtime 比 atime 更能反映结果产生时间）
-                mtime = os.path.getmtime(item_path)
+                # 获取最后访问时间
+                atime = os.path.getatime(item_path)
                 size = 0
 
                 if os.path.isfile(item_path):
@@ -595,7 +507,7 @@ def cleanup_old_results():
                 items_to_check.append({
                     'path': item_path,
                     'name': item,
-                    'mtime': mtime,
+                    'atime': atime,
                     'size': size,
                     'is_dir': os.path.isdir(item_path)
                 })
@@ -604,23 +516,12 @@ def cleanup_old_results():
         logger.error(f"扫描结果目录失败: {str(e)}")
         return
 
-    now = time.time()
-    min_age_seconds = CLEANUP_MIN_AGE_MINUTES * 60
+    # 排除正在进行的任务
+    active_task_ids = [task.task_id for task in processing_tasks.values()
+                      if task.status in ['running', 'pending']]
 
-    # 排除正在进行的任务以及刚完成的批量任务
-    # 刚完成的任务仍保留在 processing_tasks 中，需用 end_time 保护，避免长任务一完成就被清理
-    active_task_ids = []
-    for task in processing_tasks.values():
-        if task.status in ['running', 'pending']:
-            active_task_ids.append(task.task_id)
-        elif task.status == 'completed' and task.end_time:
-            # 已完成任务在 MIN_AGE 内也视为受保护，防止新下载的批量结果被立即删除
-            if (now - task.end_time) < min_age_seconds:
-                active_task_ids.append(task.task_id)
-
-    # 过滤掉正在进行的任务以及太新的结果
+    # 过滤掉正在进行的任务
     items_to_clean = []
-    skipped_too_new = 0
     for item in items_to_check:
         # 检查是否为活跃任务目录
         is_active = False
@@ -629,25 +530,15 @@ def cleanup_old_results():
                 is_active = True
                 break
 
-        if is_active:
-            continue
-
-        age_seconds = now - item['mtime']
-        if age_seconds < min_age_seconds:
-            skipped_too_new += 1
-            continue
-
-        items_to_clean.append(item)
-
-    if skipped_too_new:
-        logger.info(f"跳过 {skipped_too_new} 个太新的结果（保留 {CLEANUP_MIN_AGE_MINUTES} 分钟内）")
+        if not is_active:
+            items_to_clean.append(item)
 
     if not items_to_clean:
-        logger.info("没有可清理的旧结果，跳过清理")
+        logger.info("所有文件都属于活跃任务，跳过清理")
         return
 
-    # 按修改时间排序，先删除最旧的
-    items_to_clean.sort(key=lambda x: x['mtime'])
+    # 按访问时间排序，先删除最旧的
+    items_to_clean.sort(key=lambda x: x['atime'])
 
     cleaned_size = 0
     target_to_clean = current_size - CLEANUP_TARGET_GB
@@ -660,8 +551,7 @@ def cleanup_old_results():
             logger.info(f"删除: {item['name']} ({item['size']:.2f}GB)")
 
             if item['is_dir']:
-                if not _safe_rmtree(item['path']):
-                    logger.warning(f"无法删除目录（可能仍被占用）: {item['name']}")
+                _safe_rmtree(item['path'])
             else:
                 if not _force_remove_file(item['path']):
                     logger.warning(f"无法删除文件（可能仍被占用）: {item['name']}")
@@ -672,7 +562,6 @@ def cleanup_old_results():
 
         except Exception as e:
             logger.error(f"删除 {item['name']} 失败: {str(e)}")
-            logger.error(traceback.format_exc())
 
     final_size = get_directory_size(results_dir)
     logger.info(f"清理完成: {current_size:.2f}GB → {final_size:.2f}GB (清理了 {cleaned_size:.2f}GB)")
@@ -848,7 +737,6 @@ def _attach_task_log_handler(task: ProcessingTask):
         root.setLevel(logging.INFO)
 
     root.addHandler(handler)
-    logger.info(f"[TASK_LOG_HANDLER] Attached to task {task.task_id}")
     return handler, original_level
 
 
@@ -860,7 +748,6 @@ def _detach_task_log_handler(handler_and_level):
     if handler:
         try:
             logging.getLogger().removeHandler(handler)
-            logger.info("[TASK_LOG_HANDLER] Detached")
         except Exception:
             pass
     try:
@@ -1993,78 +1880,63 @@ def process_single_task(task):
         _detach_task_log_handler(task_log_handler)
 
 def process_batch_task(task):
-    """处理批量AccessionNumber任务 - 健壮版
-
-    改进点（对照 src/cli/download_batch.py）：
-    1. 输入参数校验与默认值保护
-    2. 每个 Accession 独立捕获异常，避免单点失败导致整批失败
-    3. 对缓存/工作流返回的 result 做规范化，避免 None.get 异常
-    4. 结果汇总阶段（创建批量ZIP、质量统计）与单条处理解耦，汇总异常时仍返回部分结果
-    5. 增加详细的 traceback 日志，便于定位批量阶段崩溃
-    """
+    """处理批量AccessionNumber任务 - 修复版，支持去重和取消检查"""
     client_logged_in = False
-    task_client = None
+    task_client = None  # 初始化变量
     task_log_handler = _attach_task_log_handler(task)
-
-    def _safe_dict(value):
-        """将可能是 None 的对象安全转为 dict。"""
-        return value if isinstance(value, dict) else {}
-
     try:
-        # --- 参数校验 ---
-        parameters = _safe_dict(task.parameters)
-        accession_numbers = parameters.get('accession_numbers')
-        if not isinstance(accession_numbers, (list, tuple)):
-            raise ValueError(f"Invalid accession_numbers type: {type(accession_numbers).__name__}")
+        accession_numbers = task.parameters['accession_numbers']
+        options = task.parameters.get('options', {})
 
-        options = _safe_dict(parameters.get('options'))
+        # 获取过滤参数
         modality_filter = options.get('modality_filter')
         min_series_files = options.get('min_series_files')
-        exclude_derived = options.get('exclude_derived', True)
+        exclude_derived = options.get('exclude_derived', True)  # 默认启用衍生序列过滤
         if min_series_files is not None:
             try:
                 min_series_files = int(min_series_files)
-                if min_series_files < 0:
-                    min_series_files = None
             except (ValueError, TypeError):
                 min_series_files = None
-
         if modality_filter:
             task.add_log(f"Modality filter: {modality_filter}")
         if min_series_files:
             task.add_log(f"Min series files: {min_series_files}")
         if exclude_derived:
-            task.add_log("Exclude derived series: enabled")
+            task.add_log(f"Exclude derived series: enabled")
 
-        # 去重并保持顺序
+        # 去重处理，保持顺序
         seen = set()
         unique_accession_numbers = []
         for acc in accession_numbers:
-            acc_str = str(acc).strip() if acc is not None else ''
-            if acc_str and acc_str not in seen:
-                seen.add(acc_str)
-                unique_accession_numbers.append(acc_str)
+            if acc and acc not in seen:
+                seen.add(acc)
+                unique_accession_numbers.append(acc)
 
         if len(unique_accession_numbers) < len(accession_numbers):
-            task.add_log(
-                f"Removed {len(accession_numbers) - len(unique_accession_numbers)} duplicates, "
-                f"{len(unique_accession_numbers)} unique studies to process"
-            )
+            task.add_log(f"Removed {len(accession_numbers) - len(unique_accession_numbers)} duplicates, {len(unique_accession_numbers)} unique studies to process")
+        
         accession_numbers = unique_accession_numbers
-
+        
         task.update_status('running', 5, 'Connecting to DICOM service')
         task.add_log("Connecting to DICOM service...")
+        
+        # 检查取消标志
         task.check_cancellation("before_connect")
-
+        
+        # 创建新的DICOM客户端实例并登录
         task_client = DICOMDownloadClient()
+        
+        # 自动登录（兼容性接口：当前DICOM客户端不做真实认证）
         task.add_log("Logging in to DICOM service...")
         username = os.getenv('DICOM_USERNAME', '')
         password = os.getenv('DICOM_PASSWORD', '')
         if not task_client.login(username, password):
             raise Exception("DICOM service login failed, please check service status")
+        
         client_logged_in = True
         task.add_log("DICOM service login successful")
-
+        
+        # Attach progress callback so MR_clean can report progress back to task logs
         def _mr_progress(msg, stage=None):
             try:
                 task.add_log(msg)
@@ -2073,19 +1945,23 @@ def process_batch_task(task):
             logger.debug(f"MR_PROGRESS[{stage}]: {msg}")
 
         task_client.progress_callback = _mr_progress
-
+        
         task.update_status('running', 10, 'Initializing batch process')
         task.add_log(f"Start batch processing {len(accession_numbers)} studies")
-
+        
         results = []
         total = len(accession_numbers)
-
+        
         for i, accno in enumerate(accession_numbers):
+            # 检查取消标志
             task.check_cancellation(f"before_processing_{accno}")
+            
+            # 计算进度 (10-90%用于处理，剩余用于整理)
             progress = 10 + int((i / total) * 80)
             task.update_status('running', progress, f'Processing {accno} ({i+1}/{total})')
             task.add_log(f'Processing study {i+1}/{total}: {accno}')
-
+            
+            # 创建单独的结果目录
             result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id, accno)
             os.makedirs(result_dir, exist_ok=True)
 
@@ -2095,14 +1971,13 @@ def process_batch_task(task):
                 task.add_log(f"{accno}: Cache hit, loading from disk...")
                 try:
                     cached_result = copy_from_cache(cache_dir, result_dir, task.task_id)
-                    cached_result = _safe_dict(cached_result)
                     if cached_result.get('success'):
                         results.append(cached_result)
                         task.add_log(f'{accno}: Loaded from cache')
                         continue
                 except Exception as e:
                     task.add_log(f"{accno}: Cache load failed, will download: {e}", 'warning')
-
+            
             try:
                 result = task_client.process_complete_workflow(
                     accession_number=accno,
@@ -2111,31 +1986,23 @@ def process_batch_task(task):
                     auto_organize=options.get('auto_organize', True),
                     auto_metadata=options.get('auto_metadata', True),
                     output_format=options.get('output_format', 'nifti'),
-                    parallel_pipeline=True,
+                    parallel_pipeline=True,  # 启用下载-转换并行流水线，下载与整理/转换重叠执行
                     modality_filter=modality_filter,
                     min_series_files=min_series_files,
                     exclude_derived=exclude_derived
                 )
 
-                # 归一化：任何空返回都转为失败记录
-                result = _safe_dict(result)
-                if not result.get('success'):
-                    result.setdefault('accession_number', accno)
-                    result.setdefault('success', False)
-                    if not result.get('error'):
-                        result['error'] = 'Workflow returned unsuccessful result'
-
-                # MR 序列重命名（不影响后续统计的健壮性）
-                if options.get('rename_mr_series') and result.get('organized_dir') and result.get('excel_file'):
+                # --- MR 序列重命名 ---
+                if options.get('rename_mr_series') and result and result.get('organized_dir') and result.get('excel_file'):
                     try:
                         rename_map = task_client.rename_mr_series_folders(
                             result['organized_dir'],
                             result['excel_file']
                         )
-                        series_info = _safe_dict(result.get('series_info'))
-                        if rename_map and series_info:
+                        # 仅更新原有 series_info 中的序列
+                        if rename_map and result.get('series_info'):
                             updated_series_info = {}
-                            for old_name, info in series_info.items():
+                            for old_name, info in result['series_info'].items():
                                 new_name = rename_map.get(old_name, old_name)
                                 new_path = os.path.join(result['organized_dir'], new_name)
                                 if os.path.isdir(new_path):
@@ -2144,21 +2011,19 @@ def process_batch_task(task):
                     except Exception as rename_e:
                         task.add_log(f'{accno}: MR rename failed: {rename_e}', 'warning')
 
-                # 确保 series_info 始终为 dict，避免后续 .get 异常
-                result['series_info'] = _safe_dict(result.get('series_info'))
-
-                # 保存到磁盘缓存
-                if result.get('success') and result.get('organized_dir'):
+                # --- 保存到磁盘缓存 ---
+                if result and result.get('success') and result.get('organized_dir'):
                     try:
-                        zip_name = f"{task.task_id}_{accno}"
-                        zip_path = create_result_zip(
-                            result['organized_dir'],
-                            zip_name,
-                            app.config['RESULT_FOLDER'],
-                            extra_files=[result.get('excel_file')],
-                            include_subdirs=set(result['series_info'].keys())
-                        )
-                        result['result_zip'] = zip_path
+                        zip_path = None
+                        if result.get('organized_dir'):
+                            zip_path = create_result_zip(
+                                result['organized_dir'],
+                                task.task_id,
+                                app.config['RESULT_FOLDER'],
+                                extra_files=[result.get('excel_file')],
+                                include_subdirs=set(result.get('series_info', {}).keys())
+                            )
+                            result['result_zip'] = zip_path
                         save_to_cache(
                             result['organized_dir'],
                             cache_dir,
@@ -2169,58 +2034,43 @@ def process_batch_task(task):
                         logger.warning(f"Batch cache save failed for {accno}: {cache_e}")
 
                 results.append(result)
-                if result.get('success'):
-                    task.add_log(f'{accno} Process completed')
-                else:
-                    task.add_log(f"{accno} Process failed: {result.get('error', 'Unknown error')}", 'error')
-
+                task.add_log(f'{accno} Process completed')
+                
             except Exception as e:
-                logger.error(f"[BATCH] Exception while processing {accno}: {e}", exc_info=True)
                 task.add_log(f'{accno} Process failed: {str(e)}', 'error')
-                results.append({
-                    'accession_number': accno,
-                    'success': False,
-                    'error': str(e),
-                    'series_info': {}
-                })
-
-        # --- 结果汇总阶段 ---
+                results.append({'accession_number': accno, 'error': str(e)})
+        
         task.update_status('running', 95, 'Creating batch results')
         task.add_log("Creating batch result files...")
-
-        zip_path = None
-        try:
-            batch_result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id)
-            zip_path = create_result_zip(
-                batch_result_dir,
-                f"batch_{task.task_id}",
-                app.config['RESULT_FOLDER']
-            )
-        except Exception as zip_e:
-            logger.error(f"[BATCH] Failed to create batch result ZIP: {zip_e}", exc_info=True)
-            task.add_log(f'Batch ZIP creation failed: {zip_e}', 'warning')
-
-        # --- 统计信息 ---
-        total_processed = 0
-        total_failed = 0
-        quality_stats = {'normal': 0, 'low_quality': 0, 'fixed': 0, 'unknown': 0}
+        
+        # 合并结果
+        batch_result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id)
+        zip_path = create_result_zip(
+            batch_result_dir,
+            f"batch_{task.task_id}",
+            app.config['RESULT_FOLDER']
+        )
+        
+        # 计算详细的批处理统计信息
+        total_processed = len([r for r in results if r.get('success')])
+        total_failed = len([r for r in results if r.get('error')])
+        
+        # 收集质量统计数据
+        quality_stats = {
+            'normal': 0,
+            'low_quality': 0,
+            'fixed': 0,
+            'unknown': 0
+        }
         total_images = 0
         total_series = 0
-
-        try:
-            for r in results:
-                r = _safe_dict(r)
-                if r.get('success'):
-                    total_processed += 1
-                else:
-                    total_failed += 1
-
-                if not r.get('success'):
-                    continue
-
-                series_info = _safe_dict(r.get('series_info'))
+        
+        for r in results:
+            if r.get('success'):
+                series_info = r.get('series_info', {})
                 total_series += len(series_info)
-
+                
+                # 尝试从Excel元数据文件中读取质量统计
                 excel_file = r.get('excel_file')
                 if excel_file and os.path.exists(excel_file):
                     try:
@@ -2228,42 +2078,38 @@ def process_batch_task(task):
                         df = pd.read_excel(excel_file)
                         if 'Low_quality' in df.columns:
                             for _, row in df.iterrows():
-                                total_images += 1
                                 low_quality = row.get('Low_quality', 0)
                                 fixed = row.get('Fixed', '')
-                                reason = str(row.get('Low_quality_reason', ''))
-                                if fixed == 'Yes' or 'Fixed' in reason:
+                                if fixed == 'Yes' or 'Fixed' in str(row.get('Low_quality_reason', '')):
                                     quality_stats['fixed'] += 1
-                                elif low_quality == 0 or low_quality is False:
+                                elif low_quality == 0 or low_quality == False:
                                     quality_stats['normal'] += 1
-                                elif low_quality == 1 or low_quality is True:
+                                elif low_quality == 1 or low_quality == True:
                                     quality_stats['low_quality'] += 1
                                 else:
                                     quality_stats['unknown'] += 1
+                                total_images += 1
                         else:
-                            count = len(df)
-                            total_images += count
-                            quality_stats['unknown'] += count
-                    except Exception as excel_e:
-                        logger.warning(f"[BATCH] Failed to read quality stats from {excel_file}: {excel_e}")
-                        for series_data in series_info.values():
-                            series_data = _safe_dict(series_data)
+                            # 如果没有质量列，只统计文件数量
+                            total_images += len(df)
+                            quality_stats['unknown'] += len(df)
+                    except Exception as e:
+                        # 如果读取Excel失败，使用series_info统计
+                        for series_name, series_data in series_info.items():
                             file_count = series_data.get('file_count', 0)
                             total_images += file_count
                             quality_stats['unknown'] += file_count
                 else:
-                    for series_data in series_info.values():
-                        series_data = _safe_dict(series_data)
+                    # 如果没有Excel文件，使用series_info统计
+                    for series_name, series_data in series_info.items():
                         file_count = series_data.get('file_count', 0)
                         total_images += file_count
                         quality_stats['unknown'] += file_count
-        except Exception as stats_e:
-            logger.error(f"[BATCH] Statistics aggregation failed: {stats_e}", exc_info=True)
-            task.add_log(f'Batch statistics aggregation failed: {stats_e}', 'warning')
-
+        
+        # 计算处理时间
         duration = (task.end_time or time.time()) - task.start_time
         avg_speed = total_images / duration if duration > 0 else 0
-
+        
         task.result = {
             'batch_results': results,
             'result_zip': zip_path,
@@ -2276,25 +2122,28 @@ def process_batch_task(task):
             'avg_speed': round(avg_speed, 2),
             'quality_distribution': quality_stats
         }
-
+        
         task.update_status('completed', 100, 'Batch process completed')
         task.add_log('Batch process completed')
         task.end_time = time.time()
         _record_task_completion(task)
+        
+        # 批量任务完成后检查并清理结果目录
         check_and_cleanup_results()
-
+        
     except InterruptedError:
+        # 任务被取消，已在上面的循环中处理
         task.add_log('Batch process cancelled by user', 'warning')
         task.update_status('cancelled')
         task.end_time = time.time()
     except Exception as e:
-        tb = traceback.format_exc()
         task.add_log(f'Batch process error: {str(e)}', 'error')
-        logger.error(f"[Task {task.task_id}] Batch process error: {str(e)}\n{tb}")
         task.update_status('failed')
         task.error = str(e)
         task.end_time = time.time()
+    
     finally:
+        # 确保登出
         if client_logged_in and task_client:
             try:
                 task_client.logout()
@@ -2302,7 +2151,6 @@ def process_batch_task(task):
             except Exception as e:
                 task.add_log(f"Error during logout: {str(e)}", 'warning')
         _detach_task_log_handler(task_log_handler)
-
 
 def process_upload_task(task):
     """处理上传文件任务 - 修复版，支持取消检查"""
@@ -2549,14 +2397,6 @@ if __name__ == '__main__':
     logger.info("🏥 DICOM处理Web应用启动")
     logger.info("="*60)
 
-    # 记录运行环境信息，便于崩溃后复现
-    logger.info(f"[RUNTIME] Python {sys.version}")
-    logger.info(f"[RUNTIME] Platform: {platform.platform()}")
-    logger.info(f"[RUNTIME] Machine: {platform.machine()}")
-    logger.info(f"[RUNTIME] PID: {os.getpid()}")
-    logger.info(f"[RUNTIME] CWD: {os.getcwd()}")
-    logger.info(f"[RUNTIME] Project root: {project_root}")
-
     enable_https = os.getenv('ENABLE_HTTPS', 'false').lower() in ('true', '1', 'yes')
     ssl_context = None
     protocol = 'http'
@@ -2570,7 +2410,6 @@ if __name__ == '__main__':
             logger.info("   ⚠️  首次访问时浏览器会提示证书不受信任，点击'高级→继续访问'即可")
         except Exception as ssl_err:
             logger.error(f"❌ HTTPS 启动失败，回退为 HTTP: {ssl_err}")
-            logger.error(traceback.format_exc())
 
     logger.info(f"📡 访问地址: {protocol}://172.17.250.136:5005")
     
@@ -2587,7 +2426,6 @@ if __name__ == '__main__':
             logger.warning("⚠️  PACS服务连接异常，下载功能可能不可用")
     except Exception as e:
         logger.error(f"⚠️  无法连接PACS服务: {str(e)}")
-        logger.error(traceback.format_exc())
         logger.info("   仅支持本地文件上传处理")
     
     logger.info("="*60)
@@ -2603,11 +2441,5 @@ if __name__ == '__main__':
     logger.info("="*60)
 
     # 启动应用
-    logger.info("[SERVER] Starting SocketIO server...")
-    try:
-        socketio.run(app, host='0.0.0.0', port=5005, debug=False,
-                     allow_unsafe_werkzeug=True, ssl_context=ssl_context)
-    except Exception as e:
-        logger.critical(f"[SERVER] SocketIO server crashed: {e}")
-        logger.critical(traceback.format_exc())
-        raise
+    socketio.run(app, host='0.0.0.0', port=5005, debug=False,
+                 allow_unsafe_werkzeug=True, ssl_context=ssl_context)

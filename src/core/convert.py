@@ -60,13 +60,9 @@ def _run_subprocess_with_timeout(cmd, timeout, capture_output=True, text=True):
         stdout = subprocess.PIPE
         stderr = subprocess.PIPE
 
-    cmd_str = ' '.join(str(c) for c in cmd)
-    logger.info(f"[SUBPROCESS] Starting: {cmd_str} (timeout={timeout}s)")
-
     try:
         proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, text=text)
     except Exception as e:
-        logger.error(f"[SUBPROCESS] Failed to start: {cmd_str}: {e}")
         class FakeResult:
             returncode = -1
             stdout = ''
@@ -81,38 +77,31 @@ def _run_subprocess_with_timeout(cmd, timeout, capture_output=True, text=True):
         result.returncode = proc.returncode
         result.stdout = out or ''
         result.stderr = err or ''
-        if result.returncode != 0:
-            logger.warning(
-                f"[SUBPROCESS] Exited with code {result.returncode}: {cmd_str}\n"
-                f"stdout={result.stdout[:500]}\nstderr={result.stderr[:500]}"
-            )
-        else:
-            logger.info(f"[SUBPROCESS] Completed successfully: {cmd_str}")
         return result
     except subprocess.TimeoutExpired:
-        logger.warning(f"[SUBPROCESS] Timeout after {timeout}s, forcing termination (PID={proc.pid}): {cmd_str}")
+        logger.warning(f"dcm2niix timeout after {timeout}s, forcing termination (PID={proc.pid})")
         # 先尝试优雅终止
         try:
             proc.terminate()
             proc.wait(timeout=2)
-        except Exception as term_e:
-            logger.warning(f"[SUBPROCESS] Terminate failed: {term_e}")
+        except Exception:
+            pass
 
         # 如果还在运行，强制 kill
         if proc.poll() is None:
             try:
                 proc.kill()
                 proc.wait(timeout=2)
-            except Exception as kill_e:
-                logger.warning(f"[SUBPROCESS] Kill failed: {kill_e}")
+            except Exception:
+                pass
 
         # Windows: 使用 taskkill 确保进程树被彻底终止
         if sys.platform.startswith('win') and proc.poll() is None:
             try:
                 subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
                                capture_output=True, timeout=5)
-            except Exception as tk_e:
-                logger.warning(f"[SUBPROCESS] taskkill failed: {tk_e}")
+            except Exception:
+                pass
 
         # 最后一次等待
         try:
@@ -132,7 +121,6 @@ def _run_subprocess_with_timeout(cmd, timeout, capture_output=True, text=True):
         result.returncode = -1
         result.stdout = out or ''
         result.stderr = err or f"Timeout after {timeout}s"
-        logger.error(f"[SUBPROCESS] Timeout result for: {cmd_str}\nstderr={result.stderr[:500]}")
         return result
 
 
@@ -860,7 +848,7 @@ def convert_with_dcm2niix(
                         if result.returncode == 0:
                             break
                         if attempt < 2:
-                            logger.warning("[dcm2niix] failed for %s (attempt %d/3), retrying in 0.5s...", file_output_name, attempt + 1)
+                            logger.warning("dcm2niix failed for %s (attempt %d/3), retrying in 0.5s...", file_output_name, attempt + 1)
                             time.sleep(0.5)
 
                     if result and result.returncode == 0:
@@ -881,13 +869,13 @@ def convert_with_dcm2niix(
                                 pass
                         else:
                             # dcm2niix returncode 为 0 但没有生成文件，记录详细诊断信息
-                            logger.warning("[dcm2niix] returned 0 but no output file for %s, stdout=%s, stderr=%s", 
+                            logger.warning("dcm2niix returned 0 but no output file for %s, stdout=%s, stderr=%s", 
                                           file_output_name, 
                                           result.stdout[:300] if result.stdout else 'empty',
                                           result.stderr[:300] if result.stderr else 'empty')
                     else:
                         if result:
-                            logger.error("[dcm2niix] failed for %s after 3 attempts: stdout=%s, stderr=%s", 
+                            logger.warning("dcm2niix failed for %s after 3 attempts: stdout=%s, stderr=%s", 
                                           file_output_name, 
                                           result.stdout[:300] if result.stdout else 'empty',
                                           result.stderr[:300] if result.stderr else 'empty')
@@ -944,13 +932,13 @@ def convert_with_dcm2niix(
             if result.returncode == 0:
                 break
             if attempt < 2:
-                logger.warning("[dcm2niix] failed for %s (attempt %d/3), retrying in 0.5s...", output_name, attempt + 1)
+                logger.warning("dcm2niix failed for %s (attempt %d/3), retrying in 0.5s...", output_name, attempt + 1)
                 time.sleep(0.5)
 
         if result and result.returncode == 0:
             nifti_files = [f for f in os.listdir(series_dir) if f.endswith(('.nii.gz', '.nii'))]
             if nifti_files:
-                logger.info("   ✅ [dcm2niix] conversion succeeded: %s", nifti_files[0])
+                logger.info("   ✅ dcm2niix conversion succeeded: %s", nifti_files[0])
 
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
 
@@ -972,17 +960,17 @@ def convert_with_dcm2niix(
                 }
             else:
                 # dcm2niix returncode 为 0 但没有生成文件，记录详细诊断信息
-                logger.warning("[dcm2niix] returned 0 but no output files for series %s, stdout=%s, stderr=%s", 
+                logger.warning("dcm2niix returned 0 but no output files for series %s, stdout=%s, stderr=%s", 
                               output_name, 
                               result.stdout[:300] if result.stdout else 'empty',
                               result.stderr[:300] if result.stderr else 'empty')
 
         if result and result.stderr:
-            logger.error("[dcm2niix] failed for series %s: stderr=%s", output_name, result.stderr[:300])
+            logger.warning("dcm2niix failed for series %s: stderr=%s", output_name, result.stderr[:300])
         return {'success': False, 'error': result.stderr if result else 'dcm2niix failed'}
 
     except Exception as e:
-        logger.error("[dcm2niix] conversion failed: %s", e, exc_info=True)
+        logger.error("dcm2niix conversion failed: %s", e)
         return {'success': False, 'error': str(e)}
 
 
