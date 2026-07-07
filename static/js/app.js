@@ -150,6 +150,7 @@ class DICOMProcessor {
                 'history_tasks': 'History Tasks',
                 'refresh': 'Refresh',
                 'task_id': 'Task ID',
+                'accession_number': 'AccessionNumber',
                 'task_type': 'Type',
                 'task_summary': 'Summary',
                 'completed_time': 'Completed Time',
@@ -286,7 +287,13 @@ class DICOMProcessor {
                 'filter_keywords_help': 'One keyword per line. These keywords are used to filter out derived series (MPR, MIP, etc.).',
                 'save': 'Save',
                 'reset': 'Reset',
-                'filter_keywords_saved': 'Keywords saved. Will take effect on next task.'
+                'filter_keywords_saved': 'Keywords saved. Will take effect on next task.',
+                'valid_accession_count': 'Valid/Unique',
+                'from_total': 'from',
+                'duplicates_removed': 'duplicates removed',
+                'invalid_entries': 'invalid entries',
+                'truncated_to': 'truncated to',
+                'please_try_again_later': 'Please try again later'
             },
             'zh': {
                 'app_title': 'DICOM处理系统',
@@ -324,6 +331,7 @@ class DICOMProcessor {
                 'history_tasks': '历史任务',
                 'refresh': '刷新',
                 'task_id': '任务ID',
+                'accession_number': '检查号',
                 'task_type': '类型',
                 'task_summary': '摘要',
                 'completed_time': '完成时间',
@@ -460,7 +468,13 @@ class DICOMProcessor {
                 'filter_keywords_help': '每行一个关键词。这些关键词用于过滤衍生序列（MPR、MIP等）。',
                 'save': '保存',
                 'reset': '重置',
-                'filter_keywords_saved': '关键词已保存，将在下一个任务时生效'
+                'filter_keywords_saved': '关键词已保存，将在下一个任务时生效',
+                'valid_accession_count': '有效/去重后',
+                'from_total': '共',
+                'duplicates_removed': '已去重',
+                'invalid_entries': '无效条目',
+                'truncated_to': '已截断至',
+                'please_try_again_later': '请稍后重试'
             }
         };
 
@@ -1241,6 +1255,36 @@ class DICOMProcessor {
         }
     }
 
+    // 解析批量 AccessionNumber 输入：去重、去空、保留顺序、限制数量
+    _parseBatchAccessionNumbers(rawText, maxCount = 200) {
+        const seen = new Set();
+        const lines = (rawText || '').split('\n')
+            .map(line => line.trim())
+            .filter(line => line.length > 0);
+
+        const valid = [];
+        const invalid = [];
+        const duplicates = [];
+
+        for (const line of lines) {
+            // 简单校验：去除前后空白后非空即可；允许字母、数字、下划线、连字符
+            const cleaned = line.replace(/\s+/g, '');
+            if (!cleaned) {
+                invalid.push(line);
+                continue;
+            }
+            if (seen.has(cleaned)) {
+                duplicates.push(cleaned);
+                continue;
+            }
+            seen.add(cleaned);
+            valid.push(cleaned);
+        }
+
+        const truncated = valid.length > maxCount ? valid.slice(0, maxCount) : null;
+        return { valid: truncated || valid, rawCount: lines.length, duplicates, invalid, truncated: !!truncated };
+    }
+
     // 开始批量处理 - 内部实现
     async _startBatchProcess() {
         // 防止重复提交
@@ -1249,21 +1293,30 @@ class DICOMProcessor {
             return;
         }
 
-        const batchText = document.getElementById('batchAccessionNumbers').value.trim();
-        
-        if (!batchText) {
-            this.showError(this.translations[this.currentLang]['enter_accession_number_list_error']);
-            return;
-        }
+        const batchText = document.getElementById('batchAccessionNumbers').value;
+        const { valid: accessionNumbers, rawCount, duplicates, invalid, truncated } =
+            this._parseBatchAccessionNumbers(batchText, 200);
 
-        const accessionNumbers = batchText.split('\n')
-            .map(line => line.trim())
-            .filter(line => line.length > 0);
-
-        if (accessionNumbers.length === 0) {
+        if (!accessionNumbers.length) {
             this.showError(this.translations[this.currentLang]['no_valid_accession_number']);
             return;
         }
+
+        const t = this.translations[this.currentLang];
+        let hintMsg = `${t['valid_accession_count'] || 'Valid/Unique'}: ${accessionNumbers.length}`;
+        if (rawCount !== accessionNumbers.length) {
+            hintMsg += ` (${t['from_total'] || 'from'} ${rawCount})`;
+        }
+        if (duplicates.length) {
+            hintMsg += `, ${t['duplicates_removed'] || 'duplicates removed'}: ${duplicates.length}`;
+        }
+        if (invalid.length) {
+            hintMsg += `, ${t['invalid_entries'] || 'invalid entries'}: ${invalid.length}`;
+        }
+        if (truncated) {
+            hintMsg += `; ${t['truncated_to'] || 'truncated to'} 200`;
+        }
+        this.showSuccess(hintMsg);
 
         this.isProcessing = true;
         const options = this.getProcessingOptions();
@@ -1282,42 +1335,69 @@ class DICOMProcessor {
             options.exclude_derived = true;
         }
 
+        const payload = {
+            accession_numbers: accessionNumbers,
+            options: options
+        };
+
+        // 提交任务，带重试机制（对照 download_batch.py）
+        const maxRetries = 3;
+        const baseDelay = 2000;
+        const queueFullDelay = 10000;
+
         try {
-            const response = await fetch('/api/process/batch', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    accession_numbers: accessionNumbers,
-                    options: options
-                })
-            });
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+                try {
+                    const response = await fetch('/api/process/batch', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    });
 
-            const data = await response.json();
+                    const data = await response.json();
 
-            if (response.ok) {
-                const isQueued = data.status === 'queued';
-                this.currentTask = {
-                    id: data.task_id,
-                    type: 'batch',
-                    status: isQueued ? 'pending' : 'running'
-                };
-                this.showProgressCard();
-                this.subscribeToTask(data.task_id);
-                if (isQueued) {
-                    this.showSuccess(`${this.translations[this.currentLang]['batch_process_queued'] || 'Batch task queued'} (${accessionNumbers.length})`);
-                } else {
-                    this.showSuccess(`${this.translations[this.currentLang]['batch_process_started']} (${accessionNumbers.length})`);
+                    if (response.ok) {
+                        const isQueued = data.status === 'queued';
+                        this.currentTask = {
+                            id: data.task_id,
+                            type: 'batch',
+                            status: isQueued ? 'pending' : 'running'
+                        };
+                        this.showProgressCard();
+                        this.subscribeToTask(data.task_id);
+                        if (isQueued) {
+                            this.showSuccess(`${t['batch_process_queued'] || 'Batch task queued'} (${accessionNumbers.length})`);
+                        } else {
+                            this.showSuccess(`${t['batch_process_started']} (${accessionNumbers.length})`);
+                        }
+                        return;
+                    } else if (response.status === 503) {
+                        // 队列满，参考 download_batch.py 等待后重试
+                        const msg = data.error || 'Task queue is full';
+                        if (attempt < maxRetries - 1) {
+                            console.warn(`[Batch] Queue full, retrying in ${queueFullDelay}ms... (${attempt + 1}/${maxRetries})`);
+                            await new Promise(resolve => setTimeout(resolve, queueFullDelay));
+                            continue;
+                        }
+                        this.showError(`${msg}. ${t['please_try_again_later'] || 'Please try again later.'}`);
+                        return;
+                    } else {
+                        this.showError(data.error || t['start_batch_process_failed']);
+                        return;
+                    }
+                } catch (error) {
+                    if (attempt < maxRetries - 1) {
+                        console.warn(`[Batch] Network error, retrying... (${attempt + 1}/${maxRetries}):`, error.message);
+                        await new Promise(resolve => setTimeout(resolve, baseDelay));
+                        continue;
+                    }
+                    throw error;
                 }
-            } else if (response.status === 503) {
-                // 队列满
-                this.showError((data.error || 'Task queue is full') + '. Please try again later.');
-            } else {
-                this.showError(data.error || this.translations[this.currentLang]['start_batch_process_failed']);
             }
         } catch (error) {
-            this.showError(this.translations[this.currentLang]['network_error'] + error.message);
+            this.showError(t['network_error'] + error.message);
         } finally {
             setTimeout(() => {
                 this.isProcessing = false;
@@ -2310,13 +2390,23 @@ class DICOMProcessor {
         tbody.innerHTML = tasks.map(task => {
             const statusColor = statusColors[task.status] || 'secondary';
             const duration = task.elapsed_seconds ? this.formatElapsedTime(task.elapsed_seconds) : '--';
+            // 显示 AccessionNumber（优先）或回退到 task_id
+            const accLabel = task.accession_number || task.task_id.substring(0, 8);
+            // 失败状态显示简短原因，其他显示状态文本
+            let statusHtml = '';
+            if (task.status === 'failed' && task.error_summary) {
+                statusHtml = `<span class="badge bg-${statusColor}" title="${task.status}">${task.error_summary}</span>`;
+            } else {
+                const statusText = t[`status_${task.status}`] || task.status;
+                statusHtml = `<span class="badge bg-${statusColor}">${statusText}</span>`;
+            }
 
             return `
                 <tr>
-                    <td><small>${task.task_id.substring(0, 8)}...</small></td>
-                    <td>${task.type}</td>
-                    <td><span class="badge bg-${statusColor}">${task.status}</span></td>
-                    <td>${duration}</td>
+                    <td><small class="text-truncate d-inline-block" style="max-width: 140px;" title="${task.accession_number || ''}">${accLabel}</small></td>
+                    <td><small>${task.type}</small></td>
+                    <td>${statusHtml}</td>
+                    <td><small>${duration}</small></td>
                 </tr>
             `;
         }).join('');

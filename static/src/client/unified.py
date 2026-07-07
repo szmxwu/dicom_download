@@ -1549,9 +1549,6 @@ class DICOMDownloadClient:
                         except Exception:
                             metadata['Rows'] = metadata.get('Rows', '')
                             metadata['Columns'] = metadata.get('Columns', '')
-                        # P0: 修复 Carestream BPE 乱码
-                        from src.core.metadata import repair_bodypart_examined
-                        repair_bodypart_examined(metadata)
                         records.append(metadata)
                     except Exception:
                         continue
@@ -1587,9 +1584,6 @@ class DICOMDownloadClient:
                 except Exception:
                     metadata['Rows'] = metadata.get('Rows', '')
                     metadata['Columns'] = metadata.get('Columns', '')
-                # P0: 修复 Carestream BPE 乱码
-                from src.core.metadata import repair_bodypart_examined
-                repair_bodypart_examined(metadata)
                 records.append(metadata)
                 logger.info(f"[COLLECT] Appended metadata record for {series_folder} with {len(metadata)} fields")
         except Exception as e:
@@ -1623,9 +1617,6 @@ class DICOMDownloadClient:
                     metadata[keyword] = ""
             except Exception:
                 metadata[keyword] = ""
-        # P0: 修复 Carestream BPE 乱码
-        from src.core.metadata import repair_bodypart_examined
-        repair_bodypart_examined(metadata)
         return metadata
 
     def _get_series_sample_dicom(self, series_dir):

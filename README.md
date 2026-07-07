@@ -37,6 +37,25 @@ CALLED_AET=pacsServer
 CALLING_PORT=1023
 ```
 
+### Disk Cleanup Strategy
+The web application automatically cleans up the `results/` directory when it grows too large. Cleanup rules are also configured in `.env`:
+
+```ini
+# When results/ exceeds this size (GB), automatic cleanup is triggered
+CLEANUP_THRESHOLD_GB=200
+# Cleanup target: reduce results/ below this size (GB)
+CLEANUP_TARGET_GB=160
+# Minimum age (minutes) of a result file/directory before it can be deleted.
+# Recently completed tasks (default 30 minutes) are protected so users can
+# download batch ZIPs before they are removed.
+CLEANUP_MIN_AGE_MINUTES=30
+```
+
+Key behavior:
+- `running` and `pending` tasks are never cleaned.
+- Items newer than `CLEANUP_MIN_AGE_MINUTES` are skipped.
+- Oldest items (by modification time `mtime`) are deleted first until usage falls below `CLEANUP_TARGET_GB`.
+
 ### Metadata Templates
 You can customize the DICOM tags extracted for each modality by editing the JSON files in the `dicom_tags/` directory:
 - `mr.json`: MRI

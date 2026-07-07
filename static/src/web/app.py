@@ -43,7 +43,6 @@ import uuid
 import threading
 import shutil
 import logging
-import traceback
 from logging.handlers import RotatingFileHandler
 from werkzeug.utils import secure_filename
 
@@ -386,22 +385,13 @@ try:
 except Exception:
     CLEANUP_TARGET_GB = 40.0
 
-try:
-    CLEANUP_MIN_AGE_MINUTES = float(os.getenv('CLEANUP_MIN_AGE_MINUTES', '30'))
-    if CLEANUP_MIN_AGE_MINUTES < 0:
-        CLEANUP_MIN_AGE_MINUTES = 0.0
-except Exception:
-    CLEANUP_MIN_AGE_MINUTES = 30.0
-
 # 将读取到的默认值持久化到 .env，便于用户修改与持久化配置
 try:
     # 写入整数值时保留整型格式，浮点数保留原样
     thr_val = str(int(CLEANUP_THRESHOLD_GB) if float(CLEANUP_THRESHOLD_GB).is_integer() else CLEANUP_THRESHOLD_GB)
     tgt_val = str(int(CLEANUP_TARGET_GB) if float(CLEANUP_TARGET_GB).is_integer() else CLEANUP_TARGET_GB)
-    age_val = str(int(CLEANUP_MIN_AGE_MINUTES) if float(CLEANUP_MIN_AGE_MINUTES).is_integer() else CLEANUP_MIN_AGE_MINUTES)
     set_key(ENV_FILE_PATH, 'CLEANUP_THRESHOLD_GB', thr_val)
     set_key(ENV_FILE_PATH, 'CLEANUP_TARGET_GB', tgt_val)
-    set_key(ENV_FILE_PATH, 'CLEANUP_MIN_AGE_MINUTES', age_val)
 except Exception as e:
     logger.warning(f"无法将清理阈值写入 {ENV_FILE_PATH}: {e}")
 
@@ -488,15 +478,7 @@ def _safe_rmtree(dirpath):
 
 
 def cleanup_old_results():
-    """清理旧的结果文件，保持磁盘空间在合理范围内。
-
-    清理策略：
-    1. 仅在 results 目录总大小超过 CLEANUP_THRESHOLD_GB 时触发。
-    2. 保留 running/pending 任务对应的结果。
-    3. 保留最近 CLEANUP_MIN_AGE_MINUTES 分钟内产生/修改的结果，
-       避免刚完成的批量任务 ZIP 被立即删除。
-    4. 按 mtime（修改时间）升序删除最旧的项目，直到总大小低于 CLEANUP_TARGET_GB。
-    """
+    """清理旧的结果文件，保持磁盘空间在合理范围内"""
     results_dir = app.config['RESULT_FOLDER']
     current_size = get_directory_size(results_dir)
 
@@ -513,8 +495,8 @@ def cleanup_old_results():
         for item in os.listdir(results_dir):
             item_path = os.path.join(results_dir, item)
             if os.path.exists(item_path):
-                # 获取修改时间（mtime 比 atime 更能反映结果产生时间）
-                mtime = os.path.getmtime(item_path)
+                # 获取最后访问时间
+                atime = os.path.getatime(item_path)
                 size = 0
 
                 if os.path.isfile(item_path):
@@ -525,7 +507,7 @@ def cleanup_old_results():
                 items_to_check.append({
                     'path': item_path,
                     'name': item,
-                    'mtime': mtime,
+                    'atime': atime,
                     'size': size,
                     'is_dir': os.path.isdir(item_path)
                 })
@@ -538,12 +520,8 @@ def cleanup_old_results():
     active_task_ids = [task.task_id for task in processing_tasks.values()
                       if task.status in ['running', 'pending']]
 
-    now = time.time()
-    min_age_seconds = CLEANUP_MIN_AGE_MINUTES * 60
-
-    # 过滤掉正在进行的任务以及太新的结果
+    # 过滤掉正在进行的任务
     items_to_clean = []
-    skipped_too_new = 0
     for item in items_to_check:
         # 检查是否为活跃任务目录
         is_active = False
@@ -552,25 +530,15 @@ def cleanup_old_results():
                 is_active = True
                 break
 
-        if is_active:
-            continue
-
-        age_seconds = now - item['mtime']
-        if age_seconds < min_age_seconds:
-            skipped_too_new += 1
-            continue
-
-        items_to_clean.append(item)
-
-    if skipped_too_new:
-        logger.info(f"跳过 {skipped_too_new} 个太新的结果（保留 {CLEANUP_MIN_AGE_MINUTES} 分钟内）")
+        if not is_active:
+            items_to_clean.append(item)
 
     if not items_to_clean:
-        logger.info("没有可清理的旧结果，跳过清理")
+        logger.info("所有文件都属于活跃任务，跳过清理")
         return
 
-    # 按修改时间排序，先删除最旧的
-    items_to_clean.sort(key=lambda x: x['mtime'])
+    # 按访问时间排序，先删除最旧的
+    items_to_clean.sort(key=lambda x: x['atime'])
 
     cleaned_size = 0
     target_to_clean = current_size - CLEANUP_TARGET_GB
@@ -2043,17 +2011,8 @@ def process_batch_task(task):
                     except Exception as rename_e:
                         task.add_log(f'{accno}: MR rename failed: {rename_e}', 'warning')
 
-                # process_complete_workflow 在下载失败等场景下可能返回 None，
-                # 需要归一化为失败记录，避免后续统计时触发 'NoneType' object has no attribute 'get'
-                if result is None:
-                    result = {
-                        'accession_number': accno,
-                        'success': False,
-                        'error': 'Workflow returned no result (download may have failed)'
-                    }
-
                 # --- 保存到磁盘缓存 ---
-                if result.get('success') and result.get('organized_dir'):
+                if result and result.get('success') and result.get('organized_dir'):
                     try:
                         zip_path = None
                         if result.get('organized_dir'):
@@ -2075,10 +2034,7 @@ def process_batch_task(task):
                         logger.warning(f"Batch cache save failed for {accno}: {cache_e}")
 
                 results.append(result)
-                if result.get('success'):
-                    task.add_log(f'{accno} Process completed')
-                else:
-                    task.add_log(f"{accno} Process failed: {result.get('error', 'Unknown error')}", 'error')
+                task.add_log(f'{accno} Process completed')
                 
             except Exception as e:
                 task.add_log(f'{accno} Process failed: {str(e)}', 'error')
@@ -2095,9 +2051,9 @@ def process_batch_task(task):
             app.config['RESULT_FOLDER']
         )
         
-        # 计算详细的批处理统计信息（过滤掉可能的 None 项，增强健壮性）
-        total_processed = len([r for r in results if r and r.get('success')])
-        total_failed = len([r for r in results if r is None or r.get('error')])
+        # 计算详细的批处理统计信息
+        total_processed = len([r for r in results if r.get('success')])
+        total_failed = len([r for r in results if r.get('error')])
         
         # 收集质量统计数据
         quality_stats = {
@@ -2110,46 +2066,45 @@ def process_batch_task(task):
         total_series = 0
         
         for r in results:
-            if not r or not r.get('success'):
-                continue
-            series_info = r.get('series_info', {})
-            total_series += len(series_info)
-            
-            # 尝试从Excel元数据文件中读取质量统计
-            excel_file = r.get('excel_file')
-            if excel_file and os.path.exists(excel_file):
-                try:
-                    import pandas as pd
-                    df = pd.read_excel(excel_file)
-                    if 'Low_quality' in df.columns:
-                        for _, row in df.iterrows():
-                            low_quality = row.get('Low_quality', 0)
-                            fixed = row.get('Fixed', '')
-                            if fixed == 'Yes' or 'Fixed' in str(row.get('Low_quality_reason', '')):
-                                quality_stats['fixed'] += 1
-                            elif low_quality == 0 or low_quality == False:
-                                quality_stats['normal'] += 1
-                            elif low_quality == 1 or low_quality == True:
-                                quality_stats['low_quality'] += 1
-                            else:
-                                quality_stats['unknown'] += 1
-                            total_images += 1
-                    else:
-                        # 如果没有质量列，只统计文件数量
-                        total_images += len(df)
-                        quality_stats['unknown'] += len(df)
-                except Exception as e:
-                    # 如果读取Excel失败，使用series_info统计
+            if r.get('success'):
+                series_info = r.get('series_info', {})
+                total_series += len(series_info)
+                
+                # 尝试从Excel元数据文件中读取质量统计
+                excel_file = r.get('excel_file')
+                if excel_file and os.path.exists(excel_file):
+                    try:
+                        import pandas as pd
+                        df = pd.read_excel(excel_file)
+                        if 'Low_quality' in df.columns:
+                            for _, row in df.iterrows():
+                                low_quality = row.get('Low_quality', 0)
+                                fixed = row.get('Fixed', '')
+                                if fixed == 'Yes' or 'Fixed' in str(row.get('Low_quality_reason', '')):
+                                    quality_stats['fixed'] += 1
+                                elif low_quality == 0 or low_quality == False:
+                                    quality_stats['normal'] += 1
+                                elif low_quality == 1 or low_quality == True:
+                                    quality_stats['low_quality'] += 1
+                                else:
+                                    quality_stats['unknown'] += 1
+                                total_images += 1
+                        else:
+                            # 如果没有质量列，只统计文件数量
+                            total_images += len(df)
+                            quality_stats['unknown'] += len(df)
+                    except Exception as e:
+                        # 如果读取Excel失败，使用series_info统计
+                        for series_name, series_data in series_info.items():
+                            file_count = series_data.get('file_count', 0)
+                            total_images += file_count
+                            quality_stats['unknown'] += file_count
+                else:
+                    # 如果没有Excel文件，使用series_info统计
                     for series_name, series_data in series_info.items():
                         file_count = series_data.get('file_count', 0)
                         total_images += file_count
                         quality_stats['unknown'] += file_count
-            else:
-                # 如果没有Excel文件，使用series_info统计
-                for series_name, series_data in series_info.items():
-                    file_count = series_data.get('file_count', 0)
-                    total_images += file_count
-                    quality_stats['unknown'] += file_count
         
         # 计算处理时间
         duration = (task.end_time or time.time()) - task.start_time
@@ -2183,7 +2138,6 @@ def process_batch_task(task):
         task.end_time = time.time()
     except Exception as e:
         task.add_log(f'Batch process error: {str(e)}', 'error')
-        logger.error(f"[Task {task.task_id}] Batch process error: {str(e)}", exc_info=True)
         task.update_status('failed')
         task.error = str(e)
         task.end_time = time.time()

@@ -35,6 +35,24 @@ CALLED_AET=pacsFIR
 CALLING_PORT=1103
 ```
 
+### 磁盘清理策略
+Web 应用在 `results/` 目录过大时会自动清理，清理规则同样通过 `.env` 配置：
+
+```ini
+# 当 results/ 目录超过该大小（GB）时触发自动清理
+CLEANUP_THRESHOLD_GB=200
+# 清理目标：将 results/ 降到该大小以下（GB）
+CLEANUP_TARGET_GB=160
+# 最短保留时间（分钟），新完成的任务结果默认 30 分钟内不会被删除，
+# 避免用户还没来得及下载批量 ZIP 就被清理掉
+CLEANUP_MIN_AGE_MINUTES=30
+```
+
+清理规则：
+- `running` / `pending` 状态的任务结果永远不会被清理。
+- 生成时间小于 `CLEANUP_MIN_AGE_MINUTES` 的结果会被跳过。
+- 其余结果按修改时间 `mtime` 从旧到新删除，直到占用低于 `CLEANUP_TARGET_GB`。
+
 ### 元数据模板配置
 您可以通过编辑 `dicom_tags/` 目录下的 JSON 文件来自定义不同模态提取的 DICOM 标签：
 - `mr.json`: 磁共振 (MRI)
