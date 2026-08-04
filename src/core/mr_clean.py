@@ -179,6 +179,105 @@ def detect_fat_suppression(row, cfg: dict):
     return False
 
 # ==============================================================================
+# Part 1b: 行级过滤 (Row-level Filtering)
+# ==============================================================================
+
+
+def _is_excluded_row(row, cfg: dict) -> bool:
+    """
+    检查一行是否应被排除（空元数据、ExamCard、派生图等）。
+
+    被排除的行将标记为 EXCLUDED 而非 UNKNOWN，避免污染分类统计。
+
+    Args:
+        row: DataFrame 的一行 (pd.Series)
+        cfg: 完整配置字典
+
+    Returns:
+        bool: 如果该行应被排除则返回 True
+    """
+    exc_cfg = cfg.get('excluded_patterns', {})
+
+    # 空 SeriesDescription
+    if exc_cfg.get('empty_series_description', True):
+        series_desc = str(row.get('SeriesDescription', '')).strip()
+        if not series_desc or series_desc.lower() == 'nan':
+            return True
+
+    # ExamCard 等非诊断序列
+    exam_keywords = [str(x).lower() for x in exc_cfg.get('exam_card_keywords', ['examcard', 'exam_card'])]
+    protocol_lower = str(row.get('protocolName_lower', '')).lower()
+    series_desc_lower = str(row.get('SeriesDescription', '')).lower()
+    if any(k in protocol_lower or k in series_desc_lower for k in exam_keywords):
+        return True
+
+    # 派生图 / 屏幕保存等
+    screen_save_keywords = [str(x).lower() for x in exc_cfg.get('derived_screen_save_keywords',
+                                                                  ['screen save', 'processed images',
+                                                                   'filming', 'inline_vf_results'])]
+    if any(k in protocol_lower or k in series_desc_lower for k in screen_save_keywords):
+        return True
+
+    # 未知协议名（如占位符 "____"）
+    unknown_protocols = [str(x) for x in exc_cfg.get('unknown_protocol_names', ['____'])]
+    if any(k in str(row.get('ProtocolName', '')) for k in unknown_protocols):
+        return True
+
+    # 定位像（localizer/scout/survey）：扫床前低分辨率定位扫描，无诊断价值。
+    localizer_keywords = [str(x).lower() for x in exc_cfg.get('localizer_keywords', [])]
+    if localizer_keywords and any(k in series_desc_lower or k in protocol_lower for k in localizer_keywords):
+        return True
+
+    # 隐藏定位像数值规则（如 haste_pelvis_F_200）：三方位定位扫描堆叠，命名与
+    # ImageType 均无标记；特征为片数极少且层间距远大于层厚。白名单保护定量图。
+    hidden = exc_cfg.get('hidden_localizer_rules') or {}
+    if hidden:
+        def _num(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        total = _num(row.get('TotalFilesInSeries'))
+        thickness = _num(row.get('SliceThickness'))
+        spacing = _num(row.get('SpacingBetweenSlices'))
+        whitelist = [str(x).lower() for x in hidden.get('name_whitelist', [])]
+        name_hit = any(k in series_desc_lower or k in protocol_lower for k in whitelist)
+        if (total is not None and thickness and spacing and not name_hit
+                and total <= hidden.get('total_files_max', 15)
+                and spacing / thickness >= hidden.get('spacing_ratio_min', 2.0)):
+            return True
+
+    return False
+
+
+def _get_sequence_family(sequence_class: str, cfg: dict) -> str:
+    """
+    根据 sequenceClass 和配置中的映射表返回 sequenceFamily。
+
+    未直接命中时，按 sequence_family_suffix_fallback 配置剥离后缀
+    （如 '_FAT'、'_WATER'）后重试，兼容带亚型后缀的分类名。
+
+    Args:
+        sequence_class: 序列分类名称（如 'T2_TSE', 'DWI' 等）
+        cfg: 完整配置字典
+
+    Returns:
+        str: sequenceFamily 名称，未映射则返回 'UNKNOWN'
+    """
+    family_map = cfg.get('sequence_family_map', {})
+    if sequence_class in family_map:
+        return family_map[sequence_class]
+    candidate = str(sequence_class)
+    for suffix in cfg.get('sequence_family_suffix_fallback', []):
+        suffix = str(suffix)
+        if candidate.endswith(suffix):
+            candidate = candidate[:-len(suffix)]
+            if candidate in family_map:
+                return family_map[candidate]
+    return 'UNKNOWN'
+
+
+# ==============================================================================
 # Part 2: 阶段一 - 提取原子特征 (Extract Atomic Features)
 # ==============================================================================
 
@@ -206,6 +305,11 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
     # ImageType是权威的DICOM标签，应优先使用
     df['imageType_lower'] = df.get('ImageType', pd.Series(
         index=df.index, dtype=str)).astype(str).str.lower().fillna('')
+    # NaN-safe: SeriesDescription 可能包含 NaN(float)，统一转为空字符串
+    if 'SeriesDescription' in df.columns:
+        df['SeriesDescription'] = df['SeriesDescription'].fillna('').astype(str)
+    else:
+        df['SeriesDescription'] = ''
 
     # -- 特征提取 --
     atomic_cfg = cfg.get('atomic_features', {})
@@ -258,6 +362,9 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
             return 'ORIGINAL'
         return refined_default
     df['refinedImageType'] = df.apply(get_refined_type, axis=1)
+    # 派生图/二次成像便捷标记列（与 MR_YOLO 侧输出对齐）
+    df['isDerivedImage'] = df['refinedImageType'].eq('DERIVED')
+    df['isSecondaryImage'] = df['imageType_lower'].str.contains('secondary', na=False)
 
     if progress_callback:
         progress_callback("Done. Added columns: standardOrientation, standardDimension, isFatSuppressed, etc.", "extract_atomic_features_done")
@@ -348,9 +455,13 @@ def classify_sequence(row, cfg: dict):
     scan_seq = str(row.get('ScanningSequence', '')).lower()
     seq_variant = str(row.get('SequenceVariant', '')).lower()
     img_type = row.get('refinedImageType', '')
+    raw_image_type = str(row.get('ImageType', '')).lower()
     field_strength = row.get('standardFieldStrength', 'default')
     standardDimension= row.get('standardDimension', '')
-    combined_name = name + ' ' + SeriesDescription  # 提前定义，供 RuleB/C 共用
+    # NaN-safe: 确保拼接时不因 NaN(float) 导致 TypeError
+    if name != name:  # NaN check
+        name = ''
+    combined_name = str(name) + ' ' + SeriesDescription  # 提前定义，供 RuleB/C 共用
 
     tr = safe_to_numeric(row.get('RepetitionTime'))
     te = safe_to_numeric(row.get('EchoTime'))
@@ -408,18 +519,66 @@ def classify_sequence(row, cfg: dict):
         base_class = 'MRS'
     elif any(k in SeriesDescription for k in [str(x).lower() for x in ruleA.get('BREATH MOVEMENT', {}).get('series_description_keywords', ['resp'])]):
         base_class = 'BREATH MOVEMENT'
-    elif any(k in SeriesDescription for k in [str(x).lower() for x in ruleA.get('MIP', {}).get('series_description_keywords', ['mip'])]):
+    elif any(
+        k in combined_name or k in raw_image_type
+        for k in [str(x).lower() for x in ruleA.get('MIP', {}).get(
+            'keywords', ruleA.get('MIP', {}).get('series_description_keywords', ['mip'])
+        )]
+    ):
         base_class = 'MIP'
+    elif _check_keywords('MRCP', ['mrcp', 'cholangio', 'biliary']):
+        base_class = 'MRCP'
+
+    # Vendor MRCP source volumes are often named only as heavy-T2 SPACE/SPC
+    # (e.g. t2_spc_rst_cor_p4_320_iso) without MRCP keywords in the name.
+    # Detect by physics: 3D SE with very high TE/ETL and thin slices.
+    if base_class == 'UNKNOWN':
+        mrcp_cfg = classification_cfg.get('physical_mrcp', {})
+        body_part = str(row.get('BodyPartExamined', '')).strip().upper()
+        allowed_body_parts = {str(x).upper() for x in mrcp_cfg.get('body_parts', [])}
+        source_only = bool(mrcp_cfg.get('source_only', True))
+        is_source = img_type != 'DERIVED' if source_only else True
+        is_spin_echo = any(
+            str(token).lower() in scan_seq
+            for token in mrcp_cfg.get('scanning_sequence_tokens', ['se'])
+        )
+        dimension_cfg = mrcp_cfg.get('dimensions', {}).get(
+            str(standardDimension).upper(), {}
+        )
+        slice_thickness = safe_to_numeric(row.get('SliceThickness'))
+        min_te = safe_to_numeric(dimension_cfg.get('min_echo_time_ms'))
+        min_etl = safe_to_numeric(dimension_cfg.get('min_echo_train_length'))
+        max_slice = safe_to_numeric(dimension_cfg.get('max_slice_thickness_mm'))
+        matches = (
+            bool(dimension_cfg)
+            and (not allowed_body_parts or body_part in allowed_body_parts)
+            and is_source
+            and is_spin_echo
+            and pd.notnull(te) and (pd.isnull(min_te) or te >= min_te)
+            and (pd.isnull(min_etl) or (pd.notnull(etl) and etl >= min_etl))
+            and (pd.isnull(max_slice) or (
+                pd.notnull(slice_thickness) and slice_thickness <= max_slice
+            ))
+        )
+        if matches:
+            base_class = str(mrcp_cfg.get('class', 'MRCP'))
+
     # --- 规则B: 基于物理参数的核心分类 (仅当规则A未命中时执行) ---
     if base_class == 'UNKNOWN':
+        # 物理规则0: DWI关键词检查（优先于b_value检查，因为b_value可能缺失）
+        dwi_name_keywords = [str(x).lower() for x in classification_cfg.get('dwi_name_keywords',
+                              ['dwi', 'dwibs', 'diff', 'trace', 'resolve_diff', 'dwiblack'])]
+        if any(k in combined_name for k in dwi_name_keywords):
+            base_class = 'DWI'
+
         # 物理规则1: 功能成像 (DWI, fMRI)
         dwi_min = safe_to_numeric(classification_cfg.get('dwi_b_value_min', 50))
         dti_keyword = str(classification_cfg.get('dti_name_keyword', 'dti')).lower()
         dti_class = str(classification_cfg.get('dti_class', 'DTI'))
         dwi_class = str(classification_cfg.get('dwi_class', 'DWI'))
-        if b_val > dwi_min:
+        if base_class == 'UNKNOWN' and b_val > dwi_min:
             base_class = dti_class if (dti_keyword in name or dti_keyword in SeriesDescription) else dwi_class
-        else:
+        elif base_class == 'UNKNOWN':
             fmri_cfg = classification_cfg.get('fmri', {})
             fmri_seq_token = str(fmri_cfg.get('scan_seq_token', 'ep')).lower()
             fmri_name_keywords = [str(x).lower() for x in fmri_cfg.get('protocol_keywords', ['fmri', 'bold'])]
@@ -877,19 +1036,43 @@ def process_mri_dataframe(df, cfg: Optional[Dict] = None, config_path: Optional[
     cfg = _get_cfg(cfg, config_path)
     df_copy = df.copy()
 
-    # Stage 1: atomic features
+    # Stage 0: 排除空元数据、ExamCard 等非诊断行
+    if progress_callback:
+        progress_callback("Stage 0: filtering excluded rows (empty metadata, ExamCard, etc.)...", "filter_excluded_rows")
+    else:
+        print("Stage 0: filtering excluded rows (empty metadata, ExamCard, etc.)...")
+    # 先生成 protocolName_lower 供 _is_excluded_row 使用
+    df_copy['protocolName_lower'] = df_copy.get('ProtocolName', pd.Series(
+        index=df_copy.index, dtype=str)).astype(str).str.lower().fillna('')
+    if 'SeriesDescription' in df_copy.columns:
+        df_copy['SeriesDescription'] = df_copy['SeriesDescription'].fillna('').astype(str)
+    else:
+        df_copy['SeriesDescription'] = ''
+    excluded_mask = df_copy.apply(lambda r: _is_excluded_row(r, cfg), axis=1)
+    df_copy.loc[excluded_mask, 'sequenceClass'] = 'EXCLUDED'
+
+    # Stage 1: atomic features（仅处理未被排除的行）
     df_featured = extract_atomic_features(df_copy, cfg, progress_callback=progress_callback)
 
     # Stage 2: hardware features
     df_hardware_featured = extract_hardware_features(df_featured, cfg, progress_callback=progress_callback)
 
-    # Stage 3: classification
+    # Stage 3: classification（跳过已标记为 EXCLUDED 的行）
     if progress_callback:
         progress_callback("Stage 3: classifying sequences...", "classify_sequence")
     else:
         print("Stage 3: classifying sequences...")
-    df_classified = df_hardware_featured.apply(lambda r: classify_sequence(r, cfg), axis=1)
-    df_hardware_featured['sequenceClass'] = df_classified
+    not_excluded = df_hardware_featured['sequenceClass'] != 'EXCLUDED'
+    df_classified = df_hardware_featured[not_excluded].apply(lambda r: classify_sequence(r, cfg), axis=1)
+    df_hardware_featured.loc[not_excluded, 'sequenceClass'] = df_classified
+
+    # Stage 3c: 计算 sequenceFamily
+    if progress_callback:
+        progress_callback("Stage 3c: computing sequenceFamily...", "compute_sequence_family")
+    else:
+        print("Stage 3c: computing sequenceFamily...")
+    df_hardware_featured['sequenceFamily'] = df_hardware_featured['sequenceClass'].apply(
+        lambda sc: _get_sequence_family(sc, cfg))
 
     # Stage 4: dynamic contrast analysis
     df_dynamic = analyze_dynamic_series(df_hardware_featured, cfg, progress_callback=progress_callback)

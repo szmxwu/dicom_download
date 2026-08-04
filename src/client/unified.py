@@ -10,6 +10,7 @@ DICOM 客户端统一模块
 import os
 import json
 import time
+import shutil
 import threading
 import zipfile
 from queue import Queue, Empty
@@ -286,6 +287,12 @@ class DICOMDownloadClient:
         except Exception:
             self._download_high_watermark_gb = 45.0
             self._download_low_watermark_gb = 40.0
+        # 磁盘剩余空间硬下限（GB）：C-STORE 写入时剩余低于该值直接拒收，
+        # 避免磁盘写满后产生大量 ENOSPC 错误并拖垮 PACS 传输
+        try:
+            self._download_critical_free_gb = float(os.getenv('DOWNLOAD_CRITICAL_FREE_GB', '1'))
+        except Exception:
+            self._download_critical_free_gb = 1.0
 
         # P0: 下载统计信息
         self.download_stats = DownloadStats()
@@ -376,26 +383,17 @@ class DICOMDownloadClient:
         print(f"✅ Login successful: {username} (no actual authentication required)")
         return True
 
-    def _get_dir_size_gb(self, directory):
-        """计算目录大小（GB），用于磁盘水位判断。"""
-        total_size = 0
-        try:
-            for dirpath, dirnames, filenames in os.walk(directory):
-                for filename in filenames:
-                    filepath = os.path.join(dirpath, filename)
-                    if os.path.exists(filepath):
-                        try:
-                            total_size += os.path.getsize(filepath)
-                        except Exception:
-                            continue
-        except Exception:
-            return 0.0
-        return total_size / (1024 ** 3)
-
-    def _wait_for_disk_low(self, directory, sleep_sec=5):
-        """当目录大小超过高水位时阻塞，直到降到低水位以下。
+    def _wait_for_disk_low(self, directory, sleep_sec=15):
+        """当磁盘剩余空间低于低水位时阻塞，直到恢复到高水位以上。
 
         该方法在下载循环中被调用以实现简单的回压，避免无限制拉取导致磁盘耗尽。
+
+        水位线含义为"要求保留的最小磁盘剩余空间（GB）"：
+        - 剩余 < DOWNLOAD_LOW_WATERMARK_GB 时暂停下载；
+        - 剩余 >= DOWNLOAD_HIGH_WATERMARK_GB 时恢复下载。
+
+        使用 shutil.disk_usage 检测整个文件系统的真实剩余空间，
+        而不是某个子目录大小（子目录大小永远达不到水位线，旧实现从未生效）。
         """
         try:
             high = float(os.getenv('DOWNLOAD_HIGH_WATERMARK_GB', str(self._download_high_watermark_gb)))
@@ -404,25 +402,34 @@ class DICOMDownloadClient:
             high = self._download_high_watermark_gb
             low = self._download_low_watermark_gb
 
-        # 快速判断：如果目录不存在或大小小于高水位，立即返回
+        def _free_gb():
+            return shutil.disk_usage(directory).free / (1024 ** 3)
+
+        # 快速判断：剩余空间充足则立即返回
         try:
-            current = self._get_dir_size_gb(directory)
+            free = _free_gb()
         except Exception:
             return
 
-        while current >= high:
+        warned = False
+        while free < low:
+            if not warned:
+                try:
+                    logger.warning(
+                        f"Disk free space low ({free:.2f}GB < {low}GB). "
+                        f"Pausing downloads until free >= {high}GB..."
+                    )
+                except Exception:
+                    pass
+                warned = True
+            time.sleep(sleep_sec)
             try:
-                logger.warning(f"Disk high watermark reached ({current:.2f}GB >= {high}GB). Pausing downloads...")
-            except Exception:
-                pass
-            time.sleep(15)  # P3 优化：从 5s 延长到 15s，减少频繁的目录大小计算
-            try:
-                current = self._get_dir_size_gb(directory)
+                free = _free_gb()
             except Exception:
                 break
-            if current <= low:
+            if free >= high:
                 try:
-                    logger.info(f"Disk usage dropped to {current:.2f}GB <= low watermark {low}GB, resuming")
+                    logger.info(f"Disk free space recovered to {free:.2f}GB >= {high}GB, resuming downloads")
                 except Exception:
                     pass
                 break
@@ -728,7 +735,8 @@ class DICOMDownloadClient:
             'files_received': 0,
             'current_series_files': set(),  # 当前序列接收的文件
             'failed_files': [],  # 失败的文件记录
-            'series_uid_to_dir': {}  # SeriesInstanceUID到目录的映射，避免竞态条件
+            'series_uid_to_dir': {},  # SeriesInstanceUID到目录的映射，避免竞态条件
+            'disk_full': False  # 磁盘剩余空间不足标志，触发后快速失败
         }
 
         def handle_store(event):
@@ -775,6 +783,22 @@ class DICOMDownloadClient:
 
                 # 确保目录存在
                 os.makedirs(series_dir, exist_ok=True)
+
+                # 磁盘剩余空间检查：低于硬下限时拒收，避免写满磁盘产生大量 ENOSPC 错误
+                if storage_state['files_received'] % 10 == 0 or storage_state['disk_full']:
+                    try:
+                        free_gb = shutil.disk_usage(series_dir).free / (1024 ** 3)
+                        if free_gb < self._download_critical_free_gb:
+                            storage_state['disk_full'] = True
+                            logger.error(
+                                f"❌ Disk nearly full (free {free_gb:.2f}GB < "
+                                f"{self._download_critical_free_gb}GB), refusing to store {filename}"
+                            )
+                            return 0xA702
+                    except Exception:
+                        pass
+                if storage_state['disk_full']:
+                    return 0xA702
 
                 # 保存文件
                 try:
@@ -876,11 +900,19 @@ class DICOMDownloadClient:
                     try:
                         logger.info(f"📥 Downloading series {i+1}/{len(series_metadata)}: {series_num} - {series_desc}")
 
-                        # 当磁盘空间达到高水位时，暂停下载以等待转换/清理
+                        # 当磁盘剩余空间达到低水位时，暂停下载以等待转换/清理
                         try:
                             self._wait_for_disk_low(output_path)
                         except Exception:
                             pass
+
+                        # 磁盘已满（C-STORE 拒收过文件），中止后续序列下载
+                        if storage_state['disk_full']:
+                            logger.error(
+                                f"❌ Disk nearly full, aborting remaining "
+                                f"{len(series_metadata) - i} series download"
+                            )
+                            break
 
                         # P2: 动态 C-MOVE 超时：根据 series 大小和类型调整
                         cmove_timeout = self._get_series_cmove_timeout(series)
@@ -977,6 +1009,9 @@ class DICOMDownloadClient:
             # P0: 尝试重试失败的序列
             # P2: 增强重试——重试前清理旧文件，并使用新关联
             retryable = self.failed_series_tracker.get_retryable_series()
+            if retryable and storage_state['disk_full']:
+                logger.error("⛔ Skipping retry phase: disk nearly full")
+                retryable = []
             if retryable:
                 logger.info(f"🔄 Attempting to retry {len(retryable)} failed series...")
                 # 为重试创建新的关联（避免使用可能已断开的旧关联）
@@ -1074,6 +1109,14 @@ class DICOMDownloadClient:
                     logger.debug(f"🔓 C-MOVE lock released for {accession_number}")
                 except RuntimeError:
                     pass  # 锁已被释放
+
+        # 磁盘满导致下载中止：返回 None 终止整个工作流
+        if storage_state['disk_full']:
+            logger.error(
+                f"❌ Download aborted: disk nearly full "
+                f"(free < {self._download_critical_free_gb}GB)"
+            )
+            return None
 
         # 打印下载统计
         stats_summary = self.download_stats.get_summary()
@@ -2046,63 +2089,40 @@ class DICOMDownloadClient:
                     break
                 series_dir, series_folder = item
 
-                # P0: 使用带超时的线程处理单个 series，防止 dcm2niix/pydicom 无限卡住
-                # 超时后检查已有输出，并尝试一次重试
-                def _run_with_timeout(target_func, timeout_sec):
-                    """在线程中运行目标函数，返回 (result, error, timed_out)"""
-                    result_holder = [None]
-                    error_holder = [None]
-
-                    def _wrapper():
-                        try:
-                            result_holder[0] = target_func()
-                        except Exception as e:
-                            error_holder[0] = e
-
-                    t = threading.Thread(target=_wrapper, daemon=True)
-                    t.start()
-                    t.join(timeout=timeout_sec)
-                    timed_out = t.is_alive()
-                    return result_holder[0], error_holder[0], timed_out
-
-                def _process_single():
-                    return self._process_single_series(
+                # 直接处理单个 series。
+                # 不再使用"超时线程"包装：Thread.join(timeout) 无法杀死超时线程，
+                # 被抛弃的线程会永久滞留在后台，是线程泄漏的主要来源。
+                # dcm2niix 子进程自身已有超时+强杀机制（_run_subprocess_with_timeout），
+                # 无需再叠加一层线程级超时。
+                info = None
+                err = None
+                try:
+                    info = self._process_single_series(
                         series_dir, series_folder, fmt,
                         min_series_files=min_series_files
                     )
+                except Exception as e:
+                    err = e
 
-                # 第一次尝试
-                info, err, timed_out = _run_with_timeout(_process_single, 600)
-
-                if timed_out:
-                    logger.error(
-                        f"   ❌ Series {series_folder} organize/conversion timed out after 600s (attempt 1/2)"
-                    )
-                    # 检查 dcm2niix 是否在超时前已生成输出
-                    existing_nifti = [
-                        f for f in os.listdir(series_dir)
-                        if f.endswith(('.nii.gz', '.nii')) and not f.startswith('.')
-                    ]
+                # 转换无结果时的兜底：若已存在 NIfTI 输出则直接采用
+                if not info:
+                    try:
+                        existing_nifti = [
+                            f for f in os.listdir(series_dir)
+                            if f.endswith(('.nii.gz', '.nii')) and not f.startswith('.')
+                        ]
+                    except Exception:
+                        existing_nifti = []
                     if existing_nifti:
                         logger.info(
-                            f"   ✅ Series {series_folder} has existing NIfTI output despite timeout, using it: {existing_nifti[0]}"
+                            f"   ✅ Series {series_folder} has existing NIfTI output, using it: {existing_nifti[0]}"
                         )
                         info = {
                             'path': series_dir,
                             'file_count': 0,  # 未知，但非关键
                             'files': []
                         }
-                    else:
-                        # 重试一次（dcm2niix 可能在 Windows 上因句柄问题卡住，重试可能成功）
-                        logger.warning(f"   🔄 Retrying series {series_folder} (attempt 2/2)...")
-                        info, err, timed_out2 = _run_with_timeout(_process_single, 600)
-                        if timed_out2:
-                            logger.error(
-                                f"   ❌ Series {series_folder} still timed out after retry. "
-                                f"Skipping this series. The daemon thread may remain stuck in background."
-                            )
-                            info = None
-                            err = f"Timed out after 2 attempts (1200s total)"
+                        err = None
 
                 if info:
                     with series_lock:
@@ -2217,7 +2237,14 @@ class DICOMDownloadClient:
 
                 metadata_thread = threading.Thread(target=_metadata_worker, daemon=True)
                 metadata_thread.start()
-                metadata_thread.join()
+                # 带超时等待：元数据提取卡死时不能永久占用任务 worker
+                metadata_thread.join(timeout=600)
+                if metadata_thread.is_alive():
+                    logger.error(
+                        "❌ Metadata extraction timed out after 600s, "
+                        "continuing without metadata (background thread will be abandoned)"
+                    )
+                    excel_holder['path'] = None
 
                 excel_file = excel_holder['path']
                 if excel_file:

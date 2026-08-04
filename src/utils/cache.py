@@ -129,10 +129,91 @@ def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = Non
             shutil.copy2(excel_path, cache_excel)
 
         logger.info(f"[CACHE] Saved to cache: {cache_dir}")
+
+        # 保存成功后强制执行容量检查（LRU 淘汰），防止缓存无限增长
+        try:
+            enforce_cache_limit(os.path.dirname(cache_dir))
+        except Exception as e:
+            logger.warning(f"[CACHE] enforce_cache_limit failed: {e}")
+
         return True
     except Exception as e:
         logger.error(f"[CACHE] Failed to save cache: {e}")
         return False
+
+
+# 缓存容量上限默认值（GB），可通过环境变量 CACHE_MAX_GB 覆盖
+DEFAULT_CACHE_MAX_GB = 20.0
+
+
+def get_cache_max_gb() -> float:
+    """读取缓存容量上限（GB）。"""
+    try:
+        val = float(os.getenv('CACHE_MAX_GB', str(DEFAULT_CACHE_MAX_GB)))
+        return val if val > 0 else DEFAULT_CACHE_MAX_GB
+    except Exception:
+        return DEFAULT_CACHE_MAX_GB
+
+
+def enforce_cache_limit(cache_base: str) -> int:
+    """LRU 淘汰：当缓存总大小超过上限时，从最旧访问的条目开始删除。
+
+    Args:
+        cache_base: 缓存根目录（results/cache）
+
+    Returns:
+        被淘汰的条目数量
+    """
+    if not os.path.isdir(cache_base):
+        return 0
+
+    max_gb = get_cache_max_gb()
+    limit_bytes = max_gb * (1024 ** 3)
+
+    entries = []
+    total_bytes = 0
+    try:
+        for item in os.listdir(cache_base):
+            item_path = os.path.join(cache_base, item)
+            if not os.path.isdir(item_path):
+                continue
+            size = _get_dir_size(item_path)
+            try:
+                atime = os.path.getatime(item_path)
+            except OSError:
+                atime = 0.0
+            entries.append((atime, size, item_path))
+            total_bytes += size
+    except Exception as e:
+        logger.warning(f"[CACHE] Failed to scan cache for LRU: {e}")
+        return 0
+
+    if total_bytes <= limit_bytes:
+        return 0
+
+    logger.info(
+        f"[CACHE] Cache size {total_bytes / (1024**3):.2f}GB exceeds limit {max_gb}GB, starting LRU eviction"
+    )
+    entries.sort(key=lambda x: x[0])  # 最旧访问的在前
+
+    evicted = 0
+    for _atime, size, path in entries:
+        if total_bytes <= limit_bytes:
+            break
+        try:
+            shutil.rmtree(path)
+            total_bytes -= size
+            evicted += 1
+            logger.info(f"[CACHE] Evicted: {os.path.basename(path)} ({size / (1024**3):.2f}GB)")
+        except Exception as e:
+            logger.warning(f"[CACHE] Failed to evict {path}: {e}")
+
+    if evicted:
+        logger.info(
+            f"[CACHE] LRU eviction done: removed {evicted} entries, "
+            f"cache now {total_bytes / (1024**3):.2f}GB (limit {max_gb}GB)"
+        )
+    return evicted
 
 
 def clear_all_cache(results_base_dir: str) -> Dict:

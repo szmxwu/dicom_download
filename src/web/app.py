@@ -156,6 +156,7 @@ _completed_tasks_lock = threading.Lock()
 _completed_tasks_cache = []
 _completed_task_ids = set()
 _serialized_history_cache = []
+MAX_COMPLETED_TASK_CACHE = 500  # 已完成任务缓存上限，防止内存无限增长
 
 # 任务取消标志字典 - 用于真正中断任务执行
 _task_cancel_flags = {}
@@ -385,13 +386,31 @@ try:
 except Exception:
     CLEANUP_TARGET_GB = 40.0
 
+# 磁盘剩余空间触发阈值（GB）：当 results 所在磁盘剩余空间低于该值时，
+# 无论 results 目录大小如何都强制触发清理，避免磁盘被写满
+try:
+    CLEANUP_MIN_FREE_GB = float(os.getenv('CLEANUP_MIN_FREE_GB', '50'))
+except Exception:
+    CLEANUP_MIN_FREE_GB = 50.0
+
+# 周期性清理检查间隔（秒）
+try:
+    DISK_CLEANUP_INTERVAL_SEC = int(os.getenv('DISK_CLEANUP_INTERVAL_SEC', '300'))
+except Exception:
+    DISK_CLEANUP_INTERVAL_SEC = 300
+
+# 清理并发保护：同一时刻只允许一个清理任务运行
+_cleanup_lock = threading.Lock()
+
 # 将读取到的默认值持久化到 .env，便于用户修改与持久化配置
 try:
     # 写入整数值时保留整型格式，浮点数保留原样
     thr_val = str(int(CLEANUP_THRESHOLD_GB) if float(CLEANUP_THRESHOLD_GB).is_integer() else CLEANUP_THRESHOLD_GB)
     tgt_val = str(int(CLEANUP_TARGET_GB) if float(CLEANUP_TARGET_GB).is_integer() else CLEANUP_TARGET_GB)
+    free_val = str(int(CLEANUP_MIN_FREE_GB) if float(CLEANUP_MIN_FREE_GB).is_integer() else CLEANUP_MIN_FREE_GB)
     set_key(ENV_FILE_PATH, 'CLEANUP_THRESHOLD_GB', thr_val)
     set_key(ENV_FILE_PATH, 'CLEANUP_TARGET_GB', tgt_val)
+    set_key(ENV_FILE_PATH, 'CLEANUP_MIN_FREE_GB', free_val)
 except Exception as e:
     logger.warning(f"无法将清理阈值写入 {ENV_FILE_PATH}: {e}")
 
@@ -477,94 +496,138 @@ def _safe_rmtree(dirpath):
     return len(failed_paths) == 0
 
 
+def _get_free_space_gb(path):
+    """获取 path 所在磁盘的真实剩余空间（GB）"""
+    try:
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except Exception:
+        return None
+
+
 def cleanup_old_results():
-    """清理旧的结果文件，保持磁盘空间在合理范围内"""
+    """清理旧的结果文件，保持磁盘空间在合理范围内
+
+    触发条件（满足其一即清理）：
+    1. results 目录大小 >= CLEANUP_THRESHOLD_GB（原有逻辑）
+    2. results 所在磁盘剩余空间 < CLEANUP_MIN_FREE_GB（防止磁盘被写满，
+       无论 results 目录本身多大都会触发）
+    """
     results_dir = app.config['RESULT_FOLDER']
-    current_size = get_directory_size(results_dir)
 
-    if current_size < CLEANUP_THRESHOLD_GB:
+    # 并发保护：已有清理任务运行时跳过，避免多个清理线程互相竞争
+    if not _cleanup_lock.acquire(blocking=False):
+        logger.debug("Another cleanup task is running, skipping")
         return
-
-    logger.info(f"结果目录大小: {current_size:.2f}GB, 启动自动清理")
-
-    # 获取所有子目录（任务目录和ZIP文件）
-    items_to_check = []
 
     try:
-        # 扫描所有文件和目录
-        for item in os.listdir(results_dir):
-            item_path = os.path.join(results_dir, item)
-            if os.path.exists(item_path):
-                # 获取最后访问时间
-                atime = os.path.getatime(item_path)
-                size = 0
+        current_size = get_directory_size(results_dir)
+        free_gb = _get_free_space_gb(results_dir)
 
-                if os.path.isfile(item_path):
-                    size = os.path.getsize(item_path) / (1024 ** 3)
-                elif os.path.isdir(item_path):
-                    size = get_directory_size(item_path)
+        size_triggered = current_size >= CLEANUP_THRESHOLD_GB
+        free_triggered = free_gb is not None and free_gb < CLEANUP_MIN_FREE_GB
+        if not size_triggered and not free_triggered:
+            return
 
-                items_to_check.append({
-                    'path': item_path,
-                    'name': item,
-                    'atime': atime,
-                    'size': size,
-                    'is_dir': os.path.isdir(item_path)
-                })
+        if free_triggered:
+            logger.warning(
+                f"磁盘剩余空间不足 (free {free_gb:.2f}GB < {CLEANUP_MIN_FREE_GB}GB), 强制启动清理"
+            )
+        free_desc = f"{free_gb:.2f}GB" if free_gb is not None else "未知"
+        logger.info(f"结果目录大小: {current_size:.2f}GB, 磁盘剩余: {free_desc}, 启动自动清理")
 
-    except Exception as e:
-        logger.error(f"扫描结果目录失败: {str(e)}")
-        return
-
-    # 排除正在进行的任务
-    active_task_ids = [task.task_id for task in processing_tasks.values()
-                      if task.status in ['running', 'pending']]
-
-    # 过滤掉正在进行的任务
-    items_to_clean = []
-    for item in items_to_check:
-        # 检查是否为活跃任务目录
-        is_active = False
-        for task_id in active_task_ids:
-            if task_id in item['name']:
-                is_active = True
-                break
-
-        if not is_active:
-            items_to_clean.append(item)
-
-    if not items_to_clean:
-        logger.info("所有文件都属于活跃任务，跳过清理")
-        return
-
-    # 按访问时间排序，先删除最旧的
-    items_to_clean.sort(key=lambda x: x['atime'])
-
-    cleaned_size = 0
-    target_to_clean = current_size - CLEANUP_TARGET_GB
-
-    for item in items_to_clean:
-        if cleaned_size >= target_to_clean:
-            break
+        # 获取所有子目录（任务目录和ZIP文件）
+        items_to_check = []
 
         try:
-            logger.info(f"删除: {item['name']} ({item['size']:.2f}GB)")
+            # 扫描所有文件和目录
+            for item in os.listdir(results_dir):
+                item_path = os.path.join(results_dir, item)
+                if os.path.exists(item_path):
+                    # 获取最后访问时间
+                    atime = os.path.getatime(item_path)
+                    size = 0
 
-            if item['is_dir']:
-                _safe_rmtree(item['path'])
-            else:
-                if not _force_remove_file(item['path']):
-                    logger.warning(f"无法删除文件（可能仍被占用）: {item['name']}")
+                    if os.path.isfile(item_path):
+                        size = os.path.getsize(item_path) / (1024 ** 3)
+                    elif os.path.isdir(item_path):
+                        size = get_directory_size(item_path)
 
-            # 如果删除成功，目录/文件应该不存在了
-            if not os.path.exists(item['path']):
-                cleaned_size += item['size']
+                    items_to_check.append({
+                        'path': item_path,
+                        'name': item,
+                        'atime': atime,
+                        'size': size,
+                        'is_dir': os.path.isdir(item_path)
+                    })
 
         except Exception as e:
-            logger.error(f"删除 {item['name']} 失败: {str(e)}")
+            logger.error(f"扫描结果目录失败: {str(e)}")
+            return
 
-    final_size = get_directory_size(results_dir)
-    logger.info(f"清理完成: {current_size:.2f}GB → {final_size:.2f}GB (清理了 {cleaned_size:.2f}GB)")
+        # 排除正在进行的任务
+        active_task_ids = [task.task_id for task in processing_tasks.values()
+                          if task.status in ['running', 'pending']]
+
+        # 过滤掉正在进行的任务
+        items_to_clean = []
+        for item in items_to_check:
+            # 检查是否为活跃任务目录
+            is_active = False
+            for task_id in active_task_ids:
+                if task_id in item['name']:
+                    is_active = True
+                    break
+
+            if not is_active:
+                items_to_clean.append(item)
+
+        if not items_to_clean:
+            logger.info("所有文件都属于活跃任务，跳过清理")
+            return
+
+        # 按访问时间排序，先删除最旧的
+        items_to_clean.sort(key=lambda x: x['atime'])
+
+        # 计算需要清理的总量：取"目录大小达标"与"剩余空间达标"所需删除量的较大值
+        target_to_clean = 0.0
+        if size_triggered:
+            target_to_clean = max(target_to_clean, current_size - CLEANUP_TARGET_GB)
+        if free_triggered:
+            # 清理到剩余空间恢复至 CLEANUP_MIN_FREE_GB + 10GB 缓冲
+            target_to_clean = max(target_to_clean, (CLEANUP_MIN_FREE_GB + 10.0) - free_gb)
+
+        cleaned_size = 0
+        for item in items_to_clean:
+            if cleaned_size >= target_to_clean:
+                break
+
+            try:
+                logger.info(f"删除: {item['name']} ({item['size']:.2f}GB)")
+
+                if item['is_dir']:
+                    _safe_rmtree(item['path'])
+                else:
+                    if not _force_remove_file(item['path']):
+                        logger.warning(f"无法删除文件（可能仍被占用）: {item['name']}")
+
+                # 如果删除成功，目录/文件应该不存在了
+                if not os.path.exists(item['path']):
+                    cleaned_size += item['size']
+
+            except Exception as e:
+                logger.error(f"删除 {item['name']} 失败: {str(e)}")
+
+        final_size = get_directory_size(results_dir)
+        final_free = _get_free_space_gb(results_dir)
+        logger.info(f"清理完成: {current_size:.2f}GB → {final_size:.2f}GB (清理了 {cleaned_size:.2f}GB)")
+        if free_triggered and final_free is not None and final_free < CLEANUP_MIN_FREE_GB:
+            logger.error(
+                f"⚠️ 已删除所有可清理项，但磁盘剩余空间仍不足 "
+                f"({final_free:.2f}GB < {CLEANUP_MIN_FREE_GB}GB)，"
+                f"磁盘可能被 results 目录以外的数据占满"
+            )
+    finally:
+        _cleanup_lock.release()
 
 def check_and_cleanup_results():
     """检查并清理结果目录的后台任务"""
@@ -574,8 +637,28 @@ def check_and_cleanup_results():
         except Exception as e:
             logger.error(f"自动清理失败: {str(e)}")
     
-    # 异步执行清理，避免阻塞主线程
+    # 异步执行清理，避免阻塞主线程（并发由 _cleanup_lock 保护）
     threading.Thread(target=cleanup_thread, daemon=True).start()
+
+
+def _periodic_disk_cleanup_loop():
+    """后台线程：周期性检查磁盘并清理。
+
+    原清理只在任务完成后触发，批量下载过程中磁盘写满时清理不会运行；
+    现在无论是否有任务完成，都按 DISK_CLEANUP_INTERVAL_SEC 周期检查。
+    """
+    while True:
+        time.sleep(DISK_CLEANUP_INTERVAL_SEC)
+        try:
+            cleanup_old_results()
+        except Exception as e:
+            logger.error(f"周期性磁盘清理失败: {e}")
+
+
+_periodic_cleanup_thread = threading.Thread(
+    target=_periodic_disk_cleanup_loop, daemon=True, name='PeriodicDiskCleanup'
+)
+_periodic_cleanup_thread.start()
 
 class ProcessingTask:
     """处理任务类 - 修复版"""
@@ -1021,6 +1104,11 @@ def _record_task_completion(task: 'ProcessingTask'):
         _completed_task_ids.add(task.task_id)
         _completed_tasks_cache.insert(0, task)
         _serialized_history_cache.insert(0, _serialize_task_history(task))
+        # 截断过期缓存，防止长期运行时内存无限增长
+        while len(_completed_tasks_cache) > MAX_COMPLETED_TASK_CACHE:
+            evicted = _completed_tasks_cache.pop()
+            _serialized_history_cache.pop()
+            _completed_task_ids.discard(evicted.task_id)
 
 
 @app.route('/api/tasks/history')
@@ -2039,7 +2127,10 @@ def process_batch_task(task):
             except Exception as e:
                 task.add_log(f'{accno} Process failed: {str(e)}', 'error')
                 results.append({'accession_number': accno, 'error': str(e)})
-        
+
+            # 每完成一个 accession 检查一次磁盘（清理内部有并发锁，重复调用无副作用）
+            check_and_cleanup_results()
+
         task.update_status('running', 95, 'Creating batch results')
         task.add_log("Creating batch result files...")
         

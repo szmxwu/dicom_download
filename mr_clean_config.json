@@ -97,7 +97,23 @@
       "PWI": { "protocol_keywords": ["pwi", "perf", "dsc"] },
       "MRS": { "protocol_keywords": ["mrs", "svs", "csi", "spectro"] },
       "BREATH MOVEMENT": { "series_description_keywords": ["resp"] },
-      "MIP": { "series_description_keywords": ["mip"] }
+      "MIP": { "keywords": ["mip", "minip", "minimum intensity projection", "maximum intensity projection"] },
+      "MRCP": { "protocol_keywords": ["mrcp", "cholangio", "biliary"] }
+    },
+    "dwi_name_keywords": ["dwi", "dwibs", "diff", "trace", "resolve_diff", "dwiblack"],
+    "physical_mrcp": {
+      "class": "MRCP",
+      "body_parts": ["ABDOMEN", "LIVER"],
+      "source_only": true,
+      "scanning_sequence_tokens": ["se"],
+      "dimensions": {
+        "3D": {
+          "min_echo_time_ms": 200,
+          "min_echo_train_length": 100,
+          "max_slice_thickness_mm": 3.0
+        },
+        "2D": {"min_echo_time_ms": 400}
+      }
     },
     "dwi_b_value_min": 50,
     "dti_name_keyword": "dti",
@@ -191,5 +207,63 @@
   "propagate": {
     "t1_contains": "T1",
     "propagated_phase": "POST_PROPAGATED"
+  },
+  "excluded_patterns": {
+    "exam_card_keywords": ["examcard", "exam_card"],
+    "empty_series_description": true,
+    "derived_screen_save_keywords": ["screen save", "processed images", "filming", "inline_vf_results", "posdisp", "new series"],
+    "unknown_protocol_names": ["____"],
+    "localizer_keywords": ["3-plane", "3plane", "aahscout", "define_sax", "localiser", "localizer", "scout", "smartprep", "surv", "定位"],
+    "hidden_localizer_rules": {
+      "total_files_max": 15,
+      "spacing_ratio_min": 2.0,
+      "name_whitelist": ["map", "moco", "bolustrak", "dynamic"]
+    }
+  },
+  "sequence_family_suffix_fallback": ["_MC", "_WATER", "_FAT", "_INPHASE", "_OUTPHASE"],
+  "sequence_family_map": {
+    "T2_TSE": "T2_anatomic",
+    "T2_SE": "T2_anatomic",
+    "T2_FLAIR": "T2_anatomic",
+    "T2_SE_SingleShot": "T2_anatomic",
+    "T2_TSE_MC": "T2_anatomic",
+    "T2_MAP": "T2_anatomic",
+    "T2_NAME_BASED": "T2_anatomic",
+    "T2_STIR": "T2_fat_suppressed",
+    "T2_TSE_FAT": "T2_fat_suppressed",
+    "T1_TSE": "T1_anatomic",
+    "T1_SE": "T1_anatomic",
+    "T1_GRE": "T1_anatomic",
+    "T1_GRE_SPOILED": "T1_anatomic",
+    "T1_GRE_STEADY_STATE": "T1_anatomic",
+    "T1_MAP": "T1_anatomic",
+    "T1_NAME_BASED": "T1_anatomic",
+    "T1_GRE_FLASH3D": "T1_anatomic",
+    "T1_TSE_FAT": "T1_fat_suppressed",
+    "T1_GRE_STEADY_STATE_FAT": "T1_fat_suppressed",
+    "T1_TSE_INPHASE": "T1_in_phase",
+    "T1_GRE_STEADY_STATE_INPHASE": "T1_in_phase",
+    "T1_TSE_OUTPHASE": "T1_out_phase",
+    "T1_GRE_STEADY_STATE_OUTPHASE": "T1_out_phase",
+    "PD_TSE": "PD",
+    "PD_SE": "PD",
+    "PD_GRE": "PD",
+    "PD_TSE_FAT": "PD",
+    "PD_TSE_WATER": "PD",
+    "DWI": "DWI",
+    "DTI": "DWI",
+    "ADC": "ADC",
+    "MRA": "MRA",
+    "SWI": "SWI",
+    "PWI": "PWI",
+    "MRS": "MRS",
+    "MRCP": "MRCP",
+    "fMRI_BOLD": "fMRI",
+    "LOCALIZER": "LOCALIZER",
+    "DERIVED": "DERIVED",
+    "SUBTRACTION": "DERIVED",
+    "MIP": "DERIVED",
+    "FA_MAP": "DERIVED",
+    "BREATH MOVEMENT": "OTHER"
   }
 }

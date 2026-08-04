@@ -40,6 +40,9 @@ class QualityReasons:
     FILE_NOT_FOUND = "file_not_found"
     UNSUPPORTED_FORMAT = "unsupported_format"
     NIFTI_ORIENTATION_ERROR = "nifti_orientation_error"
+    # 转换时方向一致性校验（convert.py）：镜像处方已自动校正 / 无法自动校验
+    ORIENTATION_MIRROR_CORRECTED = "orientation_mirror_corrected"
+    ORIENTATION_NOT_VERIFIABLE = "orientation_not_verifiable"
     # 修复状态（用于标记已修复的问题）
     FIXED_ORIENTATION = "fixed_orientation"
     FIXED_GRAYSCALE = "fixed_grayscale"
@@ -62,6 +65,8 @@ REASON_DESCRIPTIONS = {
     QualityReasons.FILE_NOT_FOUND: "File not found",
     QualityReasons.UNSUPPORTED_FORMAT: "Unsupported file format",
     QualityReasons.NIFTI_ORIENTATION_ERROR: "NIfTI orientation error (dcm2niix bug detected)",
+    QualityReasons.ORIENTATION_MIRROR_CORRECTED: "Mirrored prescription corrected at conversion (content re-laid-out to match DICOM geometry)",
+    QualityReasons.ORIENTATION_NOT_VERIFIABLE: "NIfTI orientation not auto-verifiable (non-permutation transform, resampled?)",
     # 修复状态描述
     QualityReasons.FIXED_ORIENTATION: "Fixed: NIfTI orientation corrected",
     QualityReasons.FIXED_GRAYSCALE: "Fixed: Grayscale inversion corrected",

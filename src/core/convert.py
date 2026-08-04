@@ -9,6 +9,7 @@ DICOM 转换模块。
 - 处理不同模态（CT、MR、DR、MG、DX 等）的影像数据
 - 像素值重缩放和光度解释处理
 - 从 DICOM 构建仿射变换矩阵
+- 转换时方向一致性校验与镜像处方校正（verify_and_fix_orientation）
 
 典型用法：
     from src.core.convert import convert_dicom_to_nifti, convert_to_npz
@@ -25,6 +26,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -416,6 +418,483 @@ def normalize_and_save_npz(nii_path_or_img, npz_path: str) -> None:
         np.savez_compressed(npz_path, data=data.astype(np.float32))
     else:
         np.savez(npz_path, data=data.astype(np.float32))
+
+
+# ==============================================================================
+# 转换时方向一致性校验与镜像校正 (Orientation Consistency Check & Mirror Fix)
+# ==============================================================================
+#
+# 背景：斜位扫描可能使用镜像处方（IOP 行方向 x 分量与常规反号），
+# 转换器若在镜像处方下产出自相矛盾的 内容-仿射 关系（如纯 Python 兜底路径
+# 的面内翻转），下游 TotalSegmentator 会把左肱骨标成 humerus_right。
+#
+# 设计原则：NIfTI/NPZ 的 内容+仿射 必须与 DICOM 头描述的几何严格一致。
+# 校验步骤（实测校准，详见 test/test_orientation_fix.py）：
+#   1. 从全部 DICOM 头重建真值体素网格几何 dicom_affine（G_d 约定：
+#      axis0=rows, axis1=columns, axis2=按规范方向排序的层，RAS 坐标）；
+#   2. 相对变换 T = inv(nifti_affine) @ dicom_affine 归一化后应为带符号置换矩阵，
+#      否则视为重采样过，不自动改，记 QC 告警；
+#   3. 用探针体素（probing）实测内容布局 L_c：比较 NIfTI 数据在 L_c(p) 处
+#      与 DICOM 像素在 p 处的相关性，确认内容与仿射是否自洽；
+#      - L_c != T → 仿射与内容不自洽（转换器 bug）：修正仿射使二者一致；
+#   4. det(layout) < 0（左手性网格 = 镜像处方签名）→ 沿列轴（IOP 行方向，
+#      即镜像发生的轴）翻转数据并同步修正仿射（一致性重排，世界几何不变），
+#      使体素内容方向恢复正常处方形态。
+#
+# 实测结论（v1.0.20250505 捆绑 dcm2niix，合成斜位序列验证）：
+#   - dcm2niix 对正常/镜像处方均为忠实转换（内容与仿射一致）；
+#     镜像处方输出 det(T)<0 是其固定布局惯例，需要第 4 步的重排校正；
+#   - 纯 Python 兜底路径存在面内镜像 bug（仿射列方向与内容相反），
+#     由第 3 步检测并修正仿射。
+
+# 方向校验结果动作常量（与 qc.QualityReasons 的字符串保持一致）
+ORIENTATION_CHECK_OK = 'ok'
+ORIENTATION_CHECK_MIRROR_CORRECTED = 'orientation_mirror_corrected'
+ORIENTATION_CHECK_NOT_VERIFIABLE = 'orientation_not_verifiable'
+ORIENTATION_CHECK_SKIPPED = 'skipped'
+
+# 探针相关阈值
+_PROBE_CORR_THRESHOLD = 0.995      # 布局判定的皮尔逊相关系数阈值
+_PERM_TOL = 0.02                   # 置换矩阵元素容差
+_TRANS_TOL = 0.1                   # 平移整数性容差（体素）
+
+
+def _canonical_slice_order(positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    按规范方向对层位置排序。
+
+    排序方向取层分布主轴（世界坐标 |分量| 最大的轴）的正方向，
+    与 IOP 叉积无关——这样左手性（镜像处方）才能体现为
+    cross(X,Y) 与排序步进方向的反号。
+
+    参数:
+        positions: (N, 3) 的 IPP 数组（LPS 坐标）
+
+    返回:
+        (order, step_vec): 排序索引与排序后相邻差分均值向量
+    """
+    positions = np.asarray(positions, dtype=np.float64)
+    if len(positions) < 2:
+        return np.arange(len(positions)), np.zeros(3, dtype=np.float64)
+    # 找距离最远的一对点确定层分布主轴
+    diff = positions[:, None, :] - positions[None, :, :]
+    dist = np.linalg.norm(diff, axis=-1)
+    i, j = np.unravel_index(int(np.argmax(dist)), dist.shape)
+    spread = positions[j] - positions[i]
+    dom = int(np.argmax(np.abs(spread)))
+    step_dir = np.zeros(3, dtype=np.float64)
+    step_dir[dom] = 1.0 if spread[dom] >= 0 else -1.0
+    order = np.argsort(positions @ step_dir)
+    sorted_pos = positions[order]
+    step_vec = np.diff(sorted_pos, axis=0).mean(axis=0)
+    return order, step_vec
+
+
+def build_dicom_truth_affine(datasets: List[FileDataset]) -> Optional[Tuple[np.ndarray, List[FileDataset]]]:
+    """
+    从序列全部 DICOM 头重建真值体素网格几何（G_d 约定，RAS 坐标）。
+
+    G_d 体素网格定义：axis0 = rows (r)，axis1 = columns (c)，axis2 = 规范排序后的层 (s)。
+    仿射列：Y*row_spacing（IOP[3:6]，r 递增方向）、X*col_spacing（IOP[0:3]，c 递增方向）、
+    排序后 IPP 差分估计的层步进、首层 IPP。
+
+    参数:
+        datasets: pydicom Dataset 列表（需含 IOP/IPP/PixelSpacing）
+
+    返回:
+        (affine_ras, sorted_datasets) 或 None（缺少几何标签时）
+    """
+    try:
+        first = datasets[0]
+        iop = getattr(first, 'ImageOrientationPatient', None)
+        pixel_spacing = getattr(first, 'PixelSpacing', None)
+        if iop is None or pixel_spacing is None:
+            return None
+        positions = []
+        for ds in datasets:
+            ipp = getattr(ds, 'ImagePositionPatient', None)
+            if ipp is None:
+                return None
+            positions.append([float(v) for v in ipp])
+        positions = np.asarray(positions, dtype=np.float64)
+
+        order, step_vec = _canonical_slice_order(positions)
+        sorted_datasets = [datasets[i] for i in order]
+        if len(datasets) == 1:
+            # 单层：步进方向用叉积法向 * 层厚
+            row_cos = np.array([float(v) for v in iop[:3]], dtype=np.float64)
+            col_cos = np.array([float(v) for v in iop[3:6]], dtype=np.float64)
+            thickness = float(getattr(first, 'SliceThickness', 1.0))
+            step_vec = np.cross(row_cos, col_cos) * thickness
+
+        row_cos = np.array([float(v) for v in iop[:3]], dtype=np.float64)  # X：c 递增方向
+        col_cos = np.array([float(v) for v in iop[3:6]], dtype=np.float64)  # Y：r 递增方向
+        row_spacing = float(pixel_spacing[0])  # Δr
+        col_spacing = float(pixel_spacing[1])  # Δc
+
+        affine_lps = np.eye(4, dtype=np.float64)
+        affine_lps[:3, 0] = col_cos * row_spacing   # axis0 = rows：沿 IOP[3:6]
+        affine_lps[:3, 1] = row_cos * col_spacing   # axis1 = columns：沿 IOP[0:3]
+        affine_lps[:3, 2] = step_vec
+        affine_lps[:3, 3] = positions[order[0]]
+
+        lps_to_ras = np.diag([-1.0, -1.0, 1.0, 1.0])
+        return lps_to_ras @ affine_lps, sorted_datasets
+    except Exception as e:
+        logger.warning("Failed to build DICOM truth affine: %s", e)
+        return None
+
+
+def _analyze_signed_permutation(T: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    判断相对变换 T 是否为带符号置换矩阵（归一化后元素为 0/±1，平移为整数体素）。
+
+    返回:
+        (perm_matrix, translation) 或 None（不是置换矩阵，说明被重采样/插值过）
+    """
+    M = np.array(T[:3, :3], dtype=np.float64)
+    for j in range(3):
+        norm = float(np.linalg.norm(M[:, j]))
+        if norm <= 0:
+            return None
+        M[:, j] /= norm
+    rounded = np.round(M)
+    if not np.allclose(M, rounded, atol=_PERM_TOL, rtol=0):
+        return None
+    if not (np.all(np.abs(rounded).sum(axis=0) == 1) and np.all(np.abs(rounded).sum(axis=1) == 1)):
+        return None
+    translation = T[:3, 3]
+    if not np.allclose(translation, np.round(translation), atol=_TRANS_TOL, rtol=0):
+        return None
+    return rounded.astype(np.int64), np.round(translation).astype(np.int64)
+
+
+def _layout_matrix(perm: Tuple[int, int, int], flips: Tuple[bool, bool, bool],
+                   gd_shape: Tuple[int, int, int]) -> np.ndarray:
+    """
+    由布局描述构造 4x4 映射矩阵：nifti_idx = L @ gd_idx。
+
+    布局约定：np.transpose(V, perm) 后按 flips 翻转对应轴，
+    即 G_d 轴 perm[a] 映射到 NIfTI 轴 a，翻转时平移 dim-1。
+    """
+    L = np.eye(4, dtype=np.float64)
+    for a in range(3):
+        b = perm[a]
+        L[a, :] = 0.0
+        if flips[a]:
+            L[a, b] = -1.0
+            L[a, 3] = float(gd_shape[b] - 1)
+        else:
+            L[a, b] = 1.0
+    return L
+
+
+def _probe_content_layout(
+    data: np.ndarray,
+    sorted_datasets: List[FileDataset],
+    max_probe_slices: int = 5,
+    slice_loader=None
+) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    用探针体素实测 NIfTI 内容布局。
+
+    在 G_d 网格上采样探针点（若干层的 (r,c) 网格），对全部 48 种带符号置换
+    候选布局，计算 NIfTI 数据在 L(p) 处与 DICOM 像素在 p 处的皮尔逊相关系数，
+    返回相关度达标的布局矩阵。
+
+    参数:
+        data: NIfTI 体数据（3D）
+        sorted_datasets: 按 G_d 规范排序的 DICOM 数据集（与真值仿射一致）
+        max_probe_slices: 最多抽取的层数
+        slice_loader: 可选，按序号返回含像素的 Dataset（默认直接用 sorted_datasets）
+
+    返回:
+        (layout_matrix, correlation) 或 None（无法判定：空白数据或无候选达标）
+    """
+    import itertools
+
+    n_slices = len(sorted_datasets)
+    if n_slices == 0:
+        return None
+    if slice_loader is None:
+        slice_loader = lambda i: sorted_datasets[i]
+    rows = int(getattr(sorted_datasets[0], 'Rows', data.shape[0]))
+    cols = int(getattr(sorted_datasets[0], 'Columns', data.shape[1]))
+    gd_shape = (rows, cols, n_slices)
+    if data.ndim != 3:
+        return None
+
+    # 探针点：均匀抽取若干层，每层 6x6 的 (r,c) 网格（内缩 15% 避开边缘）
+    slice_indices = np.linspace(0, n_slices - 1, min(max_probe_slices, n_slices)).astype(int)
+    r_grid = np.linspace(int(rows * 0.15), int(rows * 0.85), 6).astype(int)
+    c_grid = np.linspace(int(cols * 0.15), int(cols * 0.85), 6).astype(int)
+
+    probe_pts: List[Tuple[int, int, int]] = []
+    probe_vals: List[float] = []
+    for s in slice_indices:
+        try:
+            ds = slice_loader(int(s))
+            pixels = ds.pixel_array
+        except Exception:
+            return None
+        pixels = apply_rescale(pixels, ds)
+        pixels = apply_photometric(pixels, ds)
+        for r in r_grid:
+            for c in c_grid:
+                probe_pts.append((int(r), int(c), int(s)))
+                probe_vals.append(float(pixels[int(r), int(c)]))
+    probe_vals_arr = np.asarray(probe_vals, dtype=np.float64)
+    if probe_vals_arr.std() < 1e-6:
+        # 空白/均匀数据，无法探针判定
+        return None
+    pts = np.asarray(probe_pts, dtype=np.float64)  # (N, 3)
+
+    best_layout = None
+    best_corr = -1.0
+    for perm in itertools.permutations(range(3)):
+        expected_shape = tuple(gd_shape[perm[a]] for a in range(3))
+        if expected_shape != tuple(data.shape[:3]):
+            continue
+        for flips in itertools.product([False, True], repeat=3):
+            L = _layout_matrix(perm, flips, gd_shape)
+            q = (L[:3, :] @ np.hstack([pts, np.ones((len(pts), 1))]).T)[:3, :]
+            qi = np.round(q).astype(np.int64)
+            if (qi < 0).any():
+                continue
+            if any(qi[a].max() >= data.shape[a] for a in range(3)):
+                continue
+            gathered = data[qi[0], qi[1], qi[2]].astype(np.float64)
+            if gathered.std() < 1e-6:
+                continue
+            corr = float(np.corrcoef(gathered, probe_vals_arr)[0, 1])
+            if corr > best_corr:
+                best_corr = corr
+                best_layout = L
+    if best_layout is not None and best_corr >= _PROBE_CORR_THRESHOLD:
+        return best_layout, best_corr
+    return None
+
+
+def _flip_image_axis(data: np.ndarray, affine: np.ndarray, axis: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    沿指定体素轴翻转数据并同步修正仿射（一致性重排，世界几何不变）。
+    """
+    flipped = np.flip(data, axis=axis)
+    F = np.eye(4, dtype=np.float64)
+    F[axis, axis] = -1.0
+    F[axis, 3] = float(data.shape[axis] - 1)
+    return flipped, affine @ F
+
+
+def _rebuild_nifti(img: nib.Nifti1Image, data: np.ndarray, affine: np.ndarray) -> nib.Nifti1Image:
+    """以新数据/仿射重建 NIfTI 图像，保留原 header 并同步 qform/sform。"""
+    header = img.header.copy() if img.header is not None else None
+    new_img = nib.Nifti1Image(np.asanyarray(data), affine, header)
+    try:
+        qcode = int(img.header['qform_code']) if img.header is not None else 1
+        scode = int(img.header['sform_code']) if img.header is not None else 1
+        new_img.set_qform(affine, code=qcode if qcode > 0 else 1)
+        new_img.set_sform(affine, code=scode if scode > 0 else 1)
+    except Exception:
+        pass
+    return new_img
+
+
+def verify_and_fix_orientation(
+    nifti_img: nib.Nifti1Image,
+    datasets: List[FileDataset],
+    series_name: str = '',
+    slice_loader=None
+) -> Tuple[nib.Nifti1Image, Dict[str, Any]]:
+    """
+    校验 NIfTI 内容+仿射与 DICOM 头描述几何的一致性，必要时校正。
+
+    流程：重建真值仿射 → 置换矩阵判定 → 探针实测内容布局 →
+    仿射不自洽则修正仿射 → 左手性网格（镜像处方）则沿列轴重排去镜像。
+
+    注意：该校验设计为转换时执行一次。若对已校正的 NIfTI 用同一批 DICOM
+    重复执行，去镜像重排会再次翻转（网格 handedness 签名不变），请勿重复调用。
+
+    参数:
+        nifti_img: 转换产出的 NIfTI 图像（内存对象）
+        datasets: 该序列的 DICOM 数据集列表（顺序不限，可不含像素）
+        series_name: 序列名（日志用）
+        slice_loader: 可选，按排序后序号返回含像素的 Dataset（探针用）
+
+    返回:
+        (fixed_img, result)：result 含 action/det_t/flip_axis/corr/message 等字段，
+        action ∈ {ok, orientation_mirror_corrected, orientation_not_verifiable, skipped}
+    """
+    result: Dict[str, Any] = {
+        'action': ORIENTATION_CHECK_OK,
+        'fixes': [],
+        'det_t': None,
+        'det_grid': None,
+        'flip_axis': None,
+        'probe_corr': None,
+        'message': ''
+    }
+    try:
+        data = np.asanyarray(nifti_img.dataobj)
+        if data.ndim != 3:
+            result['action'] = ORIENTATION_CHECK_SKIPPED
+            result['message'] = f'non-3D data (ndim={data.ndim}), check skipped'
+            return nifti_img, result
+
+        truth = build_dicom_truth_affine(datasets)
+        if truth is None:
+            result['action'] = ORIENTATION_CHECK_SKIPPED
+            result['message'] = 'missing DICOM geometry tags (IOP/IPP/PixelSpacing), check skipped'
+            return nifti_img, result
+        affine_d, sorted_datasets = truth
+
+        nifti_affine = np.array(nifti_img.affine, dtype=np.float64)
+        T = np.linalg.inv(nifti_affine) @ affine_d
+        perm = _analyze_signed_permutation(T)
+        if perm is None:
+            # T 不是置换矩阵：产出被重采样/插值过，不自动改，记 QC 告警
+            result['action'] = ORIENTATION_CHECK_NOT_VERIFIABLE
+            result['message'] = 'relative transform is not a signed permutation (resampled?)'
+            logger.warning(
+                "[ORIENTATION] %s: T is not a signed permutation, skip auto-fix (QC warning)",
+                series_name
+            )
+            return nifti_img, result
+        perm_matrix, _ = perm
+        det_t = float(np.linalg.det(perm_matrix))
+        result['det_t'] = det_t
+
+        # 探针实测内容布局
+        probe = _probe_content_layout(data, sorted_datasets, slice_loader=slice_loader)
+        layout_matrix = None
+        if probe is not None:
+            layout_matrix, corr = probe
+            result['probe_corr'] = corr
+            # 内容与仿射是否自洽：仿射隐含的布局（T）应等于实测内容布局
+            if not np.allclose(layout_matrix, T, atol=_PERM_TOL, rtol=0):
+                # 不自洽（转换器 bug，如纯 Python 路径面内镜像）：修正仿射匹配实测布局
+                fixed_affine = affine_d @ np.linalg.inv(layout_matrix)
+                nifti_img = _rebuild_nifti(nifti_img, data, fixed_affine)
+                nifti_affine = fixed_affine
+                result['fixes'].append('affine_mismatch')
+                logger.warning(
+                    "[ORIENTATION] %s: content-affine mismatch (probe corr=%.4f), affine corrected",
+                    series_name, corr
+                )
+        else:
+            # 探针无法判定（如空白数据）：信任仿射隐含布局，仅按 handedness 处理
+            layout_matrix = T.copy()
+
+        # 左手性网格 = 镜像处方签名：真值网格（规范排序）在 RAS 下 det>0。
+        # 该签名只取决于 DICOM 几何，与转换器布局惯例无关（实测：
+        # dcm2niix 镜像输出 det(T)<0 即源于此；python 路径仿射修正前后 det 会变，不可用）。
+        # 去镜像：沿列轴（IOP 行方向，G_d axis1，即镜像发生的轴）翻转数据并同步仿射。
+        det_grid = float(np.linalg.det(affine_d[:3, :3]))
+        result['det_grid'] = det_grid
+        if det_grid > 0:
+            # 列轴（G_d axis1）映射到的 NIfTI 轴
+            flip_axis = None
+            for a in range(3):
+                if abs(layout_matrix[a, 1]) > 0.5:
+                    flip_axis = a
+                    break
+            if flip_axis is None:
+                flip_axis = 1
+            new_data, new_affine = _flip_image_axis(
+                np.asanyarray(nifti_img.dataobj), nifti_affine, flip_axis
+            )
+            nifti_img = _rebuild_nifti(nifti_img, new_data, new_affine)
+            result['fixes'].append('mirror_relayout')
+            result['flip_axis'] = int(flip_axis)
+            logger.warning(
+                "[ORIENTATION] %s: mirrored prescription detected (det(grid)=%.1f), "
+                "flipped axis %d to un-mirror content",
+                series_name, det_grid, flip_axis
+            )
+
+        if result['fixes']:
+            result['action'] = ORIENTATION_CHECK_MIRROR_CORRECTED
+            result['message'] = ','.join(result['fixes'])
+        return nifti_img, result
+    except Exception as e:
+        logger.warning("[ORIENTATION] %s: orientation check failed: %s", series_name, e)
+        result['action'] = ORIENTATION_CHECK_SKIPPED
+        result['message'] = f'check error: {e}'
+        return nifti_img, result
+
+
+def verify_and_fix_orientation_file(
+    nifti_path: str,
+    dicom_files: List[str],
+    series_name: str = ''
+) -> Dict[str, Any]:
+    """
+    对已写入磁盘的 NIfTI 文件执行方向一致性校验与校正（dcm2niix 路径）。
+
+    几何标签从全部文件读取（不含像素），像素仅在校验阶段按探针层读取。
+    若发生校正，用临时文件+重命名覆盖原文件。
+
+    返回:
+        verify_and_fix_orientation 的 result 字典
+    """
+    try:
+        # 先只读头（不含像素）构建几何，探针层按需重读像素，避免大序列全量读像素
+        datasets: List[FileDataset] = []
+        readable_files: List[str] = []
+        for filepath in dicom_files:
+            try:
+                datasets.append(pydicom.dcmread(filepath, force=True, stop_before_pixels=True))
+                readable_files.append(filepath)
+            except Exception:
+                continue
+        if not datasets:
+            return {'action': ORIENTATION_CHECK_SKIPPED, 'fixes': [],
+                    'det_t': None, 'det_grid': None, 'flip_axis': None,
+                    'probe_corr': None, 'message': 'no readable DICOM files'}
+        # 与 build_dicom_truth_affine 相同的排序，供探针层定位源文件
+        file_of_dataset = {id(ds): f for ds, f in zip(datasets, readable_files)}
+
+        img = nib.load(nifti_path)
+        # 构造按排序后序号读取探针层像素的 loader；
+        # verify_and_fix_orientation 内部用同一 _canonical_slice_order 排序，顺序一致
+        with_ipp = [(ds, file_of_dataset[id(ds)]) for ds in datasets
+                    if getattr(ds, 'ImagePositionPatient', None) is not None]
+        sorted_files = None
+        if len(with_ipp) == len(datasets) and len(with_ipp) > 1:
+            positions = np.array([[float(v) for v in ds.ImagePositionPatient] for ds, _ in with_ipp])
+            order, _ = _canonical_slice_order(positions)
+            sorted_files = [with_ipp[i][1] for i in order]
+
+        slice_loader = None
+        if sorted_files is not None:
+            def slice_loader(sorted_idx):
+                return pydicom.dcmread(sorted_files[sorted_idx], force=True)
+
+        fixed_img, result = verify_and_fix_orientation(
+            img, datasets, series_name,
+            slice_loader=slice_loader if sorted_files is not None else None
+        )
+        if result.get('fixes'):
+            temp_dir = os.path.dirname(nifti_path)
+            fd, temp_path = tempfile.mkstemp(suffix='.nii.gz', dir=temp_dir)
+            try:
+                os.close(fd)
+                nib.save(fixed_img, temp_path)
+                original_stat = os.stat(nifti_path)
+                shutil.move(temp_path, nifti_path)
+                os.chmod(nifti_path, original_stat.st_mode)
+            finally:
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+        return result
+    except Exception as e:
+        logger.warning("[ORIENTATION] %s: file-level orientation check failed: %s", series_name, e)
+        return {'action': ORIENTATION_CHECK_SKIPPED, 'fixes': [],
+                'det_t': None, 'det_grid': None, 'flip_axis': None,
+                'probe_corr': None, 'message': f'check error: {e}'}
 
 
 def convert_dicom_to_nifti(
@@ -940,6 +1419,13 @@ def convert_with_dcm2niix(
             if nifti_files:
                 logger.info("   ✅ dcm2niix conversion succeeded: %s", nifti_files[0])
 
+                # 方向一致性校验与镜像校正（需在删除 DICOM 之前，依赖其头与像素）
+                orientation_check = verify_and_fix_orientation_file(
+                    os.path.join(series_dir, nifti_files[0]),
+                    dicom_files,
+                    series_name
+                )
+
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
 
                 for file in os.listdir(series_dir):
@@ -956,7 +1442,8 @@ def convert_with_dcm2niix(
                     'method': 'dcm2niix',
                     'modality': modality,
                     'conversion_mode': 'series',
-                    'output_file': nifti_files[0]
+                    'output_file': nifti_files[0],
+                    'orientation_check': orientation_check
                 }
             else:
                 # dcm2niix returncode 为 0 但没有生成文件，记录详细诊断信息
@@ -1248,7 +1735,12 @@ def convert_with_python_libs(
             if iop is not None:
                 nifti_img = nib.as_closest_canonical(nifti_img)
             # 否则：保持原方向，build_affine_from_dicom 已经构建了正确的矩阵
-            
+
+            # 方向一致性校验与镜像校正（内存中完成后再写盘）
+            nifti_img, orientation_check = verify_and_fix_orientation(
+                nifti_img, [dcm], series_name
+            )
+
             output_filename = f"{client._sanitize_folder_name(series_name)}.nii.gz"
 
             if save_to_disk:
@@ -1271,7 +1763,8 @@ def convert_with_python_libs(
                 'method': 'python_libs',
                 'modality': modality,
                 'conversion_mode': 'series',
-                'output_file': output_filename
+                'output_file': output_filename,
+                'orientation_check': orientation_check
             }
             if not save_to_disk:
                 result['nifti_img'] = nifti_img
@@ -1335,12 +1828,17 @@ def convert_with_python_libs(
         affine = build_affine_from_dicom(first_dcm, slice_spacing=slice_spacing, slice_cosines=slice_cosines)
 
         nifti_img = nib.Nifti1Image(volume.astype(np.float32), affine)
-        
+
         # 对于缺少 IOP 的序列，不使用 as_closest_canonical 以避免方向问题
         if iop is not None:
             nifti_img = nib.as_closest_canonical(nifti_img)
         # 否则：保持原方向，build_affine_from_dicom 已经处理了回退方案
-        
+
+        # 方向一致性校验与镜像校正（内存中完成后再写盘）
+        nifti_img, orientation_check = verify_and_fix_orientation(
+            nifti_img, [dcm for _, _, dcm, _ in slice_info], series_name
+        )
+
         output_filename = f"{client._sanitize_folder_name(series_name)}.nii.gz"
 
         if save_to_disk:
@@ -1364,7 +1862,8 @@ def convert_with_python_libs(
             'modality': modality,
             'conversion_mode': 'series',
             'output_file': output_filename,
-            'slice_count': len(slices)
+            'slice_count': len(slices),
+            'orientation_check': orientation_check
         }
         if not save_to_disk:
             result['nifti_img'] = nifti_img
