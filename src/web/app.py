@@ -10,9 +10,35 @@ Flask Web 应用主模块
 - WebSocket 实时通信
 """
 
+# 优先使用 eventlet 异步模式，避免大量 Socket.IO 长轮询连接导致线程爆炸。
+# eventlet 必须在其他库（特别是 threading、socket）导入前完成 monkey_patch。
+try:
+    import eventlet
+    eventlet.monkey_patch()
+    SOCKETIO_ASYNC_MODE = 'eventlet'
+    logger_startup_mode = 'eventlet'
+except ImportError:
+    SOCKETIO_ASYNC_MODE = 'threading'
+    logger_startup_mode = 'threading'
+
 import os
 import sys
 import stat
+
+# 启动时加载项目根目录的 .env（PACS 连接参数、清理阈值等运行时配置）。
+# 关键：必须在创建任何 DICOMDownloadClient、读取任何 os.getenv 之前执行，
+# 否则服务会静默使用代码内的硬编码默认值（如错误的 CALLING_PORT/CALLING_AET），
+# 导致 PACS 无法回传文件（C-MOVE 成功但收不到 C-STORE）。
+# override=False：真实环境变量优先于 .env 文件。
+try:
+    from dotenv import load_dotenv
+    _STARTUP_ENV_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        '.env'
+    )
+    load_dotenv(_STARTUP_ENV_PATH)
+except Exception:
+    pass  # python-dotenv 不可用时回退到代码内默认值
 from concurrent.futures import ThreadPoolExecutor, Future
 from queue import Queue, Empty
 
@@ -126,7 +152,7 @@ def setup_logging():
 logger = setup_logging()
 
 # WebSocket支持
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=SOCKETIO_ASYNC_MODE)
 
 # ============ 任务队列系统配置 ============
 MAX_CONCURRENT_TASKS = 3  # 最大并发任务数
@@ -1954,6 +1980,20 @@ def process_single_task(task):
         task.update_status('failed')
         task.error = error_msg
         task.end_time = time.time()
+
+    except BaseException as e:
+        # eventlet 环境下 GreenletExit / eventlet.Timeout 等 BaseException 会穿透
+        # 上面的 except Exception，导致 worker 静默死亡、任务状态永远停留在 running。
+        # 必须兜底：记录完整堆栈并把任务标记为失败，避免僵尸任务占用运行队列。
+        logger.error(
+            f"任务异常终止(BaseException): {task.task_id}, "
+            f"类型: {type(e).__name__}, 错误: {e}",
+            exc_info=True
+        )
+        task.add_log(f'Process aborted: {type(e).__name__}: {e}', 'error')
+        task.update_status('failed')
+        task.error = f"{type(e).__name__}: {e}"
+        task.end_time = time.time()
     
     finally:
         # 确保登出
@@ -2232,6 +2272,18 @@ def process_batch_task(task):
         task.update_status('failed')
         task.error = str(e)
         task.end_time = time.time()
+
+    except BaseException as e:
+        # 同 process_single_task：兜底捕获 BaseException，避免任务状态永远停留在 running
+        logger.error(
+            f"批量任务异常终止(BaseException): {task.task_id}, "
+            f"类型: {type(e).__name__}, 错误: {e}",
+            exc_info=True
+        )
+        task.add_log(f'Batch process aborted: {type(e).__name__}: {e}', 'error')
+        task.update_status('failed')
+        task.error = f"{type(e).__name__}: {e}"
+        task.end_time = time.time()
     
     finally:
         # 确保登出
@@ -2325,6 +2377,17 @@ def process_upload_task(task):
         task.add_log(f'Upload process error: {str(e)}', 'error')
         task.update_status('failed')
         task.error = str(e)
+        task.end_time = time.time()
+    except BaseException as e:
+        # 同 process_single_task：兜底捕获 BaseException，避免任务状态永远停留在 running
+        logger.error(
+            f"上传任务异常终止(BaseException): {task.task_id}, "
+            f"类型: {type(e).__name__}, 错误: {e}",
+            exc_info=True
+        )
+        task.add_log(f'Upload process aborted: {type(e).__name__}: {e}', 'error')
+        task.update_status('failed')
+        task.error = f"{type(e).__name__}: {e}"
         task.end_time = time.time()
     finally:
         _detach_task_log_handler(task_log_handler)
@@ -2532,5 +2595,14 @@ if __name__ == '__main__':
     logger.info("="*60)
 
     # 启动应用
-    socketio.run(app, host='0.0.0.0', port=5005, debug=False,
-                 allow_unsafe_werkzeug=True, ssl_context=ssl_context)
+    logger.info(f"🧵 SocketIO async mode: {SOCKETIO_ASYNC_MODE}")
+    if SOCKETIO_ASYNC_MODE == 'eventlet':
+        # eventlet 模式：单进程即可处理大量长轮询/WebSocket 连接
+        run_kwargs = dict(host='0.0.0.0', port=5005, debug=False)
+        if ssl_context:
+            run_kwargs['ssl_context'] = ssl_context
+        socketio.run(app, **run_kwargs)
+    else:
+        # threading 模式回退（本地开发、未安装 eventlet 的环境）
+        socketio.run(app, host='0.0.0.0', port=5005, debug=False,
+                     allow_unsafe_werkzeug=True, ssl_context=ssl_context)

@@ -38,7 +38,8 @@ pillow>=10.0.0
 
 # 生产环境部署（可选）
 # gunicorn>=21.0.0
-# eventlet>=0.33.0
+# eventlet 用于 SocketIO 大量长轮询/WebSocket 连接场景，避免线程爆炸
+eventlet>=0.41.0
 
 # 注意: dcm2niix 是外部工具，需要单独安装
 # 在Ubuntu/Debian上: sudo apt-get install dcm2niix

@@ -359,16 +359,18 @@ def resize_with_aspect(img: np.ndarray, aspect_ratio: Optional[float]) -> np.nda
 
 def normalize_2d_preview(img: np.ndarray, target_size: int = 896) -> np.ndarray:
     """
-    标准化 2D 预览图尺寸
+    限制 2D 预览图的最大边长，保持原始长宽比
 
-    将图像缩放并居中放置到目标尺寸的画布上
+    仅当图像最大边超过 target_size 时按比例缩小（DR 图像原始分辨率很高，
+    需要限制预览图大小）；小于 target_size 的图像不做放大，直接返回原图。
+    不再使用居中画布，输出图像与原始 DICOM 图像长宽比一致。
 
     Args:
         img: 输入图像数组
-        target_size: 目标画布尺寸
+        target_size: 最大边长限制
 
     Returns:
-        np.ndarray: 标准化后的图像
+        np.ndarray: 等比缩放后的图像（未超过限制时返回原图）
     """
     try:
         if img is None:
@@ -378,20 +380,17 @@ def normalize_2d_preview(img: np.ndarray, target_size: int = 896) -> np.ndarray:
         if h <= 0 or w <= 0:
             return img
 
+        # 未超过最大边长限制：保持原图，不做任何缩放
+        if max(h, w) <= target_size:
+            return img
+
         scale = float(target_size) / max(h, w)
         new_w = max(1, int(round(w * scale)))
         new_h = max(1, int(round(h * scale)))
 
         pil_img = Image.fromarray(img)
         pil_img = pil_img.resize((new_w, new_h), resample=Image.BILINEAR)
-        resized = np.array(pil_img)
-
-        # 创建画布并居中放置
-        canvas = np.zeros((target_size, target_size), dtype=np.uint8)
-        top = max(0, (target_size - new_h) // 2)
-        left = max(0, (target_size - new_w) // 2)
-        canvas[top:top + new_h, left:left + new_w] = resized
-        return canvas
+        return np.array(pil_img)
     except Exception:
         return img
 
@@ -914,7 +913,7 @@ def _generate_single_preview(
     # 应用纵横比调整
     image_2d = resize_with_aspect(image_2d, aspect_ratio)
     
-    # 2D 图像标准化尺寸（从 .env 读取 PREVIEW_TARGET_SIZE）
+    # 2D 图像限制最大边长，保持原始长宽比（从 .env 读取 PREVIEW_TARGET_SIZE）
     if not is_3d:
         target_size = get_preview_target_size(default=896)
         image_2d = normalize_2d_preview(image_2d, target_size=target_size)

@@ -140,6 +140,21 @@ class AssociationManager:
         return self.connect(max_retries=max_retries, base_delay=base_delay)
 
 
+def _safe_thread_join(thread, timeout=None):
+    """带超时的线程 join，兼容 eventlet。
+
+    eventlet monkey_patch 后，threading.Thread.join(timeout) 在超时时会抛出
+    eventlet.timeout.Timeout（BaseException 子类），与标准库"超时静默返回"
+    的语义不同。该异常会穿透 except Exception，导致调用线程静默死亡
+    （任务状态永远停留在 running）。这里统一捕获，保持标准库语义：
+    超时仅表示线程仍在运行，调用方需自行用 is_alive() 判断。
+    """
+    try:
+        thread.join(timeout=timeout)
+    except BaseException:
+        pass
+
+
 class QueueWatchdog:
     """P2: 队列看门狗，防止死锁"""
 
@@ -157,7 +172,7 @@ class QueueWatchdog:
 
     def stop(self):
         self._stop_event.set()
-        self._thread.join(timeout=1.0)
+        _safe_thread_join(self._thread, timeout=1.0)
 
     def update_activity(self):
         self.last_activity = time.time()
@@ -736,6 +751,7 @@ class DICOMDownloadClient:
             'current_series_files': set(),  # 当前序列接收的文件
             'failed_files': [],  # 失败的文件记录
             'series_uid_to_dir': {},  # SeriesInstanceUID到目录的映射，避免竞态条件
+            'unmapped_uids': set(),  # 已告警过的未注册SeriesInstanceUID，避免刷屏
             'disk_full': False  # 磁盘剩余空间不足标志，触发后快速失败
         }
 
@@ -755,7 +771,9 @@ class DICOMDownloadClient:
                 # 不能使用 storage_state['current_path']，因为它可能被下一个Series的循环修改
                 series_instance_uid = None
                 try:
-                    series_instance_uid = dataset.SeriesInstanceUID
+                    raw_series_uid = dataset.SeriesInstanceUID
+                    # 归一化为纯字符串，避免 pydicom UID 类型/空白差异导致映射查找失败
+                    series_instance_uid = str(raw_series_uid).strip() if raw_series_uid else None
                 except AttributeError:
                     # SeriesInstanceUID 属性不存在，尝试从文件元数据获取
                     logger.warning(f"⚠️  Dataset has no SeriesInstanceUID attribute, SOPInstanceUID={sop_instance_uid[:20]}...")
@@ -768,12 +786,20 @@ class DICOMDownloadClient:
                 if series_instance_uid:
                     series_dir = storage_state['series_uid_to_dir'].get(series_instance_uid)
                     if not series_dir:
-                        # 如果找不到映射，使用当前路径作为fallback（兼容旧行为）
-                        series_dir = storage_state['current_path']
-                        available_uids = list(storage_state['series_uid_to_dir'].keys())
-                        logger.warning(f"⚠️  No directory mapping for Series UID {str(series_instance_uid)[:30]}..., "
-                                       f"available mappings: {len(available_uids)}, "
-                                       f"using current_path: {series_dir}")
+                        # PACS 推送了未在 C-FIND 序列列表中注册的 Series：
+                        # 单独存放到 unmapped_series_* 目录，避免混入其他序列造成数据污染。
+                        # 不再使用 current_path 作为 fallback（会把不同序列混在一起）
+                        series_dir = os.path.join(
+                            output_path, f"unmapped_series_{series_instance_uid[-24:]}"
+                        )
+                        if series_instance_uid not in storage_state['unmapped_uids']:
+                            storage_state['unmapped_uids'].add(series_instance_uid)
+                            available_uids = list(storage_state['series_uid_to_dir'].keys())
+                            logger.warning(
+                                f"⚠️  No directory mapping for Series UID {series_instance_uid}, "
+                                f"available mappings: {len(available_uids)} {available_uids}, "
+                                f"storing separately in: {series_dir}"
+                            )
                 else:
                     # 没有 SeriesInstanceUID，使用当前路径
                     series_dir = storage_state['current_path']
@@ -889,6 +915,8 @@ class DICOMDownloadClient:
                     # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
                     # 这避免了竞态条件：C-STORE可能在下一个Series的循环开始后才到达
                     if series_uid:
+                        # 归一化为纯字符串，与 handle_store 中的查找保持一致
+                        series_uid = str(series_uid).strip()
                         storage_state['series_uid_to_dir'][series_uid] = series_dir
                         logger.debug(f"   Registered series_uid mapping: {series_uid[:20]}... -> {series_dir}")
                     else:
@@ -1031,6 +1059,7 @@ class DICOMDownloadClient:
                                     logger.info(f"   🧹 Cleaned {removed} old file(s) before retrying Series {series_num}")
 
                                 # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
+                                series_uid = str(series_uid).strip()
                                 storage_state['series_uid_to_dir'][series_uid] = series_dir
                                 storage_state['current_path'] = series_dir
                                 storage_state['current_series_uid'] = series_uid
@@ -2156,7 +2185,7 @@ class DICOMDownloadClient:
                 # P0: 不再调用 series_queue.join()（Python Queue.join 无 timeout 参数，会永久等待）
                 # 直接等待 worker 线程完成，带超时
                 for t in organizer_threads:
-                    t.join(timeout=600)
+                    _safe_thread_join(t, timeout=600)
                     if t.is_alive():
                         logger.warning(
                             "Organize worker did not exit within 600s timeout. "
@@ -2238,7 +2267,7 @@ class DICOMDownloadClient:
                 metadata_thread = threading.Thread(target=_metadata_worker, daemon=True)
                 metadata_thread.start()
                 # 带超时等待：元数据提取卡死时不能永久占用任务 worker
-                metadata_thread.join(timeout=600)
+                _safe_thread_join(metadata_thread, timeout=600)
                 if metadata_thread.is_alive():
                     logger.error(
                         "❌ Metadata extraction timed out after 600s, "
