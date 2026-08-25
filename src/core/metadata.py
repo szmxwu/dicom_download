@@ -266,8 +266,8 @@ def extract_dicom_metadata(
         if not dicom_files:
             logger.info(f"[META] No DICOM files in {series_folder}, trying cache")
             cache_path = os.path.join(series_path, "dicom_metadata_cache.json")
+            cache_loaded = False
             if os.path.exists(cache_path):
-                cache_loaded = False
                 cached_records = []
                 try:
                     with open(cache_path, 'r', encoding='utf-8') as f:

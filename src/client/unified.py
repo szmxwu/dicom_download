@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Callable, Any, Tuple
 from types import SimpleNamespace
-from src.core.constants import get_derived_keywords
+from src.core.constants import get_derived_keywords, match_derived_keyword
 from src.core.metadata import extract_dicom_metadata as extract_dicom_metadata_impl
 from src.core.organize import organize_dicom_files as organize_dicom_files_impl
 from src.core.organize import process_single_series as process_single_series_impl
@@ -586,14 +586,11 @@ class DICOMDownloadClient:
 
                                     # 过滤衍生序列：检查SeriesDescription关键词
                                     if not is_derived and series_desc:
-                                        desc_upper = series_desc.upper()
-                                        # 特殊处理：纯数字3D（如 "3D"）或作为单词的一部分
-                                        for keyword in get_derived_keywords():
-                                            # 使用单词边界匹配，避免误判（如 "MP" 匹配 "MPR"）
-                                            if keyword in desc_upper:
-                                                is_derived = True
-                                                logger.debug(f"   Filtered by keyword '{keyword}': {series_desc}")
-                                                break
+                                        # 子串匹配，含例外规则（如 iDose 迭代重建不算衍生）
+                                        matched_kw = match_derived_keyword(series_desc)
+                                        if matched_kw:
+                                            is_derived = True
+                                            logger.debug(f"   Filtered by keyword '{matched_kw}': {series_desc}")
 
                                     if is_derived:
                                         logger.info(f"   🚫 Filtered derived series: {series_desc}")

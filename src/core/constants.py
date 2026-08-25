@@ -30,6 +30,32 @@ DERIVED_IMAGE_TYPE_WHITELIST = [
 # 通过 get_derived_keywords() / set_derived_keywords() 访问
 _runtime_derived_keywords = list(DEFAULT_DERIVED_SERIES_KEYWORDS)
 
+# 关键词匹配的例外表：当 SeriesDescription 同时包含例外子串时，该关键词不判为衍生。
+# 典型场景：Philips iCT 的 iDose 迭代重建序列是诊断序列（ORIGINAL 重建），
+# 但 SeriesDescription 含 "iDose"（如 "201 Chest iDose"），
+# 会被 'DOSE' 关键词误判为剂量报告（Dose Report）衍生序列而被整体剔除。
+DERIVED_KEYWORD_EXCEPTIONS = {
+    'DOSE': ['IDOSE'],
+}
+
+
+def match_derived_keyword(series_desc):
+    """返回 SeriesDescription 命中的衍生序列关键词（含例外规则），未命中返回 None。
+
+    匹配为子串包含（不区分大小写）。命中关键词但同時包含
+    DERIVED_KEYWORD_EXCEPTIONS 中登记的例外子串时，视为未命中。
+    """
+    if not series_desc:
+        return None
+    desc_upper = series_desc.upper()
+    for keyword in get_derived_keywords():
+        if keyword in desc_upper:
+            exceptions = DERIVED_KEYWORD_EXCEPTIONS.get(keyword, ())
+            if any(exc in desc_upper for exc in exceptions):
+                continue
+            return keyword
+    return None
+
 
 def get_derived_keywords():
     """获取当前生效的衍生序列过滤关键词列表。"""

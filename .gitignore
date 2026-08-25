@@ -203,3 +203,5 @@ uploads
 results/
 !results/.gitkeep
 test/*
+offline_packages
+temp

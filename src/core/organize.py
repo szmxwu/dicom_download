@@ -17,7 +17,7 @@ from typing import Dict, List, Any, Optional, Tuple
 logger = logging.getLogger('DICOMApp')
 
 # 从常量模块导入获取当前关键词的函数
-from src.core.constants import get_derived_keywords
+from src.core.constants import get_derived_keywords, match_derived_keyword
 
 
 def _is_derived_series(series_desc: str, image_type=None) -> bool:
@@ -63,11 +63,10 @@ def _is_derived_series(series_desc: str, image_type=None) -> bool:
                 return False
 
     # ImageType 缺失或无法明确判断时，退回到 SeriesDescription 关键词匹配
+    # （含例外规则：如 iDose 迭代重建序列不判为衍生）
     if series_desc:
-        desc_upper = series_desc.upper()
-        for keyword in get_derived_keywords():
-            if keyword in desc_upper:
-                return True
+        if match_derived_keyword(series_desc):
+            return True
     return False
 
 
