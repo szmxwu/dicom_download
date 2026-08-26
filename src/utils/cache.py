@@ -11,9 +11,12 @@ import json
 import os
 import shutil
 import stat
+import threading
 import time
 import logging
 from typing import Optional, Dict
+
+from src.utils.offload import run_cpu_bound
 
 # 使用共享 logger（项目约定），保证缓存步骤的耗时在 app.log 中可见
 logger = logging.getLogger('DICOMApp')
@@ -223,11 +226,9 @@ def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = Non
             f"({n_files} files in {time.time() - t0:.1f}s)"
         )
 
-        # 保存成功后强制执行容量检查（LRU 淘汰），防止缓存无限增长
+        # 保存成功后触发容量检查（LRU 淘汰）。异步执行，不阻塞任务收尾
         try:
-            t1 = time.time()
             enforce_cache_limit(os.path.dirname(cache_dir))
-            logger.debug(f"[CACHE] enforce_cache_limit took {time.time() - t1:.1f}s")
         except Exception as e:
             logger.warning(f"[CACHE] enforce_cache_limit failed: {e}")
 
@@ -240,6 +241,12 @@ def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = Non
 # 缓存容量上限默认值（GB），可通过环境变量 CACHE_MAX_GB 覆盖
 DEFAULT_CACHE_MAX_GB = 20.0
 
+# LRU 淘汰异步执行状态：同时只跑一轮；删除失败的条目记入冷却列表
+_evict_lock = threading.Lock()
+_evict_running = False
+_evict_failures = {}  # path -> 上次失败时间戳
+_EVICT_FAIL_COOLDOWN_SEC = 1800.0  # 30 分钟内不再重试删不掉的条目
+
 
 def get_cache_max_gb() -> float:
     """读取缓存容量上限（GB）。"""
@@ -250,14 +257,62 @@ def get_cache_max_gb() -> float:
         return DEFAULT_CACHE_MAX_GB
 
 
-def enforce_cache_limit(cache_base: str) -> int:
-    """LRU 淘汰：当缓存总大小超过上限时，从最旧访问的条目开始删除。
+def enforce_cache_limit(cache_base: str, async_run: bool = True) -> int:
+    """LRU 淘汰入口：缓存超限时从最旧访问的条目开始删除。
+
+    默认异步执行（后台线程，同时只跑一轮）：淘汰涉及全量目录扫描和大量删除，
+    同步执行会拖慢 save_to_cache（表现为 "Generating results" 阶段卡住数秒~数十秒，
+    尤其存在删不掉的条目时每轮重试都要等待退避）。
 
     Args:
         cache_base: 缓存根目录（results/cache）
+        async_run: True 时立即返回（后台淘汰），False 时同步执行并返回淘汰数量
+    """
+    global _evict_running
+    if not async_run:
+        return _evict_lru_sync(cache_base)
+    with _evict_lock:
+        if _evict_running:
+            return 0
+        _evict_running = True
 
-    Returns:
-        被淘汰的条目数量
+    def _bg():
+        global _evict_running
+        try:
+            # eventlet 下后台线程是 greenlet，磁盘 I/O 不切换会让出不了事件循环；
+            # run_cpu_bound 在 eventlet 下转真实 OS 线程，普通环境下直接调用
+            run_cpu_bound(_evict_lru_sync, cache_base)
+        except Exception as e:
+            logger.warning(f"[CACHE] Background eviction failed: {e}")
+        finally:
+            with _evict_lock:
+                _evict_running = False
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return 0
+
+
+def _find_readonly_file(path: str) -> Optional[str]:
+    """在目录树中找出一个只读文件（用于淘汰失败时的成因诊断），没有则返回 None。"""
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                fp = os.path.join(root, name)
+                try:
+                    if not os.stat(fp).st_mode & stat.S_IWRITE:
+                        return fp
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def _evict_lru_sync(cache_base: str) -> int:
+    """LRU 淘汰同步实现（扫描 + 删除）。
+
+    删除失败的条目记入冷却列表（_evict_failures），冷却期内跳过，
+    避免文件长期被占用（Excel 打开/杀毒扫描/权限问题）时每轮保存都反复重试。
     """
     if not os.path.isdir(cache_base):
         return 0
@@ -292,20 +347,41 @@ def enforce_cache_limit(cache_base: str) -> int:
     entries.sort(key=lambda x: x[0])  # 最旧访问的在前
 
     evicted = 0
+    skipped_locked = 0
+    now = time.time()
     for _atime, size, path in entries:
         if total_bytes <= limit_bytes:
             break
+        # 冷却期内跳过此前删不掉的条目（文件被 Excel/杀毒/索引器占用等）
+        last_fail = _evict_failures.get(path)
+        if last_fail is not None and now - last_fail < _EVICT_FAIL_COOLDOWN_SEC:
+            skipped_locked += 1
+            continue
         try:
             _rmtree_robust(path)
+            _evict_failures.pop(path, None)
             total_bytes -= size
             evicted += 1
             logger.info(f"[CACHE] Evicted: {os.path.basename(path)} ({size / (1024**3):.2f}GB)")
         except Exception as e:
-            logger.warning(f"[CACHE] Failed to evict {path}: {e}")
+            if not os.path.exists(path):
+                # 路径已被其他清理者并发删除（如历史上的 cleanup 守护进程误删 cache）：
+                # 视为淘汰成功，不计入冷却列表
+                _evict_failures.pop(path, None)
+                total_bytes -= size
+                evicted += 1
+                logger.info(f"[CACHE] Evicted (already removed concurrently): {os.path.basename(path)}")
+            else:
+                _evict_failures[path] = now
+                # 附带诊断：区分"只读属性"与"文件被占用/权限"两类成因
+                hint = _find_readonly_file(path)
+                extra = f" [诊断: 存在只读文件 {hint}]" if hint else " [诊断: 非只读问题，文件可能被外部进程(Excel/杀毒/索引器)占用或 ACL 拒绝]"
+                logger.warning(f"[CACHE] Failed to evict {path}: {e}{extra}")
 
-    if evicted:
+    if evicted or skipped_locked:
         logger.info(
             f"[CACHE] LRU eviction done: removed {evicted} entries, "
+            f"skipped {skipped_locked} locked entries (cooldown), "
             f"cache now {total_bytes / (1024**3):.2f}GB (limit {max_gb}GB)"
         )
     return evicted

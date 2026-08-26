@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Callable, Any, Tuple
 from types import SimpleNamespace
-from src.core.constants import get_derived_keywords, match_derived_keyword
+from src.core.constants import get_derived_keywords, match_derived_keyword, is_derived_series
 from src.core.metadata import extract_dicom_metadata as extract_dicom_metadata_impl
 from src.core.organize import organize_dicom_files as organize_dicom_files_impl
 from src.core.organize import process_single_series as process_single_series_impl
@@ -47,6 +47,7 @@ from src.core.qc import assess_image_quality_from_array as assess_image_quality_
 from src.core.qc import assess_converted_file_quality as assess_converted_file_quality_impl
 from src.core.qc import assess_series_quality_converted as assess_series_quality_converted_impl
 from src.core.qc import assess_series_quality as assess_series_quality_impl
+from src.utils.offload import run_cpu_bound
 from pynetdicom import AE, evt, AllStoragePresentationContexts
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
@@ -548,6 +549,9 @@ class DICOMDownloadClient:
                     series_ds.Modality = ""
                     series_ds.ImageType = ""  # 用于区分原始/派生图像
                     series_ds.SliceThickness = ""  # 用于过滤定位像(层厚为NA的)
+                    # SERIES 级属性，与上面的 C-FIND 同一次往返取回，
+                    # 避免历史上为这两个字段再做 N 次逐序列 C-FIND（N+1 问题）
+                    series_ds.NumberOfSeriesRelatedInstances = ""
 
                     responses = assoc.send_c_find(series_ds, StudyRootQueryRetrieveInformationModelFind)
 
@@ -567,34 +571,31 @@ class DICOMDownloadClient:
 
                                 series_desc = str(identifier.SeriesDescription) if hasattr(identifier, 'SeriesDescription') else ''
 
-                                # 过滤衍生序列：检查ImageType是否为DERIVED
-                                is_derived = False
+                                # 过滤衍生序列：ImageType DERIVED 或 SeriesDescription 命中关键词
+                                # （统一判定逻辑见 constants.is_derived_series，接收端首文件也用同一套）
                                 if exclude_derived:
-                                    image_type = getattr(identifier, 'ImageType', None)
-                                    if image_type:
-                                        # ImageType 第一个值才代表像素来源：DERIVED/ORIGINAL。
-                                        # 第二个值 PRIMARY/SECONDARY 是采集上下文，不能用于过滤。
-                                        if isinstance(image_type, (list, tuple)):
-                                            first_val = str(image_type[0]).upper().strip() if image_type else ''
-                                            if first_val == 'DERIVED':
-                                                is_derived = True
-                                        else:
-                                            if 'DERIVED' in str(image_type).upper():
-                                                is_derived = True
-                                        if is_derived:
-                                            logger.debug(f"   Filtered by ImageType (DERIVED): {series_desc}")
-
-                                    # 过滤衍生序列：检查SeriesDescription关键词
-                                    if not is_derived and series_desc:
-                                        # 子串匹配，含例外规则（如 iDose 迭代重建不算衍生）
-                                        matched_kw = match_derived_keyword(series_desc)
-                                        if matched_kw:
-                                            is_derived = True
-                                            logger.debug(f"   Filtered by keyword '{matched_kw}': {series_desc}")
-
+                                    is_derived, derived_reason = is_derived_series(
+                                        series_desc, getattr(identifier, 'ImageType', None)
+                                    )
                                     if is_derived:
-                                        logger.info(f"   🚫 Filtered derived series: {series_desc}")
+                                        logger.info(f"   🚫 Filtered derived series ({derived_reason}): {series_desc}")
                                         continue
+
+                                # 同一次 C-FIND 返回的 SERIES 级属性：实例数与层厚
+                                instance_count = 0
+                                slice_thickness = None
+                                if hasattr(identifier, 'NumberOfSeriesRelatedInstances'):
+                                    try:
+                                        instance_count = int(identifier.NumberOfSeriesRelatedInstances)
+                                    except (ValueError, TypeError):
+                                        instance_count = 0
+                                if hasattr(identifier, 'SliceThickness'):
+                                    try:
+                                        st = identifier.SliceThickness
+                                        if st is not None and str(st).strip():
+                                            slice_thickness = float(st)
+                                    except (ValueError, TypeError):
+                                        slice_thickness = None
 
                                 series_info = dict(study_info)
                                 series_info.update({
@@ -602,83 +603,41 @@ class DICOMDownloadClient:
                                     'SeriesInstanceUID': str(identifier.SeriesInstanceUID),
                                     'SeriesNumber': str(identifier.SeriesNumber) if hasattr(identifier, 'SeriesNumber') else '0',
                                     'SeriesDescription': series_desc if series_desc else 'Unknown',
-                                    'Modality': series_modality
+                                    'Modality': series_modality,
+                                    'NumberOfSeriesRelatedInstances': instance_count,
+                                    'SliceThickness': slice_thickness
                                 })
                                 series_metadata.append(series_info)
 
-                # 如果设置了最小文件数过滤，查询每个Series的Instance数量和层厚
+                # 应用最小文件数与层厚过滤（定位像）
                 # 注意：只对3D模态（CT/MR等）应用此过滤，2D模态（DX/DR等）跳过
-                # 同时过滤掉层厚为NA的序列（通常是定位像/Scout/Topogram）
+                # 实例数/层厚已在 SERIES 级 C-FIND 中取回；PACS 未返回时（0/None）保留，
+                # 交由整理阶段按实际文件数验证
                 if min_series_files and min_series_files > 0:
-                    # 定义3D模态列表（这些模态通常有多个切片文件）
                     volume_modalities = {'CT', 'MR', 'MRI', 'PT', 'NM', 'US'}
 
                     filtered_metadata = []
                     for series_info in series_metadata:
-                        series_uid = series_info.get('SeriesInstanceUID')
-                        study_uid = series_info.get('StudyInstanceUID')
                         series_modality = series_info.get('Modality', '').upper()
 
-                        # 只对3D模态应用文件数过滤
                         if series_modality not in volume_modalities:
                             filtered_metadata.append(series_info)
                             continue
 
-                        # 查询该Series的Instance数量和层厚
-                        instance_ds = Dataset()
-                        instance_ds.QueryRetrieveLevel = "SERIES"
-                        instance_ds.StudyInstanceUID = study_uid
-                        instance_ds.SeriesInstanceUID = series_uid
-                        instance_ds.NumberOfSeriesRelatedInstances = ""
-                        instance_ds.SliceThickness = ""
+                        instance_count = series_info.get('NumberOfSeriesRelatedInstances') or 0
+                        slice_thickness = series_info.get('SliceThickness')
 
-                        responses = assoc.send_c_find(instance_ds, StudyRootQueryRetrieveInformationModelFind)
-
-                        instance_count = 0
-                        slice_thickness = None
-                        for (status, identifier) in responses:
-                            if status and status.Status in [0xFF00, 0xFF01]:
-                                if identifier and hasattr(identifier, 'NumberOfSeriesRelatedInstances'):
-                                    try:
-                                        instance_count = int(identifier.NumberOfSeriesRelatedInstances)
-                                    except (ValueError, TypeError):
-                                        instance_count = 0
-                                # 获取层厚信息
-                                if identifier and hasattr(identifier, 'SliceThickness'):
-                                    try:
-                                        st = identifier.SliceThickness
-                                        if st is not None and str(st).strip():
-                                            slice_thickness = float(st)
-                                    except (ValueError, TypeError):
-                                        slice_thickness = None
-                                break
-
-                        # 检查层厚是否有效（过滤定位像）
-                        # 注意：只有当SliceThickness明确存在且无效(<=0)时才过滤
-                        # 如果PACS没有返回该字段，则不过滤（保留到整理阶段通过实际文件数验证）
+                        # 只有当SliceThickness明确存在且无效(<=0)时才过滤（通常是定位像/Scout/Topogram）
                         if slice_thickness is not None and slice_thickness <= 0:
                             logger.info(f"   🚫 Filtered out Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
                                   f"SliceThickness={slice_thickness} (likely a scout/localizer)")
                             continue
 
-                        # PACS 返回的实例数可能不可靠（某些 PACS 返回 0 或不准确）
-                        # 策略：如果 PACS 返回的实例数 >= min_files，直接保留
-                        # 如果 < min_files 或为 0，仍然保留，让整理阶段根据实际文件数判断
-                        series_info['NumberOfSeriesRelatedInstances'] = instance_count
-                        series_info['SliceThickness'] = slice_thickness
-
-                        if instance_count >= min_series_files:
-                            filtered_metadata.append(series_info)
-                        elif instance_count == 0:
-                            # PACS 返回 0，可能是数据未准备好，保留到整理阶段验证
-                            logger.debug(f"   ⚠️  Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
-                                  f"PACS reports 0 files, will verify during organization")
-                            filtered_metadata.append(series_info)
-                        else:
-                            # PACS 返回少量文件，但仍保留，整理阶段会再次验证实际文件数
+                        if instance_count and instance_count < min_series_files:
                             logger.debug(f"   ⚠️  Series {series_info.get('SeriesNumber')} ({series_info.get('SeriesDescription')}): "
                                   f"PACS reports {instance_count} files < {min_series_files}, will verify during organization")
-                            filtered_metadata.append(series_info)
+
+                        filtered_metadata.append(series_info)
 
                     series_metadata = filtered_metadata
 
@@ -749,7 +708,10 @@ class DICOMDownloadClient:
             'failed_files': [],  # 失败的文件记录
             'series_uid_to_dir': {},  # SeriesInstanceUID到目录的映射，避免竞态条件
             'unmapped_uids': set(),  # 已告警过的未注册SeriesInstanceUID，避免刷屏
-            'disk_full': False  # 磁盘剩余空间不足标志，触发后快速失败
+            'disk_full': False,  # 磁盘剩余空间不足标志，触发后快速失败
+            'recv_filter_decisions': {},  # SeriesInstanceUID -> bool，接收端衍生判定缓存
+            'recv_rejected_series': set(),  # 接收端判定为衍生、直接丢弃不落盘的序列
+            'recv_dropped_files': 0  # 接收端丢弃的文件数
         }
 
         def handle_store(event):
@@ -801,6 +763,30 @@ class DICOMDownloadClient:
                     # 没有 SeriesInstanceUID，使用当前路径
                     series_dir = storage_state['current_path']
 
+                # 接收端早丢弃：C-FIND 可能返回不全（缺 ImageType/SeriesDescription），
+                # 漏网的衍生序列用首文件头部（已在内存，零额外 I/O）再判一次；
+                # 判定拒绝的序列后续文件直接丢弃不落盘、不进转换队列。
+                # 注意 C-STORE 仍返回 0x0000 成功——返回失败码会导致部分 PACS 中止整个 C-MOVE。
+                if exclude_derived and series_instance_uid:
+                    if series_instance_uid in storage_state['recv_rejected_series']:
+                        storage_state['recv_dropped_files'] += 1
+                        return 0x0000
+                    if series_instance_uid not in storage_state['recv_filter_decisions']:
+                        recv_reject, recv_reason = is_derived_series(
+                            getattr(dataset, 'SeriesDescription', None),
+                            getattr(dataset, 'ImageType', None)
+                        )
+                        storage_state['recv_filter_decisions'][series_instance_uid] = recv_reject
+                        if recv_reject:
+                            storage_state['recv_rejected_series'].add(series_instance_uid)
+                            logger.warning(
+                                f"🚫 Rejecting series at receive time ({recv_reason}): "
+                                f"'{getattr(dataset, 'SeriesDescription', '')}' "
+                                f"(SeriesUID ...{series_instance_uid[-24:]}), files will be dropped"
+                            )
+                            storage_state['recv_dropped_files'] += 1
+                            return 0x0000
+
                 filename = f"{sop_instance_uid}.dcm"
                 filepath = os.path.join(series_dir, filename)
 
@@ -824,8 +810,11 @@ class DICOMDownloadClient:
                     return 0xA702
 
                 # 保存文件
+                # 不做全量重编码（pydicom 3.x 默认 enforce_file_format=False，
+                # 2.x 默认 write_like_original=True），原样序列化 CPU 开销低一个量级；
+                # 同时卸载到真实线程，避免 eventlet 事件循环被写盘 CPU 饿死
                 try:
-                    dataset.save_as(filepath, write_like_original=False)
+                    run_cpu_bound(dataset.save_as, filepath)
                 except Exception as e:
                     logger.error(f"❌ Failed to save dataset to {filepath}: {e}")
                     return 0xA700
@@ -1147,6 +1136,12 @@ class DICOMDownloadClient:
         # 打印下载统计
         stats_summary = self.download_stats.get_summary()
         logger.info(f"✅ Download complete! Stats: {stats_summary}")
+        if storage_state['recv_dropped_files'] > 0:
+            logger.info(
+                f"🚫 Receive-time filter dropped {storage_state['recv_dropped_files']} file(s) "
+                f"from {len(storage_state['recv_rejected_series'])} derived series "
+                f"(not written to disk)"
+            )
         logger.info(f"📁 Files saved to: {output_path}")
 
         # 如果有永久失败的序列，记录到文件
@@ -1514,12 +1509,12 @@ class DICOMDownloadClient:
         return convert_dicom_to_nifti_impl(self, series_dir, series_name, dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality)
     
     def _convert_to_npz(self, series_dir, series_name, dicom_files=None, sample_dcm=None, modality=None):
-        """将DICOM序列转换为NPZ格式，并按照要求规范化方向"""
-        return convert_to_npz_impl(self, series_dir, series_name, dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality)
+        """将DICOM序列转换为NPZ格式，并按照要求规范化方向（CPU 密集，eventlet 下卸载到真实线程）"""
+        return run_cpu_bound(convert_to_npz_impl, self, series_dir, series_name, dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality)
 
     def _normalize_and_save_npz(self, nii_path, npz_path):
-        """加载NIfTI，利用DICOM方向信息规范化并保存为NPZ"""
-        return normalize_and_save_npz_impl(nii_path, npz_path)
+        """加载NIfTI，利用DICOM方向信息规范化并保存为NPZ（CPU 密集，eventlet 下卸载到真实线程）"""
+        return run_cpu_bound(normalize_and_save_npz_impl, nii_path, npz_path)
 
     def _cache_metadata_for_series(self, series_dir, series_name, dicom_files, modality):
         """缓存DICOM元数据，避免删除后无法提取标签"""
@@ -1531,7 +1526,9 @@ class DICOMDownloadClient:
 
             read_all = modality in ['DR', 'MG', 'DX', 'CR']
             logger.info(f"[CACHE] Collecting metadata for {series_name}, read_all={read_all}")
-            records = self._collect_metadata_from_dicoms(
+            # CPU/IO 密集（read_all 时解析高分辨率像素），eventlet 下卸载到真实线程
+            records = run_cpu_bound(
+                self._collect_metadata_from_dicoms,
                 dicom_files=dicom_files,
                 series_folder=series_name,
                 modality=modality,
@@ -1739,8 +1736,9 @@ class DICOMDownloadClient:
         return normalize_2d_preview_impl(img, target_size=target_size)
 
     def _generate_series_preview(self, series_dir, series_name, conversion_result, sample_dcm, modality):
-        """为序列生成PNG预览图"""
-        return generate_series_preview_impl(
+        """为序列生成PNG预览图（CPU 密集，eventlet 下卸载到真实线程）"""
+        return run_cpu_bound(
+            generate_series_preview_impl,
             series_dir,
             series_name,
             conversion_result,
@@ -1775,23 +1773,25 @@ class DICOMDownloadClient:
 
     def _assess_converted_file_quality(self, filepath, modality=None, dicom_metadata=None):
         """基于转换后的NPZ/NIfTI文件做质检，返回0/1
-        
+
         Args:
             filepath: 文件路径
             modality: 模态代码 (CT, MR, DX, etc.)，可选
             dicom_metadata: 可选的 DICOM 元数据字典，用于方向错误检测
         """
-        return assess_converted_file_quality_impl(filepath, modality, dicom_metadata=dicom_metadata)
+        # CPU 密集（体数据加载），eventlet 下卸载到真实线程
+        return run_cpu_bound(assess_converted_file_quality_impl, filepath, modality, dicom_metadata=dicom_metadata)
 
     def _assess_series_quality_converted(self, converted_files, modality=None, series_dir=None):
         """对转换后的序列做QC，<=200全量，>200中间±3抽样
-        
+
         Args:
             converted_files: 转换后的文件路径列表
             modality: 模态代码 (CT, MR, DX, etc.)，可选
             series_dir: 序列目录路径，用于检测NIfTI方向错误
         """
-        return assess_series_quality_converted_impl(converted_files, modality, series_dir)
+        # CPU 密集（体数据加载），eventlet 下卸载到真实线程
+        return run_cpu_bound(assess_series_quality_converted_impl, converted_files, modality, series_dir)
 
     def _get_converted_files(self, series_path):
         """获取转换后的NPZ/NIfTI文件列表，优先NPZ"""
@@ -1814,8 +1814,8 @@ class DICOMDownloadClient:
 
 
     def _convert_with_python_libs(self, series_dir, series_name):
-        """使用Python库转换DICOM到NIfTI"""
-        return convert_with_python_libs_impl(self, series_dir, series_name)
+        """使用Python库转换DICOM到NIfTI（CPU 密集，eventlet 下卸载到真实线程）"""
+        return run_cpu_bound(convert_with_python_libs_impl, self, series_dir, series_name)
     
     def extract_dicom_metadata(self, organized_dir, output_excel=None):
         return extract_dicom_metadata_impl(

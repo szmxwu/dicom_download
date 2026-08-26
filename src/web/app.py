@@ -80,7 +80,8 @@ from src.client.unified import DICOMDownloadClient
 from src.utils.packaging import create_result_zip
 from src.utils.cache import (
     get_cache_dir, cache_exists, copy_from_cache,
-    save_to_cache, clear_all_cache, get_cache_stats
+    save_to_cache, clear_all_cache, get_cache_stats,
+    CACHE_DIR_NAME
 )
 from src.core.constants import (
     DEFAULT_DERIVED_SERIES_KEYWORDS,
@@ -305,6 +306,11 @@ def _process_queue():
         # 提交到线程池执行
         def _task_wrapper():
             global _running_task_count
+            # 记录实际开始执行时间：耗时统计从出队这一刻起算，不含排队等待
+            task.start_time = time.time()
+            queue_wait = task.start_time - task.created_at
+            if queue_wait > 1:
+                task.add_log(f'Queue wait: {queue_wait:.0f}s (not counted in processing duration)')
             try:
                 task_func(task)
             except Exception as e:
@@ -567,6 +573,8 @@ def cleanup_old_results():
         try:
             # 扫描所有文件和目录
             for item in os.listdir(results_dir):
+                if item == CACHE_DIR_NAME:
+                    continue  # 缓存目录自管理（LRU），不扫描、不清理
                 item_path = os.path.join(results_dir, item)
                 if os.path.exists(item_path):
                     # 获取最后访问时间
@@ -597,6 +605,13 @@ def cleanup_old_results():
         # 过滤掉正在进行的任务
         items_to_clean = []
         for item in items_to_check:
+            # 缓存目录由 cache.py 自己的 LRU 淘汰管理，严禁在这里删除：
+            # 历史上曾整树删除 38GB 缓存（"删除: cache (38.17GB)"），
+            # 既清空缓存导致重复下载，又与 LRU 淘汰/缓存写入竞争产生
+            # WinError 3（路径被并发删除）/WinError 5（部分删除残留）
+            if item['name'] == CACHE_DIR_NAME:
+                continue
+
             # 检查是否为活跃任务目录
             is_active = False
             for task_id in active_task_ids:
@@ -698,13 +713,32 @@ class ProcessingTask:
         self.steps = []
         self.result = None
         self.error = None
-        self.start_time = time.time()
+        self.created_at = time.time()  # 入队时间
+        self.start_time = None         # 实际开始执行时间（出队后由 _task_wrapper 设置）
         self.end_time = None
         self.logs = []
         self._cancelled = False  # 取消标志
         self._log_buffer = []     # 日志缓冲区，用于批量发送
         self._last_emit_time = 0  # 上次发送时间
         self._emit_interval = 0.5  # 最小发送间隔（秒）
+
+    def get_duration(self):
+        """实际处理时长（秒，不含排队等待）。尚未开始执行时返回 None。
+
+        批量提交时任务可能在队列中排队很久，排队时间不属于下载/处理耗时，
+        否则 web 页面的单检查耗时会严重失真。
+        """
+        if self.start_time is None:
+            return None
+        return (self.end_time or time.time()) - self.start_time
+
+    def get_queue_wait(self):
+        """排队等待时长（秒）。已开始的返回实际等待值，排队中返回到当前为止的等待值。"""
+        if self.start_time is not None:
+            return self.start_time - self.created_at
+        if self.status == 'pending':
+            return time.time() - self.created_at
+        return None
 
     def is_cancelled(self):
         """检查任务是否被取消"""
@@ -1036,7 +1070,9 @@ def get_task_status(task_id):
         'logs': task.logs,
         'result': task.result,
         'error': task.error,
-        'duration': (task.end_time or time.time()) - task.start_time
+        # 实际处理时长（不含排队等待）；排队中为 null
+        'duration': task.get_duration(),
+        'queue_wait': task.get_queue_wait()
     })
 
 @app.route('/api/queue/status')
@@ -1073,7 +1109,7 @@ def get_queue_status():
 
 def _serialize_task_history(task: 'ProcessingTask') -> dict:
     result = task.result or {}
-    duration = (task.end_time or time.time()) - task.start_time
+    duration = task.get_duration()
     summary = ''
 
     if task.task_type == 'single':
@@ -1089,9 +1125,10 @@ def _serialize_task_history(task: 'ProcessingTask') -> dict:
         'task_type': task.task_type,
         'status': task.status,
         'summary': summary,
-        'start_time': task.start_time,
+        'start_time': task.start_time if task.start_time is not None else task.created_at,
         'end_time': task.end_time,
-        'duration': duration,
+        'duration': duration,  # 实际处理时长，不含排队等待；未开始执行为 None
+        'queue_wait': task.get_queue_wait(),
         'has_excel': bool(result.get('excel_file')),
         'has_zip': bool(result.get('result_zip') or result.get('zip_file')),
         'series_count': len(result.get('series_info', {}) or {}) if isinstance(result.get('series_info'), dict) else result.get('series_count', 0)
@@ -1113,7 +1150,7 @@ def _parse_pagination_param(value, default, min_value=1, max_value=None):
 
 def _refresh_completed_cache_from_tasks():
     completed_tasks = [t for t in processing_tasks.values() if t.status == 'completed']
-    completed_tasks.sort(key=lambda x: x.end_time or x.start_time, reverse=True)
+    completed_tasks.sort(key=lambda x: x.end_time or x.start_time or x.created_at, reverse=True)
     with _completed_tasks_lock:
         _completed_tasks_cache.clear()
         _completed_tasks_cache.extend(completed_tasks)
@@ -1477,8 +1514,10 @@ def get_system_monitoring():
                     'status': task.status,
                     'progress': task.progress,
                     'current_step': task.current_step,
-                    'start_time': task.start_time,
-                    'elapsed_seconds': round(time.time() - task.start_time, 1) if task.start_time else None,
+                    'start_time': task.start_time if task.start_time is not None else task.created_at,
+                    # 运行中显示实际处理时长；排队中显示已等待时长
+                    'elapsed_seconds': round(time.time() - (task.start_time if task.start_time is not None else task.created_at), 1),
+                    'queue_wait_seconds': round(task.get_queue_wait(), 1) if task.get_queue_wait() is not None else None,
                     'parameters': {
                         'accession_number': task.parameters.get('accession_number', 'N/A') if task.task_type == 'single' else None,
                         'batch_count': len(task.parameters.get('accession_numbers', [])) if task.task_type == 'batch' else None
@@ -1532,7 +1571,8 @@ def get_system_monitoring():
                     'accession_number': accession_number,
                     'error_summary': error_summary,
                     'end_time': task.end_time,
-                    'elapsed_seconds': round(task.end_time - task.start_time, 1) if task.end_time and task.start_time else None
+                    # 实际处理时长，不含排队等待；排队中就被取消/失败的为 None
+                    'elapsed_seconds': round(task.get_duration(), 1) if task.get_duration() is not None else None
                 })
         # 按结束时间排序，取最近10个
         all_tasks.sort(key=lambda x: x.get('end_time') or 0, reverse=True)
@@ -2237,8 +2277,8 @@ def process_batch_task(task):
                         total_images += file_count
                         quality_stats['unknown'] += file_count
         
-        # 计算处理时间
-        duration = (task.end_time or time.time()) - task.start_time
+        # 计算处理时间（不含排队等待）
+        duration = task.get_duration() or 0.0
         avg_speed = total_images / duration if duration > 0 else 0
         
         task.result = {

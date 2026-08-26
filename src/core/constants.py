@@ -103,6 +103,34 @@ def match_derived_keyword(series_desc):
     return None
 
 
+def is_derived_series(series_desc, image_type):
+    """统一的衍生序列判定：ImageType 首值为 DERIVED，或 SeriesDescription 命中关键词。
+
+    查询阶段（C-FIND identifier）与接收阶段（C-STORE 首文件 dataset）共用同一套
+    规则，避免两处逻辑漂移。
+
+    Args:
+        series_desc: SeriesDescription 字符串（可为 None/空）
+        image_type: ImageType 值（pydicom MultiValue / list / str / None）
+
+    Returns:
+        (is_derived: bool, reason: str)；未判为衍生时 reason 为空串。
+    """
+    if image_type:
+        # ImageType 第一个值才代表像素来源：DERIVED/ORIGINAL。
+        # 第二个值 PRIMARY/SECONDARY 是采集上下文，不能用于过滤。
+        if isinstance(image_type, (list, tuple)):
+            first_val = str(image_type[0]).upper().strip() if image_type else ''
+            if first_val == 'DERIVED':
+                return True, 'ImageType=DERIVED'
+        elif 'DERIVED' in str(image_type).upper():
+            return True, 'ImageType=DERIVED'
+    matched_kw = match_derived_keyword(series_desc)
+    if matched_kw:
+        return True, f"keyword '{matched_kw}'"
+    return False, ''
+
+
 def get_derived_keywords():
     """获取当前生效的衍生序列过滤关键词列表。"""
     return _runtime_derived_keywords

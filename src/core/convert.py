@@ -36,6 +36,8 @@ import numpy as np
 import pydicom
 from pydicom.dataset import FileDataset
 
+from src.utils.offload import run_cpu_bound
+
 if TYPE_CHECKING:
     from src.client.unified import DICOMDownloadClient as DicomClient
 
@@ -1420,7 +1422,9 @@ def convert_with_dcm2niix(
                 logger.info("   ✅ dcm2niix conversion succeeded: %s", nifti_files[0])
 
                 # 方向一致性校验与镜像校正（需在删除 DICOM 之前，依赖其头与像素）
-                orientation_check = verify_and_fix_orientation_file(
+                # CPU 密集（全量体数据缩放），eventlet 下需卸载到真实线程避免饿死事件循环
+                orientation_check = run_cpu_bound(
+                    verify_and_fix_orientation_file,
                     os.path.join(series_dir, nifti_files[0]),
                     dicom_files,
                     series_name
