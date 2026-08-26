@@ -6,15 +6,40 @@
 """
 
 # 衍生序列关键词列表（默认值）
-# 用于在 PACS 查询阶段和整理阶段过滤 MPR/MIP/3D 重建等衍生序列
+# 用于在 PACS 查询阶段和整理阶段过滤 MPR/MIP/3D 重建等衍生序列。
+#
+# 维护原则（2026-08 厂商命名调研后确立）：
+# - 各厂商迭代/深度学习重建（Philips iDose/IMR、GE ASIR(-V)/MBIR/TrueFidelity、
+#   Siemens SAFIRE/ADMIRE、Canon AIDR 3D/FIRST/AiCE、联影 KARL/DELTA、
+#   东软 ClearView/ClearInfinity、富士 IPV、赛诺威盛 iDream）均为 ORIGINAL
+#   诊断序列，不得出现在本列表中；其命名与下列关键词的子串碰撞通过
+#   DERIVED_KEYWORD_EXCEPTIONS 例外表解决。
+# - 短子串关键词（REF/LOC/KEY/SUM/VR 等）有误伤面，新增关键词前先排查
+#   是否会命中真实诊断序列命名。
+# - 'nodule' 曾在此列表中但为小写（匹配时 desc 会 upper 化，关键词不会），
+#   属于从未生效的死代码；且会误伤 "Lung Nodule FU" 等肺结节随访诊断协议。
+#   uAI_nodule_feature 等 AI 输出由 'AI_' 覆盖，故裸 'nodule' 已移除。
+#
+# 本院真实数据实证（2026-08）：
+# - 联影 uAI 肺结节 AI 输出：SeriesDescription="uAI_nodule_feature"，
+#   ImageType=DERIVED\SECONDARY\OTHER\UAI，Modality=CT，SOPClass=Secondary Capture，
+#   设备 uCT 760 —— ImageType 过滤与 'AI_' 关键词均可命中。
+# - 联影 MR 定位像：SeriesDescription 关键词为 "scout" —— 由 'SCOUT' 覆盖。
 DEFAULT_DERIVED_SERIES_KEYWORDS = [
     'MPR', 'MIP', 'MINIP', 'SSD', 'VRT', 'VR',
     'CPR', 'CURVED', 'THICK',
-    'SCOUT', 'TOPOGRAM', 'SURVEY',
+    'SCOUT', 'TOPOGRAM', 'SURVEY', 'SURVIEW', 'SCANOGRAM',
+    'PILOT', 'LOCALIZER', '定位像',
     'REF', 'REFERENCE', 'LOC', 'BATCH',
     'AVERAGE', 'SUM', 'REFORMAT',
-    'PROJECTION', 'RAYSUM', 'KEY', 'ROI','DOSE',
-    'TRACKER',"nodule","AI_"
+    'PROJECTION', 'RAYSUM', 'KEY', 'ROI', 'DOSE',
+    'TRACKER', 'AI_',
+    # 以下为有实证的新增附属序列命名（2026-08 调研）：
+    'SCREEN SAVE', 'SCREENSAVE',   # 剂量/报告截屏（Secondary Capture）
+    'RDSR',                        # Radiation Dose Structured Report
+    'SMARTPREP', 'SMART PREP',     # GE 团注追踪监测序列
+    'BOLUS TRACK',                 # 团注监测序列（注意不过滤裸 'BOLUS'，避免误伤 DCE 命名）
+    'MPR COLLECTION', 'CASCORING', # Siemens 派生重建输出
 ]
 
 # 当 ImageType[0] == 'DERIVED' 时，部分临床有意义的序列不应被过滤。
@@ -35,25 +60,46 @@ _runtime_derived_keywords = list(DEFAULT_DERIVED_SERIES_KEYWORDS)
 # 但 SeriesDescription 含 "iDose"（如 "201 Chest iDose"），
 # 会被 'DOSE' 关键词误判为剂量报告（Dose Report）衍生序列而被整体剔除。
 DERIVED_KEYWORD_EXCEPTIONS = {
-    'DOSE': ['IDOSE'],
+    # DOSE 的本意是过滤剂量报告（Dose Report / Dose Info / Screen Save）。
+    # 以下例外均为诊断序列或设备技术品牌名：
+    'DOSE': [
+        'IDOSE',                 # Philips iDose 迭代重建（已发生生产事故）
+        'IDREAM',                # 赛诺威盛 iDream 迭代重建（全称含 Dose Reduction）
+        'DOSE REDUCTION',        # 迭代重建全称写法（Adaptive Iterative Dose Reduction 等）
+        'AIDR',                  # Canon AIDR (Adaptive Iterative Dose Reduction) 若写全称
+        'DOSERIGHT',             # Philips DoseRight AEC 技术名
+        'DOSE4D',                # Siemens CARE Dose4D 管电流调制技术名
+        'SMARTDOSE',             # GE SmartDose 技术名
+        'LOW DOSE', 'LOW-DOSE', 'LOWDOSE',  # 低剂量肺筛诊断序列（如 "Low Dose Chest"）
+    ],
+    # THICK 的本意是过滤厚层 MPR 重建，但厚块 MRCP（thick-slab）是核心诊断序列
+    'THICK': ['MRCP'],
+    # LOC 的本意是过滤定位像（Localizer），但会命中 veLOCity（Philips QFlow 等
+    # 相位对比血流定量诊断序列）
+    'LOC': ['VELOCITY'],
+    # KEY 的本意是过滤 Key Images（关键图像标记），但会命中 keyhole 采集技术
+    # （4D 动态增强 MRA，如 Philips 4D-TRAK keyhole）
+    'KEY': ['KEYHOLE'],
 }
 
 
 def match_derived_keyword(series_desc):
     """返回 SeriesDescription 命中的衍生序列关键词（含例外规则），未命中返回 None。
 
-    匹配为子串包含（不区分大小写）。命中关键词但同時包含
-    DERIVED_KEYWORD_EXCEPTIONS 中登记的例外子串时，视为未命中。
+    匹配为子串包含（不区分大小写，desc 与关键词两侧都会归一化）。
+    命中关键词但同时包含 DERIVED_KEYWORD_EXCEPTIONS 中登记的例外子串时，
+    视为未命中。
     """
     if not series_desc:
         return None
     desc_upper = series_desc.upper()
     for keyword in get_derived_keywords():
-        if keyword in desc_upper:
-            exceptions = DERIVED_KEYWORD_EXCEPTIONS.get(keyword, ())
+        kw_upper = keyword.upper()  # 关键词侧也归一化（历史上混入过小写关键词导致死代码）
+        if kw_upper in desc_upper:
+            exceptions = DERIVED_KEYWORD_EXCEPTIONS.get(kw_upper, ())
             if any(exc in desc_upper for exc in exceptions):
                 continue
-            return keyword
+            return kw_upper
     return None
 
 

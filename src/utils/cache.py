@@ -10,12 +10,69 @@ import hashlib
 import json
 import os
 import shutil
+import stat
+import time
 import logging
 from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
 CACHE_DIR_NAME = "cache"
+
+
+def _rmtree_onerror(func, path, exc_info):
+    """shutil.rmtree 的 onerror 回调：处理 Windows 只读文件/目录（WinError 5）。
+
+    去除只读属性后重试同一操作；仍失败则重新抛出原异常，交给上层重试。
+    """
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        func(path)
+        return
+    except Exception:
+        pass
+    raise exc_info[1]
+
+
+def _rmtree_robust(path: str, retries: int = 3, delay: float = 1.0) -> None:
+    """Windows 兼容的目录删除。
+
+    - 只读文件/目录：自动去除只读属性（WinError 5）
+    - 文件被临时占用（WinError 32，如杀毒软件/Windows 索引器正在扫描）
+      或目录暂时非空（WinError 145）：退避重试
+    - 最后一次仍失败则抛出异常，由调用方记录
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(path, onerror=_rmtree_onerror)
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                logger.debug(
+                    f"[CACHE] rmtree {path} attempt {attempt + 1}/{retries} failed: {e}, retrying..."
+                )
+                time.sleep(delay)
+    raise last_err
+
+
+def _remove_file_robust(path: str, retries: int = 3, delay: float = 1.0) -> None:
+    """与 _rmtree_robust 同理的单文件删除（去只读 + 占用重试）。"""
+    for attempt in range(retries):
+        try:
+            os.remove(path)
+            return
+        except PermissionError:
+            # WinError 5（只读）/ WinError 32（被占用）：去只读后重试
+            try:
+                os.chmod(path, stat.S_IWRITE)
+            except OSError:
+                pass
+        if attempt < retries - 1:
+            time.sleep(delay)
+    # 最终一次，让原始异常抛出给调用方记录
+    os.remove(path)
 
 
 def _sanitize_accession(accession_number: str) -> str:
@@ -72,11 +129,11 @@ def copy_from_cache(cache_dir: str, target_dir: str, task_id: str) -> Dict:
     logger.info(f"[CACHE] Copying from cache: {cache_dir} -> {target_dir}")
 
     if os.path.exists(target_organized):
-        shutil.rmtree(target_organized)
+        _rmtree_robust(target_organized)
     shutil.copytree(organized_dir, target_organized)
 
     if os.path.exists(target_zip):
-        os.remove(target_zip)
+        _remove_file_robust(target_zip)
     shutil.copy2(zip_file, target_zip)
 
     # 复制 Excel 到目标 organized 目录
@@ -107,7 +164,7 @@ def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = Non
     """将任务结果保存到缓存目录。"""
     try:
         if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir)
+            _rmtree_robust(cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
 
         cache_organized = os.path.join(cache_dir, "organized")
@@ -116,7 +173,7 @@ def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = Non
 
         # 复制 organized 目录
         if os.path.exists(cache_organized):
-            shutil.rmtree(cache_organized)
+            _rmtree_robust(cache_organized)
         if os.path.isdir(source_dir):
             shutil.copytree(source_dir, cache_organized)
 
@@ -201,7 +258,7 @@ def enforce_cache_limit(cache_base: str) -> int:
         if total_bytes <= limit_bytes:
             break
         try:
-            shutil.rmtree(path)
+            _rmtree_robust(path)
             total_bytes -= size
             evicted += 1
             logger.info(f"[CACHE] Evicted: {os.path.basename(path)} ({size / (1024**3):.2f}GB)")
@@ -232,12 +289,12 @@ def clear_all_cache(results_base_dir: str) -> Dict:
             try:
                 if os.path.isdir(item_path):
                     size = _get_dir_size(item_path)
-                    shutil.rmtree(item_path)
+                    _rmtree_robust(item_path)
                     freed_bytes += size
                     cleared += 1
                 elif os.path.isfile(item_path):
                     size = os.path.getsize(item_path)
-                    os.remove(item_path)
+                    _remove_file_robust(item_path)
                     freed_bytes += size
                     cleared += 1
             except Exception as e:
