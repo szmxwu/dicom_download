@@ -205,3 +205,5 @@ results/
 test/*
 offline_packages
 temp
+.qoder
+.mimocode

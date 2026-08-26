@@ -1507,7 +1507,7 @@ class DICOMProcessor {
         
         // 更新日志
         if (data.logs && data.logs.length > 0) {
-            this.updateLogs(data.logs);
+            this.updateLogs(data.logs, data.logs_total);
         }
 
         // 如果任务完成
@@ -1622,7 +1622,7 @@ class DICOMProcessor {
     }
 
     // 更新日志 - 增量更新优化
-    updateLogs(logs) {
+    updateLogs(logs, logsTotal) {
         const logContainer = document.getElementById('logContainer');
         if (!logContainer) return;
 
@@ -1641,11 +1641,15 @@ class DICOMProcessor {
             logContainer.innerHTML = '';
         }
 
-        // 获取当前已显示的日志数量
-        const currentLogCount = logContainer.querySelectorAll('.log-entry').length;
-        
-        // 只添加新日志（增量更新）
-        const newLogs = logs.slice(currentLogCount);
+        // 服务端只回传最近 N 条（窗口）。用全量总数做窗口对齐的增量渲染：
+        // rendered 为已渲染的全局序号，窗口起始序号 = total - logs.length，
+        // 两者之差即为本窗口中尚未渲染的起始下标
+        const total = logsTotal || logs.length;  // 兼容未提供 logs_total 的旧服务端
+        const windowStart = total - logs.length;
+        const rendered = this._renderedLogCount || 0;
+        const startIdx = Math.max(0, rendered - windowStart);
+        const newLogs = logs.slice(startIdx);
+        this._renderedLogCount = total;
         
         newLogs.forEach(log => {
             const logEntry = document.createElement('div');
@@ -1673,6 +1677,7 @@ class DICOMProcessor {
 
     // 清空日志
     clearLogs() {
+        this._renderedLogCount = 0;
         const logContainer = document.getElementById('logContainer');
         if (logContainer) {
             logContainer.innerHTML = '<div class="text-muted text-center p-3">等待处理开始...</div>';

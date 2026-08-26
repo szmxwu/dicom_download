@@ -11,6 +11,10 @@ DICOM 下载与处理系统
 try:
     import eventlet
     eventlet.monkey_patch()
+    # logging 必须使用真实 OS 锁：green 锁被 tpool 真实线程触碰会导致
+    # greenlet.error（跨线程切换）且唤醒丢失 → greenlet 永久卡死
+    from src.utils.offload import fix_logging_locks_for_eventlet
+    fix_logging_locks_for_eventlet()
 except ImportError:
     pass
 

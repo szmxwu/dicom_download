@@ -21,6 +21,21 @@ except ImportError:
     SOCKETIO_ASYNC_MODE = 'threading'
     logger_startup_mode = 'threading'
 
+# logging 的锁必须是真实 OS 锁：monkey_patch 会把 threading.RLock 换成 green 锁，
+# 而 tpool 真实线程（run_cpu_bound 卸载的 CPU 密集代码）里的 logger 调用会在真实
+# 线程上注册 green waiter，事件循环唤醒时报 greenlet.error 且唤醒丢失 → greenlet
+# 永久卡死（曾导致 C-MOVE 假死、_cmove_lock 永久占用、全服务无响应）。
+# 注意：不能 `from src.utils.offload import ...`——app.py 必须先完成 monkey_patch
+# 才能 import src 包，这里用函数内延迟导入。
+def _fix_logging_locks_for_eventlet():
+    try:
+        from src.utils.offload import fix_logging_locks_for_eventlet
+        fix_logging_locks_for_eventlet()
+    except Exception:
+        pass
+
+_fix_logging_locks_for_eventlet()
+
 import os
 import sys
 import stat
@@ -147,7 +162,19 @@ def setup_logging():
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-    
+
+    # 把 pynetdicom 的日志（DIMSE 超时、关联中止、C-STORE 错误等）并入 app.log。
+    # 历史上 pynetdicom 只写自己的 logger，DIMSE 超时等关键事件在 app.log 中完全
+    # 不可见，极大增加假死问题的定位难度。
+    # 级别设为 WARNING：DIMSE 超时/关联异常都是 ERROR/WARNING，不会漏；
+    # INFO 级含每个 C-STORE 一行（"Received Store Request"），会刷屏。
+    for _pynetdicom_logger_name in ('pynetdicom', 'pynetdicom.dimse', 'pynetdicom.association', 'pynetdicom.events'):
+        _pl = logging.getLogger(_pynetdicom_logger_name)
+        _pl.setLevel(logging.WARNING)
+        if file_handler not in _pl.handlers:
+            _pl.addHandler(file_handler)
+        _pl.propagate = False
+
     return logger
 
 logger = setup_logging()
@@ -779,7 +806,8 @@ class ProcessingTask:
                 'status': self.status,
                 'progress': self.progress,
                 'current_step': self.current_step,
-                'logs': self.logs[-100:]  # 发送最新100条日志，确保前端能看到完整历史
+                'logs': self.logs[-100:],  # 发送最新100条日志，确保前端能看到完整历史
+                'logs_total': len(self.logs)  # 全量条数，供前端做窗口对齐的增量渲染
             })
         except Exception as e:
             logger.error(f"WebSocket发送失败: {str(e)}")
@@ -1067,7 +1095,10 @@ def get_task_status(task_id):
         'progress': task.progress,
         'current_step': task.current_step,
         'steps': task.steps,
-        'logs': task.logs,
+        # 只返回最近 500 条日志：批量下载时 logs 可积累数万条，
+        # 全量序列化会在 eventlet 单线程上长时间占用 CPU，拖垮整个 Web 层
+        'logs': task.logs[-500:],
+        'logs_total': len(task.logs),
         'result': task.result,
         'error': task.error,
         # 实际处理时长（不含排队等待）；排队中为 null
