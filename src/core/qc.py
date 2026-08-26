@@ -122,12 +122,13 @@ class QCConfig:
         'CT': {
             'dynamic_range_min': 20.0,
             'std_min': 5.0,
-            'unique_ratio_min': 0.01,
+            'unique_count_min': 32.0,  # 3D 体数据用绝对唯一值计数（ratio 随体积增大失真）
         },
         'MR': {
-            'dynamic_range_min': 15.0,
-            'std_min': 5.0,
-            'unique_ratio_min': 0.008,
+            # MR 信号为任意单位，绝对阈值不可靠，改用相对阈值（相对 p98/mean）
+            'dynamic_range_rel_min': 0.01,   # DR < 1% * p98 判低动态范围
+            'std_rel_min': 0.005,            # std < 0.5% * mean 判低对比度
+            'unique_count_min': 32.0,        # 组织像素唯一值 < 32 判低复杂度
         },
     }
     
@@ -308,15 +309,21 @@ def is_segmentation_mask(
         labeled_array, num_components = ndimage.label(top_value_mask)
 
         # 判断是否为分割图
+        # 分割掩码必为近二值图（极少唯一值）；真实 X 光片即使存在大片直接曝光区
+        # （近最大值、单连通域），灰度分布也是连续的，用唯一值计数排除这类误报
+        n_unique = len(np.unique(slice_data))
         has_bright_area = bright_ratio > bright_threshold
         is_continuous = num_components <= max_components_threshold
-        is_seg = has_bright_area and is_continuous
+        is_near_binary = n_unique <= 64
+        is_seg = has_bright_area and is_continuous and is_near_binary
 
         details = {
             'bright_ratio': round(bright_ratio, 4),
             'bright_threshold': bright_threshold,
             'num_components': int(num_components),
             'max_components_threshold': max_components_threshold,
+            'unique_count': int(n_unique),
+            'is_near_binary': is_near_binary,
             'has_bright_area': has_bright_area,
             'is_continuous': is_continuous,
             'value_range': [round(min_val, 2), round(max_val, 2)],
@@ -503,7 +510,8 @@ def assess_image_quality_from_array(
         p2, p98 = np.percentile(tissue_flat, [p_low, p_high])
         dynamic_range = p98 - p2
         std = float(np.std(tissue_flat))
-        unique_ratio = len(np.unique(tissue_flat)) / max(1, tissue_flat.size)
+        unique_count = len(np.unique(tissue_flat))
+        unique_ratio = unique_count / max(1, tissue_flat.size)
         mean_val = float(np.mean(tissue_flat))
         range_eps = max(dynamic_range, 1e-6)
 
@@ -511,6 +519,7 @@ def assess_image_quality_from_array(
             'dynamic_range': round(dynamic_range, 2),
             'std': round(std, 2),
             'unique_ratio': round(unique_ratio, 4),
+            'unique_count': int(unique_count),
             'mean_val': round(mean_val, 2),
             'p2': round(p2, 2),
             'p98': round(p98, 2),
@@ -529,23 +538,58 @@ def assess_image_quality_from_array(
             )
 
         # 质量判定规则（使用模态特定阈值）
-        dynamic_range_min = thresholds.get('dynamic_range_min', 20.0)
-        std_min = thresholds.get('std_min', 5.0)
-        unique_ratio_min = thresholds.get('unique_ratio_min', 0.01)
-        
-        if dynamic_range < dynamic_range_min:
-            reasons.append(QualityReasons.DYNAMIC_RANGE_LOW)
-            metrics['dynamic_range_threshold'] = dynamic_range_min
+        if modality == 'MR':
+            # MR 信号为任意单位，绝对阈值会造成大量误报（实测正常 MR 72% 被误判），
+            # 改用相对阈值：DR 相对 p98、std 相对 mean、唯一值用绝对计数。
+            dr_threshold = max(2.0, thresholds.get('dynamic_range_rel_min', 0.01) * abs(p98))
+            std_threshold = max(0.5, thresholds.get('std_rel_min', 0.005) * abs(mean_val))
+            if dynamic_range < dr_threshold:
+                reasons.append(QualityReasons.DYNAMIC_RANGE_LOW)
+                metrics['dynamic_range_threshold'] = round(dr_threshold, 2)
+            if std < std_threshold:
+                reasons.append(QualityReasons.CONTRAST_LOW)
+                metrics['std_threshold'] = round(std_threshold, 2)
+            unique_count_min = thresholds.get('unique_count_min', 32.0)
+            if unique_count < unique_count_min:
+                reasons.append(QualityReasons.COMPLEXITY_LOW)
+                metrics['unique_count_threshold'] = unique_count_min
+        elif modality == 'CT':
+            # CT 为 HU 校准单位，DR/std 保留绝对阈值；
+            # unique_ratio 随体数据像素数增大而失真，改用绝对唯一值计数
+            dynamic_range_min = thresholds.get('dynamic_range_min', 20.0)
+            std_min = thresholds.get('std_min', 5.0)
+            if dynamic_range < dynamic_range_min:
+                reasons.append(QualityReasons.DYNAMIC_RANGE_LOW)
+                metrics['dynamic_range_threshold'] = dynamic_range_min
+            if std < std_min:
+                reasons.append(QualityReasons.CONTRAST_LOW)
+                metrics['std_threshold'] = std_min
+            unique_count_min = thresholds.get('unique_count_min', 32.0)
+            if unique_count < unique_count_min:
+                reasons.append(QualityReasons.COMPLEXITY_LOW)
+                metrics['unique_count_threshold'] = unique_count_min
+        else:
+            # 2D 模态（DX/DR/MG/CR 等）保持原有绝对阈值规则
+            dynamic_range_min = thresholds.get('dynamic_range_min', 20.0)
+            std_min = thresholds.get('std_min', 5.0)
+            unique_ratio_min = thresholds.get('unique_ratio_min', 0.01)
 
-        if std < std_min:
-            reasons.append(QualityReasons.CONTRAST_LOW)
-            metrics['std_threshold'] = std_min
+            if dynamic_range < dynamic_range_min:
+                reasons.append(QualityReasons.DYNAMIC_RANGE_LOW)
+                metrics['dynamic_range_threshold'] = dynamic_range_min
 
-        if unique_ratio < unique_ratio_min:
-            reasons.append(QualityReasons.COMPLEXITY_LOW)
-            metrics['unique_ratio_threshold'] = unique_ratio_min
+            if std < std_min:
+                reasons.append(QualityReasons.CONTRAST_LOW)
+                metrics['std_threshold'] = std_min
+
+            if unique_ratio < unique_ratio_min:
+                reasons.append(QualityReasons.COMPLEXITY_LOW)
+                metrics['unique_ratio_threshold'] = unique_ratio_min
 
         # 检测过曝和欠曝（基于组织像素，排除背景）
+        # 仅对 2D 放射摄影模态（DX/DR/MG/CR/RF）启用：曝光是 X 光摄影概念。
+        # MR 信号为任意单位且体数据包含空气/骨皮质/噪声本底等天然低信号像素，
+        # CT 为 HU 单位且空气占大比例，low_ratio 对二者都会产生系统性误报。
         low_thresh = p2 + 0.01 * range_eps
         high_thresh = p98 - 0.01 * range_eps
         low_ratio = float(np.mean(tissue_flat <= low_thresh))
@@ -557,14 +601,15 @@ def assess_image_quality_from_array(
         low_ratio_threshold = thresholds.get('low_ratio_threshold', 0.6)
         high_ratio_threshold = thresholds.get('high_ratio_threshold', 0.6)
 
-        under_exposed = mean_val < (p2 + 0.1 * range_eps) or low_ratio > low_ratio_threshold
-        over_exposed = mean_val > (p98 - 0.1 * range_eps) or high_ratio > high_ratio_threshold
+        if modality not in ['MR', 'CT']:
+            under_exposed = mean_val < (p2 + 0.1 * range_eps) or low_ratio > low_ratio_threshold
+            over_exposed = mean_val > (p98 - 0.1 * range_eps) or high_ratio > high_ratio_threshold
 
-        if under_exposed:
-            reasons.append(QualityReasons.UNDER_EXPOSED)
-        
-        if over_exposed:
-            reasons.append(QualityReasons.OVER_EXPOSED)
+            if under_exposed:
+                reasons.append(QualityReasons.UNDER_EXPOSED)
+
+            if over_exposed:
+                reasons.append(QualityReasons.OVER_EXPOSED)
 
         # 边缘反转检测（检查边框与中心的差异）
         slice_data = pixel_data
@@ -651,8 +696,8 @@ def detect_nifti_orientation_error(
     try:
         modality = (modality or '').upper()
         
-        # 只对2D X-ray模态进行检测
-        if modality not in ['DX', 'DR', 'CR', 'RF']:
+        # 只对2D X-ray模态进行检测（MG 钼靶同样是 2D 摄影，缺 IOP 时 dcm2niix 也会翻转）
+        if modality not in ['DX', 'DR', 'CR', 'RF', 'MG']:
             return False
         
         data = img.get_fdata()
@@ -1024,8 +1069,8 @@ def assess_series_quality_converted(
         for r in file_results:
             if r['is_low_quality']:
                 all_reasons.extend(r['reasons'])
-            # 也收集修复状态用于报告
-            if r.get('fixed'):
+            # 也收集修复状态用于报告（fixed 标志在 metrics 里，不在顶层）
+            if r.get('metrics', {}).get('fixed'):
                 all_reasons.extend([reason for reason in r['reasons'] 
                                    if reason.startswith('fixed_')])
         

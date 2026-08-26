@@ -1286,6 +1286,30 @@ class DICOMDownloadClient:
         except Exception:
             return
 
+    def _record_orientation_check(self, series_dir, orientation_check):
+        """把转换时的方向校验结果合并进 metadata cache，供 Excel 记录 Fixed/Fixes_applied。
+
+        转换时的镜像/仿射校正（verify_and_fix_orientation）直接改写了 NIfTI 文件，
+        但结果此前只存在于转换返回值中，QC/Excel 看不到。这里写入 cache 的
+        orientation_check 字段，由 metadata 提取阶段合并进记录。
+        """
+        if not orientation_check or not orientation_check.get('fixes'):
+            return
+        cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
+        try:
+            cache = {}
+            if os.path.exists(cache_path):
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+            cache['orientation_check'] = {
+                'action': orientation_check.get('action'),
+                'fixes': orientation_check.get('fixes'),
+            }
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"[META] Failed to record orientation_check into cache for {series_dir}: {e}")
+
     def _write_minimal_cache(self, series_dir, series_name, modality, sample_dcm=None, file_count=0):
         cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
         if os.path.exists(cache_path):

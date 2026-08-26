@@ -204,6 +204,27 @@ def _build_converted_filename(accession_number: str, converted_file_path: str) -
     return f"{accession_number}/{filename}"
 
 
+def _merge_orientation_fixes(record: Dict, cache: Optional[Dict]) -> None:
+    """把转换时方向校正（mirror_relayout/affine_mismatch）合并进记录的 Fixed/Fixes_applied。
+
+    转换时的方向校正直接改写 NIfTI 文件，发生在 QC 之前，QC 不会再次检测到，
+    因此需要从 cache 的 orientation_check 字段补录，避免 Excel 漏记。
+    """
+    if not cache:
+        return
+    oc = cache.get('orientation_check') or {}
+    fixes = oc.get('fixes') or []
+    if not fixes:
+        return
+    existing = record.get('Fixes_applied', '')
+    parts = [p for p in existing.split(', ') if p] if existing else []
+    for fx in fixes:
+        if fx not in parts:
+            parts.append(fx)
+    record['Fixed'] = 'Yes'
+    record['Fixes_applied'] = ', '.join(parts)
+
+
 def extract_dicom_metadata(
     organized_dir: str,
     output_excel: Optional[str],
@@ -337,6 +358,8 @@ def extract_dicom_metadata(
                                 # Update FileName to converted filename format
                                 if idx < len(converted_files):
                                     record['FileName'] = _build_converted_filename(accession_number, converted_files[idx])
+                                # 转换时方向校正（QC 之前发生，QC 不会再次检测到）从 cache 补录
+                                _merge_orientation_fixes(record, cache)
                         else:
                             series_quality_result = assess_series_quality_converted(converted_files, cached_modality, series_path)
                             series_quality = series_quality_result.get('low_quality', 1)
@@ -350,6 +373,8 @@ def extract_dicom_metadata(
                                     cached_records[0]['Fixed_count'] = fixed_count
                                     cached_records[0]['Fixed_orientation'] = series_quality_result.get('fixed_orientation_count', 0)
                                     cached_records[0]['Fixed_grayscale'] = series_quality_result.get('fixed_grayscale_count', 0)
+                                # 转换时方向校正（QC 之前发生，QC 不会再次检测到）从 cache 补录
+                                _merge_orientation_fixes(cached_records[0], cache)
                                 # Update SampleFileName to first converted filename for 3D series
                                 if converted_files:
                                     cached_records[0]['SampleFileName'] = _build_converted_filename(accession_number, converted_files[0])
@@ -529,6 +554,8 @@ def extract_dicom_metadata(
                     # Update FileName to converted filename format: AccessionNumber/filename
                     if idx < len(converted_files):
                         record['FileName'] = _build_converted_filename(accession_number, converted_files[idx])
+                    # 转换时方向校正（QC 之前发生）从 cache 补录
+                    _merge_orientation_fixes(record, cache if 'cache' in dir() else None)
                     all_metadata.append(record)
 
                     if (idx + 1) % 10 == 0:
@@ -569,6 +596,16 @@ def extract_dicom_metadata(
                 # Update SampleFileName to first converted filename for 3D series
                 if converted_files:
                     metadata['SampleFileName'] = _build_converted_filename(accession_number, converted_files[0])
+                # 转换时方向校正（QC 之前发生）从 cache 补录
+                try:
+                    _oc_cache = None
+                    _oc_cache_path = os.path.join(series_path, "dicom_metadata_cache.json")
+                    if os.path.exists(_oc_cache_path):
+                        with open(_oc_cache_path, 'r', encoding='utf-8') as _oc_f:
+                            _oc_cache = json.load(_oc_f)
+                    _merge_orientation_fixes(metadata, _oc_cache)
+                except Exception:
+                    pass
                 all_metadata.append(metadata)
 
         except Exception as e:

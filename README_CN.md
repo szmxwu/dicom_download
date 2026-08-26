@@ -79,35 +79,41 @@ MRI 治理的规则（关键词/阈值/正则等）已抽离到 `mr_clean_config
 
 **默认配置示例**（`.env` 文件）：
 ```ini
-# 动态范围最小阈值
+# 动态范围最小阈值（2D 模态 + CT，绝对单位；CT 为 HU 校准）
 QC_DEFAULT_DYNAMIC_RANGE_MIN=20
 QC_CT_DYNAMIC_RANGE_MIN=20
-QC_MR_DYNAMIC_RANGE_MIN=15
 QC_DX_DYNAMIC_RANGE_MIN=10
 QC_DR_DYNAMIC_RANGE_MIN=10
 QC_MG_DYNAMIC_RANGE_MIN=10
 QC_CR_DYNAMIC_RANGE_MIN=10
 
-# 标准差最小阈值（对比度）
+# MR 使用相对阈值（MR 信号为任意单位，绝对阈值无意义）：
+# 当 (p98 - p2) < QC_MR_DYNAMIC_RANGE_REL_MIN * p98 时判低动态范围（下限 2.0）
+# 当 std < QC_MR_STD_REL_MIN * mean 时判低对比度（下限 0.5）
+QC_MR_DYNAMIC_RANGE_REL_MIN=0.01
+QC_MR_STD_REL_MIN=0.005
+
+# 标准差最小阈值（对比度，2D 模态 + CT）
 QC_DEFAULT_STD_MIN=5
 QC_CT_STD_MIN=5
-QC_MR_STD_MIN=5
 QC_DX_STD_MIN=3
 QC_DR_STD_MIN=3
 QC_MG_STD_MIN=3
 QC_CR_STD_MIN=3
 
-# 唯一值比例最小阈值（复杂度）
-# X-ray图像（DX/DR/MG/CR）通常比CT/MR具有更低的唯一值比例
+# 复杂度阈值
+# X-ray 图像（DX/DR/MG/CR）使用唯一值比例（2D 图像像素数有界，比例可用）
 QC_DEFAULT_UNIQUE_RATIO_MIN=0.01
-QC_CT_UNIQUE_RATIO_MIN=0.01
-QC_MR_UNIQUE_RATIO_MIN=0.008
 QC_DX_UNIQUE_RATIO_MIN=0.001
 QC_DR_UNIQUE_RATIO_MIN=0.001
 QC_MG_UNIQUE_RATIO_MIN=0.001
 QC_CR_UNIQUE_RATIO_MIN=0.001
+# CT/MR 3D 体数据改用绝对唯一值计数
+# （比例随体数据像素数增大而缩小，会把大量正常检查误判为低质量）
+QC_CT_UNIQUE_COUNT_MIN=32
+QC_MR_UNIQUE_COUNT_MIN=32
 
-# 曝光检测阈值
+# 曝光检测阈值（仅 2D 放射摄影模态；不适用于 CT/MR 体数据）
 QC_DEFAULT_LOW_RATIO_THRESHOLD=0.6
 QC_DEFAULT_HIGH_RATIO_THRESHOLD=0.6
 
@@ -117,16 +123,16 @@ QC_DEFAULT_SERIES_LOW_QUALITY_RATIO=0.3
 
 **不同模态的默认阈值**：
 
-| 模态 | unique_ratio_min | std_min | dynamic_range_min |
-|-----|-----------------|---------|-------------------|
-| CT  | 0.01 (严格)      | 5       | 20                |
-| MR  | 0.008 (适中)     | 5       | 15                |
-| DX  | 0.001 (宽松)     | 3       | 10                |
-| DR  | 0.001 (宽松)     | 3       | 10                |
-| MG  | 0.001 (宽松)     | 3       | 10                |
-| CR  | 0.001 (宽松)     | 3       | 10                |
+| 模态 | 复杂度 | 对比度 (std) | 动态范围 | 曝光检测 |
+|-----|--------|-------------|---------|---------|
+| CT  | 唯一值计数 < 32 | std < 5 (HU) | DR < 20 (HU) | 否 |
+| MR  | 唯一值计数 < 32 | std < 0.5% × mean | DR < 1% × p98 | 否 |
+| DX  | 唯一值比例 < 0.001 | 3 | 10 | 是 |
+| DR  | 唯一值比例 < 0.001 | 3 | 10 | 是 |
+| MG  | 唯一值比例 < 0.001 | 3 | 10 | 是 |
+| CR  | 唯一值比例 < 0.001 | 3 | 10 | 是 |
 
-说明：X-ray 类图像（DX/DR/MG/CR）通常具有更简单的图像内容，因此使用更宽松的复杂度阈值。
+说明：MR 信号强度为任意单位，绝对阈值曾导致约 72% 的正常 MR 检查被误判为低质量。MR/CT 现采用相对（尺度不变）阈值与绝对唯一值计数；过曝/欠曝检测仅适用于 2D 放射摄影模态（曝光是 X 光摄影概念）。
 
 ## 使用方法
 

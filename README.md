@@ -82,35 +82,41 @@ The QC system supports modality-specific configurable thresholds via the `.env` 
 
 **Example Configuration** (in `.env` file):
 ```ini
-# Dynamic range minimum threshold
+# Dynamic range minimum threshold (2D modalities + CT, absolute units; CT is HU-calibrated)
 QC_DEFAULT_DYNAMIC_RANGE_MIN=20
 QC_CT_DYNAMIC_RANGE_MIN=20
-QC_MR_DYNAMIC_RANGE_MIN=15
 QC_DX_DYNAMIC_RANGE_MIN=10
 QC_DR_DYNAMIC_RANGE_MIN=10
 QC_MG_DYNAMIC_RANGE_MIN=10
 QC_CR_DYNAMIC_RANGE_MIN=10
 
-# Standard deviation minimum threshold (contrast)
+# MR uses RELATIVE thresholds (MR signal is in arbitrary units, absolute values are meaningless):
+# flag low dynamic range if (p98 - p2) < QC_MR_DYNAMIC_RANGE_REL_MIN * p98 (floor: 2.0)
+# flag low contrast if std < QC_MR_STD_REL_MIN * mean (floor: 0.5)
+QC_MR_DYNAMIC_RANGE_REL_MIN=0.01
+QC_MR_STD_REL_MIN=0.005
+
+# Standard deviation minimum threshold (contrast, 2D modalities + CT)
 QC_DEFAULT_STD_MIN=5
 QC_CT_STD_MIN=5
-QC_MR_STD_MIN=5
 QC_DX_STD_MIN=3
 QC_DR_STD_MIN=3
 QC_MG_STD_MIN=3
 QC_CR_STD_MIN=3
 
-# Unique pixel value ratio minimum threshold (complexity)
-# X-ray images (DX/DR/MG/CR) typically have lower unique ratios than CT/MR
+# Complexity thresholds
+# X-ray images (DX/DR/MG/CR) use unique pixel value RATIO (2D images have bounded pixel counts)
 QC_DEFAULT_UNIQUE_RATIO_MIN=0.01
-QC_CT_UNIQUE_RATIO_MIN=0.01
-QC_MR_UNIQUE_RATIO_MIN=0.008
 QC_DX_UNIQUE_RATIO_MIN=0.001
 QC_DR_UNIQUE_RATIO_MIN=0.001
 QC_MG_UNIQUE_RATIO_MIN=0.001
 QC_CR_UNIQUE_RATIO_MIN=0.001
+# CT/MR 3D volumes use absolute unique value COUNT instead of ratio
+# (the ratio shrinks as the volume grows, causing massive false positives on normal studies)
+QC_CT_UNIQUE_COUNT_MIN=32
+QC_MR_UNIQUE_COUNT_MIN=32
 
-# Exposure detection thresholds
+# Exposure detection thresholds (2D radiography modalities only; not applied to CT/MR volumes)
 QC_DEFAULT_LOW_RATIO_THRESHOLD=0.6
 QC_DEFAULT_HIGH_RATIO_THRESHOLD=0.6
 
@@ -120,16 +126,16 @@ QC_DEFAULT_SERIES_LOW_QUALITY_RATIO=0.3
 
 **Default Thresholds by Modality**:
 
-| Modality | unique_ratio_min | std_min | dynamic_range_min |
-|----------|------------------|---------|-------------------|
-| CT       | 0.01 (strict)    | 5       | 20                |
-| MR       | 0.008 (moderate) | 5       | 15                |
-| DX       | 0.001 (lenient)  | 3       | 10                |
-| DR       | 0.001 (lenient)  | 3       | 10                |
-| MG       | 0.001 (lenient)  | 3       | 10                |
-| CR       | 0.001 (lenient)  | 3       | 10                |
+| Modality | complexity | contrast (std) | dynamic range | exposure check |
+|----------|-----------|----------------|---------------|----------------|
+| CT       | unique_count < 32 | std < 5 (HU)   | DR < 20 (HU)  | no             |
+| MR       | unique_count < 32 | std < 0.5% × mean | DR < 1% × p98 | no        |
+| DX       | unique_ratio < 0.001 | 3       | 10                | yes            |
+| DR       | unique_ratio < 0.001 | 3       | 10                | yes            |
+| MG       | unique_ratio < 0.001 | 3       | 10                | yes            |
+| CR       | unique_ratio < 0.001 | 3       | 10                | yes            |
 
-Note: X-ray images (DX/DR/MG/CR) typically have simpler content, so they use more lenient complexity thresholds.
+Note: MR signal intensity is in arbitrary units, so absolute thresholds caused ~72% of normal MR studies to be misjudged as low quality. MR/CT use relative (scale-invariant) thresholds and absolute unique-value counts; under/over-exposure detection only applies to 2D radiography modalities where exposure is a meaningful concept.
 
 ## Usage
 

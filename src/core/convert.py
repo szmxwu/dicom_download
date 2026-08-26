@@ -1431,6 +1431,7 @@ def convert_with_dcm2niix(
                 )
 
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
+                client._record_orientation_check(series_dir, orientation_check)
 
                 for file in os.listdir(series_dir):
                     if file.startswith('.'):
@@ -1752,6 +1753,7 @@ def convert_with_python_libs(
                 nib.save(nifti_img, output_path)
 
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
+                client._record_orientation_check(series_dir, orientation_check)
                 for file in dicom_files:
                     try:
                         os.remove(file)
@@ -1850,6 +1852,7 @@ def convert_with_python_libs(
             nib.save(nifti_img, output_path)
 
             client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
+            client._record_orientation_check(series_dir, orientation_check)
             for file in dicom_files:
                 try:
                     os.remove(file)
