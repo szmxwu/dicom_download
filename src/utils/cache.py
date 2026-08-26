@@ -15,9 +15,37 @@ import time
 import logging
 from typing import Optional, Dict
 
-logger = logging.getLogger(__name__)
+# 使用共享 logger（项目约定），保证缓存步骤的耗时在 app.log 中可见
+logger = logging.getLogger('DICOMApp')
 
 CACHE_DIR_NAME = "cache"
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    """同卷优先硬链接（瞬时、零额外磁盘占用），失败时回退到完整复制。
+
+    缓存目录与任务结果目录同处于 results/ 下（同卷），缓存文件均为
+    只写一次的产物（.dcm/.nii.gz/.xlsx/.zip），硬链接是安全的：
+    任务目录被清理守护进程删除后，缓存副本（链接）仍然有效，反之亦然。
+    Windows NTFS 支持文件硬链接；FAT32/跨卷等场景自动回退复制。
+    """
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _copytree_link(src_dir: str, dst_dir: str) -> int:
+    """递归复制目录树，文件层面优先硬链接。返回文件数。"""
+    count = 0
+    for root, _dirs, files in os.walk(src_dir):
+        rel = os.path.relpath(root, src_dir)
+        out_root = dst_dir if rel == '.' else os.path.join(dst_dir, rel)
+        os.makedirs(out_root, exist_ok=True)
+        for name in files:
+            _link_or_copy(os.path.join(root, name), os.path.join(out_root, name))
+            count += 1
+    return count
 
 
 def _rmtree_onerror(func, path, exc_info):
@@ -127,20 +155,23 @@ def copy_from_cache(cache_dir: str, target_dir: str, task_id: str) -> Dict:
     target_zip = os.path.join(os.path.dirname(target_dir), f"result_{task_id}.zip")
 
     logger.info(f"[CACHE] Copying from cache: {cache_dir} -> {target_dir}")
+    t0 = time.time()
 
     if os.path.exists(target_organized):
         _rmtree_robust(target_organized)
-    shutil.copytree(organized_dir, target_organized)
+    n_files = _copytree_link(organized_dir, target_organized)
 
     if os.path.exists(target_zip):
         _remove_file_robust(target_zip)
-    shutil.copy2(zip_file, target_zip)
+    _link_or_copy(zip_file, target_zip)
 
     # 复制 Excel 到目标 organized 目录
     target_excel = None
     if os.path.isfile(excel_file):
         target_excel = os.path.join(target_organized, os.path.basename(excel_file))
-        shutil.copy2(excel_file, target_excel)
+        _link_or_copy(excel_file, target_excel)
+
+    logger.info(f"[CACHE] Copy from cache done: {n_files} files in {time.time() - t0:.1f}s")
 
     # 扫描 series_info
     series_info = {}
@@ -162,6 +193,7 @@ def copy_from_cache(cache_dir: str, target_dir: str, task_id: str) -> Dict:
 def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = None,
                   excel_path: Optional[str] = None) -> bool:
     """将任务结果保存到缓存目录。"""
+    t0 = time.time()
     try:
         if os.path.exists(cache_dir):
             _rmtree_robust(cache_dir)
@@ -171,25 +203,31 @@ def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = Non
         cache_zip = os.path.join(cache_dir, "result.zip")
         cache_excel = os.path.join(cache_dir, "metadata.xlsx")
 
-        # 复制 organized 目录
+        # 复制 organized 目录（同卷硬链接，避免 Windows 上小文件全量复制的巨大开销）
+        n_files = 0
         if os.path.exists(cache_organized):
             _rmtree_robust(cache_organized)
         if os.path.isdir(source_dir):
-            shutil.copytree(source_dir, cache_organized)
+            n_files = _copytree_link(source_dir, cache_organized)
 
         # 复制 ZIP
         if zip_path and os.path.isfile(zip_path):
-            shutil.copy2(zip_path, cache_zip)
+            _link_or_copy(zip_path, cache_zip)
 
         # 复制 Excel
         if excel_path and os.path.isfile(excel_path):
-            shutil.copy2(excel_path, cache_excel)
+            _link_or_copy(excel_path, cache_excel)
 
-        logger.info(f"[CACHE] Saved to cache: {cache_dir}")
+        logger.info(
+            f"[CACHE] Saved to cache: {cache_dir} "
+            f"({n_files} files in {time.time() - t0:.1f}s)"
+        )
 
         # 保存成功后强制执行容量检查（LRU 淘汰），防止缓存无限增长
         try:
+            t1 = time.time()
             enforce_cache_limit(os.path.dirname(cache_dir))
+            logger.debug(f"[CACHE] enforce_cache_limit took {time.time() - t1:.1f}s")
         except Exception as e:
             logger.warning(f"[CACHE] enforce_cache_limit failed: {e}")
 
