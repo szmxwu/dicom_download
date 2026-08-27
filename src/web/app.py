@@ -100,9 +100,7 @@ from src.utils.cache import (
 )
 from src.core.constants import (
     DEFAULT_DERIVED_SERIES_KEYWORDS,
-    get_derived_keywords,
-    set_derived_keywords,
-    reset_derived_keywords
+    get_derived_keywords
 )
 
 def get_base_path():
@@ -458,6 +456,15 @@ try:
 except Exception:
     DISK_CLEANUP_INTERVAL_SEC = 300
 
+# 清理最小年龄（分钟）：早于此年龄的结果目录/ZIP 一律不删。
+# 关键保护：任务完成后客户端需要窗口期下载 ZIP；且 Windows 下旧文件常被
+# 杀毒/索引器/Excel 锁定删不掉，若无年龄保护，清理循环会一直推进到
+# 最新生成的 ZIP（实测任务完成后 1.5 秒 ZIP 即被删，客户端稳定 404）
+try:
+    CLEANUP_MIN_AGE_MINUTES = float(os.getenv('CLEANUP_MIN_AGE_MINUTES', '60'))
+except Exception:
+    CLEANUP_MIN_AGE_MINUTES = 60.0
+
 # 清理并发保护：同一时刻只允许一个清理任务运行
 _cleanup_lock = threading.Lock()
 
@@ -470,6 +477,8 @@ try:
     set_key(ENV_FILE_PATH, 'CLEANUP_THRESHOLD_GB', thr_val)
     set_key(ENV_FILE_PATH, 'CLEANUP_TARGET_GB', tgt_val)
     set_key(ENV_FILE_PATH, 'CLEANUP_MIN_FREE_GB', free_val)
+    age_val = str(int(CLEANUP_MIN_AGE_MINUTES) if float(CLEANUP_MIN_AGE_MINUTES).is_integer() else CLEANUP_MIN_AGE_MINUTES)
+    set_key(ENV_FILE_PATH, 'CLEANUP_MIN_AGE_MINUTES', age_val)
 except Exception as e:
     logger.warning(f"无法将清理阈值写入 {ENV_FILE_PATH}: {e}")
 
@@ -604,8 +613,18 @@ def cleanup_old_results():
                     continue  # 缓存目录自管理（LRU），不扫描、不清理
                 item_path = os.path.join(results_dir, item)
                 if os.path.exists(item_path):
-                    # 获取最后访问时间
-                    atime = os.path.getatime(item_path)
+                    # 有效时间戳取 mtime/ctime 的较新值，不用 atime：
+                    # - 本函数自身的 os.walk 大小扫描会读目录，relatime 下会把
+                    #   目录 atime 刷成"现在"，atime 在本场景毫无参考价值
+                    # - Windows 默认不更新 atime；其 ctime 即创建时间，可保护新建文件
+                    # - mtime 反映内容最后写入（任务完成时刻）
+                    try:
+                        ts = max(
+                            os.path.getmtime(item_path),
+                            os.path.getctime(item_path),
+                        )
+                    except OSError:
+                        continue  # 扫描瞬间被并发删除/锁定，跳过
                     size = 0
 
                     if os.path.isfile(item_path):
@@ -616,7 +635,7 @@ def cleanup_old_results():
                     items_to_check.append({
                         'path': item_path,
                         'name': item,
-                        'atime': atime,
+                        'ts': ts,
                         'size': size,
                         'is_dir': os.path.isdir(item_path)
                     })
@@ -630,13 +649,22 @@ def cleanup_old_results():
                           if task.status in ['running', 'pending']]
 
         # 过滤掉正在进行的任务
+        min_age_sec = CLEANUP_MIN_AGE_MINUTES * 60
+        now = time.time()
         items_to_clean = []
+        skipped_young = 0
         for item in items_to_check:
             # 缓存目录由 cache.py 自己的 LRU 淘汰管理，严禁在这里删除：
             # 历史上曾整树删除 38GB 缓存（"删除: cache (38.17GB)"），
             # 既清空缓存导致重复下载，又与 LRU 淘汰/缓存写入竞争产生
             # WinError 3（路径被并发删除）/WinError 5（部分删除残留）
             if item['name'] == CACHE_DIR_NAME:
+                continue
+
+            # 年龄保护：过新的结果（刚完成的任务 ZIP/目录）绝不清理。
+            # 否则当旧文件被锁定删不掉时，清理循环会一直推进到最新文件
+            if now - item['ts'] < min_age_sec:
+                skipped_young += 1
                 continue
 
             # 检查是否为活跃任务目录
@@ -649,12 +677,15 @@ def cleanup_old_results():
             if not is_active:
                 items_to_clean.append(item)
 
+        if skipped_young:
+            logger.info(f"清理跳过 {skipped_young} 个不足 {CLEANUP_MIN_AGE_MINUTES:.0f} 分钟的新文件/目录")
+
         if not items_to_clean:
             logger.info("所有文件都属于活跃任务，跳过清理")
             return
 
-        # 按访问时间排序，先删除最旧的
-        items_to_clean.sort(key=lambda x: x['atime'])
+        # 按有效时间戳排序，先删除最旧的
+        items_to_clean.sort(key=lambda x: x['ts'])
 
         # 计算需要清理的总量：取"目录大小达标"与"剩余空间达标"所需删除量的较大值
         target_to_clean = 0.0
@@ -1750,6 +1781,24 @@ def download_log_file(filename):
         return jsonify({'error': f'Failed to download log file: {str(e)}'}), 500
 
 # 处理任务函数
+def _parse_derived_keywords(options):
+    """从任务 options 解析本次生效的衍生序列过滤关键词（仅当前任务，不修改全局配置）。
+
+    Returns:
+        list[str] | None: 合法的关键词列表；未提供或为空时返回 None（用全局默认）。
+    """
+    raw = options.get('derived_keywords')
+    if not isinstance(raw, list):
+        return None
+    validated = []
+    for k in raw[:100]:  # 最多 100 个关键词
+        if isinstance(k, str):
+            k = k.strip().upper()
+            if k and len(k) <= 50 and k not in validated:
+                validated.append(k)
+    return validated or None
+
+
 def process_single_task(task):
     """处理单个AccessionNumber任务 - 修复版，支持取消检查"""
     client_logged_in = False
@@ -1866,6 +1915,9 @@ def process_single_task(task):
         modality_filter = options.get('modality_filter')
         min_series_files = options.get('min_series_files')
         exclude_derived = options.get('exclude_derived', True)  # 默认启用衍生序列过滤
+        derived_keywords = _parse_derived_keywords(options)  # 仅本任务生效的关键词覆盖
+        if derived_keywords is not None:
+            task.add_log(f"Using task-specific derived keywords ({len(derived_keywords)} items)")
         if min_series_files is not None:
             try:
                 min_series_files = int(min_series_files)
@@ -1918,7 +1970,8 @@ def process_single_task(task):
                 accession_number,
                 modality_filter=modality_filter,
                 min_series_files=min_series_files,
-                exclude_derived=exclude_derived
+                exclude_derived=exclude_derived,
+                derived_keywords=derived_keywords
             )
             if not series_metadata:
                 filter_info = []
@@ -1952,7 +2005,8 @@ def process_single_task(task):
                 parallel_pipeline=True,  # 启用下载-转换并行流水线，下载与整理/转换重叠执行
                 modality_filter=modality_filter,
                 min_series_files=min_series_files,
-                exclude_derived=exclude_derived
+                exclude_derived=exclude_derived,
+                derived_keywords=derived_keywords
             )
             
             if results and results.get('success'):
@@ -2091,6 +2145,7 @@ def process_batch_task(task):
         modality_filter = options.get('modality_filter')
         min_series_files = options.get('min_series_files')
         exclude_derived = options.get('exclude_derived', True)  # 默认启用衍生序列过滤
+        derived_keywords = _parse_derived_keywords(options)  # 仅本任务生效的关键词覆盖
         if min_series_files is not None:
             try:
                 min_series_files = int(min_series_files)
@@ -2102,6 +2157,8 @@ def process_batch_task(task):
             task.add_log(f"Min series files: {min_series_files}")
         if exclude_derived:
             task.add_log(f"Exclude derived series: enabled")
+        if derived_keywords is not None:
+            task.add_log(f"Using task-specific derived keywords ({len(derived_keywords)} items)")
 
         # 去重处理，保持顺序
         seen = set()
@@ -2188,7 +2245,8 @@ def process_batch_task(task):
                     parallel_pipeline=True,  # 启用下载-转换并行流水线，下载与整理/转换重叠执行
                     modality_filter=modality_filter,
                     min_series_files=min_series_files,
-                    exclude_derived=exclude_derived
+                    exclude_derived=exclude_derived,
+                    derived_keywords=derived_keywords
                 )
 
                 # --- MR 序列重命名 ---
@@ -2566,54 +2624,15 @@ def _ensure_ssl_cert(ssl_dir):
 
 @app.route('/api/filter-keywords', methods=['GET'])
 def get_filter_keywords():
-    """获取当前生效的衍生序列过滤关键词列表。"""
+    """获取当前生效的衍生序列过滤关键词列表（只读）。
+
+    页面可编辑关键词，但修改仅随任务 options.derived_keywords 对当次下载生效；
+    不提供全局写入口——永久修改只能改 src/core/constants.py 的默认值。
+    """
     return jsonify({
         'keywords': get_derived_keywords(),
         'default_keywords': DEFAULT_DERIVED_SERIES_KEYWORDS,
         'count': len(get_derived_keywords())
-    })
-
-
-@app.route('/api/filter-keywords', methods=['POST'])
-def set_filter_keywords():
-    """设置衍生序列过滤关键词列表（立即生效，影响后续所有新任务）。"""
-    data = request.json or {}
-    keywords = data.get('keywords')
-
-    if not isinstance(keywords, list):
-        return jsonify({'error': 'keywords must be a list of strings'}), 400
-
-    # 验证所有元素都是字符串且非空
-    validated = []
-    for k in keywords:
-        if isinstance(k, str) and k.strip():
-            validated.append(k.strip().upper())
-
-    if not validated:
-        return jsonify({'error': 'At least one valid keyword is required'}), 400
-
-    # 设置新的关键词（会自动去重）
-    set_derived_keywords(validated)
-    new_keywords = get_derived_keywords()
-    logger.info(f"📝 过滤关键词已更新: {new_keywords}")
-
-    return jsonify({
-        'message': 'Filter keywords updated successfully',
-        'keywords': new_keywords,
-        'count': len(new_keywords)
-    })
-
-
-@app.route('/api/filter-keywords/reset', methods=['POST'])
-def reset_filter_keywords():
-    """重置过滤关键词为系统默认值。"""
-    reset_derived_keywords()
-    keywords = get_derived_keywords()
-    logger.info(f"📝 过滤关键词已重置为默认值")
-    return jsonify({
-        'message': 'Filter keywords reset to default',
-        'keywords': keywords,
-        'count': len(keywords)
     })
 
 

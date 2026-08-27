@@ -285,6 +285,10 @@ class DICOMProcessor {
                 'filter_keywords_config': 'Filter Keywords',
                 'derived_series_keywords': 'Derived Series Keywords',
                 'filter_keywords_help': 'One keyword per line. These keywords are used to filter out derived series (MPR, MIP, etc.).',
+                'filter_keywords_session_help': 'Changes apply to the current download only and are never saved permanently.',
+                'restore_defaults': 'Restore Defaults',
+                'rename_mr_series': 'Rename MR Series (using MR_clean standardized labels)',
+                'rename_mr_help': 'When enabled, MR series folders will be renamed to [SeriesNumber]_[StandardizedName] format',
                 'save': 'Save',
                 'reset': 'Reset',
                 'filter_keywords_saved': 'Keywords saved. Will take effect on next task.',
@@ -466,6 +470,10 @@ class DICOMProcessor {
                 'filter_keywords_config': '过滤关键词',
                 'derived_series_keywords': '衍生序列过滤关键词',
                 'filter_keywords_help': '每行一个关键词。这些关键词用于过滤衍生序列（MPR、MIP等）。',
+                'filter_keywords_session_help': '修改仅对本次下载生效，不会被永久保存。',
+                'restore_defaults': '恢复默认',
+                'rename_mr_series': '重命名MR序列（使用MR_clean标准化命名）',
+                'rename_mr_help': '启用后，MR序列文件夹将重命名为 [序列号]_[标准化名称] 格式',
                 'save': '保存',
                 'reset': '重置',
                 'filter_keywords_saved': '关键词已保存，将在下一个任务时生效',
@@ -613,16 +621,10 @@ class DICOMProcessor {
             testPacsConnectionBtn.addEventListener('click', () => this.testPacsConnection());
         }
 
-        // 过滤关键词配置：保存
-        const saveFilterKeywordsBtn = document.getElementById('saveFilterKeywords');
-        if (saveFilterKeywordsBtn) {
-            saveFilterKeywordsBtn.addEventListener('click', () => this.saveFilterKeywords());
-        }
-
-        // 过滤关键词配置：重置
+        // 过滤关键词配置：恢复默认（仅客户端，不写回服务端）
         const resetFilterKeywordsBtn = document.getElementById('resetFilterKeywords');
         if (resetFilterKeywordsBtn) {
-            resetFilterKeywordsBtn.addEventListener('click', () => this.resetFilterKeywords());
+            resetFilterKeywordsBtn.addEventListener('click', () => this.restoreDefaultFilterKeywords());
         }
 
         // 文件拖拽上传
@@ -991,15 +993,16 @@ class DICOMProcessor {
         }
     }
 
-    // 加载过滤关键词
+    // 加载过滤关键词（从服务端 constants.py 的当前生效值读取，缓存默认值）
     async loadFilterKeywords() {
         try {
             const response = await fetch('/api/filter-keywords');
             const data = await response.json();
             if (response.ok) {
+                this.defaultFilterKeywords = data.default_keywords || data.keywords || [];
                 const textarea = document.getElementById('filterKeywordsTextarea');
                 if (textarea) {
-                    textarea.value = data.keywords.join('\n');
+                    textarea.value = (data.keywords || []).join('\n');
                 }
             }
         } catch (error) {
@@ -1007,68 +1010,25 @@ class DICOMProcessor {
         }
     }
 
-    // 保存过滤关键词
-    async saveFilterKeywords() {
+    // 恢复默认过滤关键词（纯客户端操作，仅影响下一次提交的下载任务）
+    restoreDefaultFilterKeywords() {
         const textarea = document.getElementById('filterKeywordsTextarea');
-        const statusDiv = document.getElementById('filterKeywordsStatus');
-        if (!textarea) return;
-
-        const keywords = textarea.value.split('\n').map(k => k.trim()).filter(k => k);
-
-        try {
-            const response = await fetch('/api/filter-keywords', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ keywords })
-            });
-
-            const data = await response.json();
-            if (response.ok) {
-                if (statusDiv) {
-                    statusDiv.style.display = 'block';
-                    setTimeout(() => { statusDiv.style.display = 'none'; }, 3000);
-                }
-                // 更新textarea为服务器返回的实际值（可能已去重）
-                textarea.value = data.keywords.join('\n');
-            } else {
-                this.showError(data.error || 'Failed to save filter keywords');
-            }
-        } catch (error) {
-            console.error('Failed to save filter keywords:', error);
-            this.showError(`Failed to save filter keywords: ${error.message}`);
+        if (textarea && this.defaultFilterKeywords) {
+            textarea.value = this.defaultFilterKeywords.join('\n');
         }
     }
 
-    // 重置过滤关键词
-    async resetFilterKeywords() {
+    // 读取 textarea 中的关键词；与默认值相同时返回 null（保持缓存键不变），否则返回数组
+    _getDerivedKeywordsOverride() {
         const textarea = document.getElementById('filterKeywordsTextarea');
-        const statusDiv = document.getElementById('filterKeywordsStatus');
-
-        try {
-            const response = await fetch('/api/filter-keywords/reset', {
-                method: 'POST'
-            });
-
-            const data = await response.json();
-            if (response.ok) {
-                if (textarea) {
-                    textarea.value = data.keywords.join('\n');
-                }
-                if (statusDiv) {
-                    statusDiv.style.display = 'block';
-                    statusDiv.innerHTML = '<span class="text-success"><i class="fas fa-check-circle"></i> Reset to default successfully</span>';
-                    setTimeout(() => {
-                        statusDiv.style.display = 'none';
-                        statusDiv.innerHTML = '<span class="text-success"><i class="fas fa-check-circle"></i> <span data-i18n="filter_keywords_saved">Keywords saved. Will take effect on next task.</span></span>';
-                    }, 3000);
-                }
-            } else {
-                this.showError(data.error || 'Failed to reset filter keywords');
-            }
-        } catch (error) {
-            console.error('Failed to reset filter keywords:', error);
-            this.showError(`Failed to reset filter keywords: ${error.message}`);
-        }
+        if (!textarea || !this.defaultFilterKeywords) return null;
+        const keywords = [...new Set(
+            textarea.value.split('\n').map(k => k.trim().toUpperCase()).filter(k => k)
+        )];
+        const defaults = this.defaultFilterKeywords.map(k => String(k).toUpperCase());
+        const same = keywords.length === defaults.length &&
+            keywords.every((k, i) => k === defaults[i]);
+        return same ? null : keywords;
     }
 
     // 更新连接状态
@@ -1143,17 +1103,23 @@ class DICOMProcessor {
         }
     }
 
-    // 获取处理选项
-    getProcessingOptions() {
-        return {
-            auto_extract: document.getElementById('autoExtract').checked,
-            auto_organize: document.getElementById('autoOrganize').checked,
-            auto_metadata: document.getElementById('autoMetadata').checked,
-            keep_zip: document.getElementById('keepZip').checked,
-            keep_extracted: document.getElementById('keepExtracted').checked,
+    // 获取处理选项（auto_extract/auto_organize/auto_metadata/keep_zip/keep_extracted 为必备项，硬编码）
+    getProcessingOptions(renameCheckboxId) {
+        const options = {
+            auto_extract: true,
+            auto_organize: true,
+            auto_metadata: true,
+            keep_zip: true,
+            keep_extracted: false,
             output_format: document.querySelector('input[name="outputFormat"]:checked')?.value || 'nifti',
-            rename_mr_series: document.getElementById('renameMRSeries')?.checked || false
+            rename_mr_series: document.getElementById(renameCheckboxId)?.checked || false
         };
+        // 过滤关键词：仅在与默认值不同时才随任务下发（保持缓存键稳定）
+        const derivedKeywords = this._getDerivedKeywordsOverride();
+        if (derivedKeywords) {
+            options.derived_keywords = derivedKeywords;
+        }
+        return options;
     }
 
     // 开始单个处理 - 内部实现
@@ -1192,7 +1158,7 @@ class DICOMProcessor {
             // 不再返回，继续执行
         }
 
-        const options = this.getProcessingOptions();
+        const options = this.getProcessingOptions('renameMRSeriesSingle');
 
         // 添加过滤参数
         const modalityFilter = document.getElementById('modalityFilter')?.value?.trim();
@@ -1319,7 +1285,7 @@ class DICOMProcessor {
         this.showSuccess(hintMsg);
 
         this.isProcessing = true;
-        const options = this.getProcessingOptions();
+        const options = this.getProcessingOptions('renameMRSeriesBatch');
 
         // 添加批量过滤参数
         const modalityFilter = document.getElementById('batchModalityFilter')?.value?.trim();
@@ -2132,21 +2098,21 @@ class DICOMProcessor {
 
     // 重置所有选项
     resetAllOptions() {
-        document.getElementById('autoExtract').checked = true;
-        document.getElementById('autoOrganize').checked = true;
-        document.getElementById('autoMetadata').checked = true;
-        document.getElementById('keepZip').checked = true;
-        document.getElementById('keepExtracted').checked = false;
         document.getElementById('defaultKeywords').checked = true;
         document.getElementById('customKeywordFile').style.display = 'none';
-        
+        const renameSingle = document.getElementById('renameMRSeriesSingle');
+        if (renameSingle) renameSingle.checked = false;
+        const renameBatch = document.getElementById('renameMRSeriesBatch');
+        if (renameBatch) renameBatch.checked = false;
+        this.restoreDefaultFilterKeywords();
+
         this.showSuccess('选项已重置为默认值');
     }
 
     // 导出配置
     exportSettings() {
         const settings = {
-            options: this.getProcessingOptions(),
+            options: this.getProcessingOptions('renameMRSeriesSingle'),
             keywordConfig: document.querySelector('input[name="keywordConfig"]:checked').value,
             timestamp: new Date().toISOString()
         };

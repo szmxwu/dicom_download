@@ -495,7 +495,7 @@ class DICOMDownloadClient:
             logger.error(f"PACS connection failed after {retries} attempts: association not established")
         return False
     
-    def _query_series_metadata(self, accession_number, modality_filter=None, min_series_files=None, exclude_derived=True):
+    def _query_series_metadata(self, accession_number, modality_filter=None, min_series_files=None, exclude_derived=True, derived_keywords=None):
         """查询PACS获取Series元数据
 
         Args:
@@ -503,6 +503,7 @@ class DICOMDownloadClient:
             modality_filter: 可选，模态过滤（如 'MR', 'CT'）
             min_series_files: 可选，最小序列文件数，少于该值的序列将被过滤
             exclude_derived: 是否排除衍生序列（MPR, MIP, VR等），默认True
+            derived_keywords: 可选，本次任务生效的衍生序列关键词列表（覆盖全局配置）
         """
         series_metadata = []
 
@@ -575,7 +576,8 @@ class DICOMDownloadClient:
                                 # （统一判定逻辑见 constants.is_derived_series，接收端首文件也用同一套）
                                 if exclude_derived:
                                     is_derived, derived_reason = is_derived_series(
-                                        series_desc, getattr(identifier, 'ImageType', None)
+                                        series_desc, getattr(identifier, 'ImageType', None),
+                                        keywords=derived_keywords
                                     )
                                     if is_derived:
                                         logger.info(f"   🚫 Filtered derived series ({derived_reason}): {series_desc}")
@@ -649,7 +651,7 @@ class DICOMDownloadClient:
                 if min_series_files and min_series_files > 0:
                     logger.debug(f"   (Min files filter: {min_series_files})")
                 if exclude_derived:
-                    logger.debug(f"   (Derived series filtered by keywords: {get_derived_keywords()})")
+                    logger.debug(f"   (Derived series filtered by keywords: {derived_keywords if derived_keywords is not None else get_derived_keywords()})")
 
         except ConnectionError as e:
             logger.error(f"❌ Failed to establish PACS connection: {e}")
@@ -661,7 +663,7 @@ class DICOMDownloadClient:
     
     def download_study(self, accession_number, output_dir=".", custom_folder_name=None,
                        on_series_downloaded=None, modality_filter=None, min_series_files=None,
-                       exclude_derived=True):
+                       exclude_derived=True, derived_keywords=None):
         """Download Study data (directly from PACS, no ZIP generation)
 
         Args:
@@ -672,6 +674,7 @@ class DICOMDownloadClient:
             modality_filter: 可选，模态过滤（如 'MR', 'CT'，支持逗号分隔多个）
             min_series_files: 可选，最小序列文件数
             exclude_derived: 是否排除衍生序列，默认True
+            derived_keywords: 可选，本次任务生效的衍生序列关键词列表（覆盖全局配置）
         """
         logger.info(f"🔍 Downloading AccessionNumber: {accession_number}")
 
@@ -680,7 +683,8 @@ class DICOMDownloadClient:
             accession_number,
             modality_filter=modality_filter,
             min_series_files=min_series_files,
-            exclude_derived=exclude_derived
+            exclude_derived=exclude_derived,
+            derived_keywords=derived_keywords
         )
         if not series_metadata:
             logger.error(f"❌ No data found for: {accession_number}")
@@ -774,7 +778,8 @@ class DICOMDownloadClient:
                     if series_instance_uid not in storage_state['recv_filter_decisions']:
                         recv_reject, recv_reason = is_derived_series(
                             getattr(dataset, 'SeriesDescription', None),
-                            getattr(dataset, 'ImageType', None)
+                            getattr(dataset, 'ImageType', None),
+                            keywords=derived_keywords
                         )
                         storage_state['recv_filter_decisions'][series_instance_uid] = recv_reject
                         if recv_reject:
@@ -2031,7 +2036,7 @@ class DICOMDownloadClient:
                                 auto_extract=True, auto_organize=True, auto_metadata=True,
                                 keep_zip=True, keep_extracted=False, output_format='nifti',
                                 parallel_pipeline=True, modality_filter=None, min_series_files=None,
-                                exclude_derived=True):
+                                exclude_derived=True, derived_keywords=None):
         """完整的工作流程：下载 -> 整理 -> 转换 -> 提取元数据
 
         Args:
@@ -2107,7 +2112,8 @@ class DICOMDownloadClient:
                     on_series_downloaded=_on_series_downloaded,
                     modality_filter=modality_filter,
                     min_series_files=min_series_files,
-                    exclude_derived=exclude_derived
+                    exclude_derived=exclude_derived,
+                    derived_keywords=derived_keywords
                 )
                 download_dir_holder['path'] = download_path
             finally:
@@ -2226,7 +2232,8 @@ class DICOMDownloadClient:
                 base_output_dir,
                 modality_filter=modality_filter,
                 min_series_files=min_series_files,
-                exclude_derived=exclude_derived
+                exclude_derived=exclude_derived,
+                derived_keywords=derived_keywords
             )
             if not download_dir:
                 logger.error("❌ Download failed, workflow terminated")

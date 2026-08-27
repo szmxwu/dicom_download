@@ -130,6 +130,13 @@
                                             </label>
                                             <div class="form-text" data-i18n="exclude_derived_help">Automatically filter out MPR, MIP, 3D VR, and other derived series</div>
                                         </div>
+                                        <div class="form-check mb-3">
+                                            <input class="form-check-input" type="checkbox" id="renameMRSeriesSingle">
+                                            <label class="form-check-label" for="renameMRSeriesSingle" data-i18n="rename_mr_series">
+                                                Rename MR Series (using MR_clean standardized labels)
+                                            </label>
+                                            <div class="form-text" data-i18n="rename_mr_help">When enabled, MR series folders will be renamed to [SeriesNumber]_[StandardizedName] format</div>
+                                        </div>
                                         <button type="button" class="btn btn-primary btn-lg" onclick="startSingleProcess()">
                                             <i class="fas fa-play"></i> <span data-i18n="start_process">Start Process</span>
                                         </button>
@@ -170,6 +177,13 @@
                                                 Exclude derived series (MPR, MIP, VR, etc.)
                                             </label>
                                             <div class="form-text" data-i18n="exclude_derived_help">Automatically filter out MPR, MIP, 3D VR, and other derived series</div>
+                                        </div>
+                                        <div class="form-check mb-3">
+                                            <input class="form-check-input" type="checkbox" id="renameMRSeriesBatch">
+                                            <label class="form-check-label" for="renameMRSeriesBatch" data-i18n="rename_mr_series">
+                                                Rename MR Series (using MR_clean standardized labels)
+                                            </label>
+                                            <div class="form-text" data-i18n="rename_mr_help">When enabled, MR series folders will be renamed to [SeriesNumber]_[StandardizedName] format</div>
                                         </div>
                                         <div class="d-flex gap-2">
                                             <button type="button" class="btn btn-primary btn-lg" onclick="startBatchProcess()">
@@ -752,60 +766,6 @@ download_list(
                     <div class="card-body">
                         <div class="accordion mb-3" id="processOptionsAccordion">
                             <div class="accordion-item">
-                                <h2 class="accordion-header" id="headingBasicSettings">
-                                    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseBasicSettings" aria-expanded="false" aria-controls="collapseBasicSettings">
-                                        <span data-i18n="basic_settings">Basic Settings</span>
-                                    </button>
-                                </h2>
-                                <div id="collapseBasicSettings" class="accordion-collapse collapse" aria-labelledby="headingBasicSettings" data-bs-parent="#processOptionsAccordion">
-                                    <div class="accordion-body pt-2">
-                                        <div class="form-check mb-2">
-                                            <input class="form-check-input" type="checkbox" id="autoExtract" checked>
-                                            <label class="form-check-label" for="autoExtract" data-i18n="auto_extract">
-                                                Auto Extract
-                                            </label>
-                                        </div>
-                                        <div class="form-check mb-2">
-                                            <input class="form-check-input" type="checkbox" id="autoOrganize" checked>
-                                            <label class="form-check-label" for="autoOrganize" data-i18n="auto_organize">
-                                                Auto Organize Files
-                                            </label>
-                                        </div>
-                                        <div class="form-check mb-2">
-                                            <input class="form-check-input" type="checkbox" id="autoMetadata" checked>
-                                            <label class="form-check-label" for="autoMetadata" data-i18n="auto_metadata">
-                                                Extract Metadata
-                                            </label>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="accordion-item">
-                                <h2 class="accordion-header" id="headingFileManagement">
-                                    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseFileManagement" aria-expanded="false" aria-controls="collapseFileManagement">
-                                        <span data-i18n="file_management">File Management</span>
-                                    </button>
-                                </h2>
-                                <div id="collapseFileManagement" class="accordion-collapse collapse" aria-labelledby="headingFileManagement" data-bs-parent="#processOptionsAccordion">
-                                    <div class="accordion-body pt-2">
-                                        <div class="form-check mb-2">
-                                            <input class="form-check-input" type="checkbox" id="keepZip" checked>
-                                            <label class="form-check-label" for="keepZip" data-i18n="keep_original_zip">
-                                                Keep Original ZIP
-                                            </label>
-                                        </div>
-                                        <div class="form-check mb-2">
-                                            <input class="form-check-input" type="checkbox" id="keepExtracted">
-                                            <label class="form-check-label" for="keepExtracted" data-i18n="keep_extracted_files">
-                                                Keep Extracted Files
-                                            </label>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="accordion-item">
                                 <h2 class="accordion-header" id="headingMetadataFields">
                                     <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseMetadataFields" aria-expanded="false" aria-controls="collapseMetadataFields">
                                         <span data-i18n="metadata_fields">Metadata Fields</span>
@@ -861,27 +821,6 @@ download_list(
                             </div>
 
                             <div class="accordion-item">
-                                <h2 class="accordion-header" id="headingMRRename">
-                                    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseMRRename" aria-expanded="false" aria-controls="collapseMRRename">
-                                        <span data-i18n="mr_rename_settings">MR Sequence Rename</span>
-                                    </button>
-                                </h2>
-                                <div id="collapseMRRename" class="accordion-collapse collapse" aria-labelledby="headingMRRename" data-bs-parent="#processOptionsAccordion">
-                                    <div class="accordion-body pt-2">
-                                        <div class="form-check mb-2">
-                                            <input class="form-check-input" type="checkbox" id="renameMRSeries">
-                                            <label class="form-check-label" for="renameMRSeries" data-i18n="rename_mr_series">
-                                                Rename MR Series (using MR_clean standardized labels)
-                                            </label>
-                                        </div>
-                                        <small class="form-text text-muted" data-i18n="rename_mr_help">
-                                            When enabled, MR series folders will be renamed to [SeriesNumber]_[StandardizedName] format.
-                                        </small>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="accordion-item">
                                 <h2 class="accordion-header" id="headingDicomServerConfig">
                                     <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseDicomServerConfig" aria-expanded="false" aria-controls="collapseDicomServerConfig">
                                         <span data-i18n="dicom_server_config">DICOM Server Config</span>
@@ -931,44 +870,14 @@ download_list(
                                     <div class="accordion-body pt-2">
                                         <div class="mb-2">
                                             <label class="form-label small mb-1" data-i18n="derived_series_keywords">Derived Series Keywords</label>
-                                            <textarea class="form-control form-control-sm" id="filterKeywordsTextarea" rows="4" placeholder="MPR\nMIP\n3D\n...">MPR
-MIP
-MINIP
-SSD
-VRT
-VR
-CPR
-CURVED
-3D
-THICK
-SCOUT
-TOPOGRAM
-SURVEY
-REF
-REFERENCE
-LOC
-BATCH
-AVERAGE
-SUM
-REFORMAT
-PROJECTION
-RAYSUM
-KEY
-ROI
-DOSE
-TRACKER</textarea>
+                                            <textarea class="form-control form-control-sm" id="filterKeywordsTextarea" rows="4" placeholder="MPR\nMIP\n..."></textarea>
                                             <small class="form-text text-muted" data-i18n="filter_keywords_help">One keyword per line. These keywords are used to filter out derived series (MPR, MIP, etc.).</small>
+                                            <small class="form-text text-warning d-block" data-i18n="filter_keywords_session_help">Changes apply to the current download only and are never saved permanently.</small>
                                         </div>
                                         <div class="d-flex gap-2">
-                                            <button type="button" class="btn btn-primary btn-sm flex-fill" id="saveFilterKeywords">
-                                                <i class="fas fa-save"></i> <span data-i18n="save">Save</span>
-                                            </button>
                                             <button type="button" class="btn btn-outline-secondary btn-sm flex-fill" id="resetFilterKeywords">
-                                                <i class="fas fa-undo"></i> <span data-i18n="reset">Reset</span>
+                                                <i class="fas fa-undo"></i> <span data-i18n="restore_defaults">Restore Defaults</span>
                                             </button>
-                                        </div>
-                                        <div class="mt-2 small" id="filterKeywordsStatus" style="display: none;">
-                                            <span class="text-success"><i class="fas fa-check-circle"></i> <span data-i18n="filter_keywords_saved">Keywords saved. Will take effect on next task.</span></span>
                                         </div>
                                     </div>
                                 </div>

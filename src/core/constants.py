@@ -44,11 +44,18 @@ DEFAULT_DERIVED_SERIES_KEYWORDS = [
 
 # 当 ImageType[0] == 'DERIVED' 时，部分临床有意义的序列不应被过滤。
 # 白名单用于保留 ADC/Dixon 等后处理序列。
+# 匹配范围：ImageType 其余值（厂商语义标记，如 Philips 拼合图像的 SPINE）
+# 以及 SeriesDescription（子串、不区分大小写）。
 DERIVED_IMAGE_TYPE_WHITELIST = [
     'ADC', 'EADC', 'WATER', 'FAT',
     'IN PHASE', 'INPHASE', 'OUT PHASE', 'OUTPHASE',
     'IDEAL', 'T1 MAP', 'T2 MAP', 'FA MAP',
     'DWI', 'DIFF', 'DIFFUSION', 'EP2D', 'EPI',  # 保留 DWI/EPI 序列（即使 ImageType=DERIVED）
+    # 全脊柱/全下肢拼合图像（stitching）：技术上属 DERIVED，
+    # 但对 DR 全脊柱/全长下肢检查是不可缺少的诊断图像。
+    # 实证：Philips DR 拼合 ImageType=DERIVED\SECONDARY\SPINE\VIEWER VB15A，
+    # SeriesDescription 如 "W LongSpine ap large"（520010500096DR 生产事故）
+    'SPINE', 'STITCH', 'LONGLEG', 'LONG LEG',
 ]
 
 # 运行时可修改的过滤关键词（模块级可变状态）
@@ -83,17 +90,21 @@ DERIVED_KEYWORD_EXCEPTIONS = {
 }
 
 
-def match_derived_keyword(series_desc):
+def match_derived_keyword(series_desc, keywords=None):
     """返回 SeriesDescription 命中的衍生序列关键词（含例外规则），未命中返回 None。
 
     匹配为子串包含（不区分大小写，desc 与关键词两侧都会归一化）。
     命中关键词但同时包含 DERIVED_KEYWORD_EXCEPTIONS 中登记的例外子串时，
     视为未命中。
+
+    Args:
+        series_desc: SeriesDescription 字符串
+        keywords: 可选，本次生效的关键词列表；None 时使用全局 get_derived_keywords()
     """
     if not series_desc:
         return None
     desc_upper = series_desc.upper()
-    for keyword in get_derived_keywords():
+    for keyword in (keywords if keywords is not None else get_derived_keywords()):
         kw_upper = keyword.upper()  # 关键词侧也归一化（历史上混入过小写关键词导致死代码）
         if kw_upper in desc_upper:
             exceptions = DERIVED_KEYWORD_EXCEPTIONS.get(kw_upper, ())
@@ -103,15 +114,20 @@ def match_derived_keyword(series_desc):
     return None
 
 
-def is_derived_series(series_desc, image_type):
+def is_derived_series(series_desc, image_type, keywords=None):
     """统一的衍生序列判定：ImageType 首值为 DERIVED，或 SeriesDescription 命中关键词。
 
     查询阶段（C-FIND identifier）与接收阶段（C-STORE 首文件 dataset）共用同一套
     规则，避免两处逻辑漂移。
 
+    ImageType[0] == 'DERIVED' 时会继续检查 DERIVED_IMAGE_TYPE_WHITELIST
+    （ImageType 其余值 + SeriesDescription），命中白名单的序列（ADC/Dixon/
+    全脊柱拼合等）保留。
+
     Args:
         series_desc: SeriesDescription 字符串（可为 None/空）
         image_type: ImageType 值（pydicom MultiValue / list / str / None）
+        keywords: 可选，本次生效的关键词列表（每个任务可覆盖）；None 时用全局配置
 
     Returns:
         (is_derived: bool, reason: str)；未判为衍生时 reason 为空串。
@@ -122,10 +138,26 @@ def is_derived_series(series_desc, image_type):
         if isinstance(image_type, (list, tuple)):
             first_val = str(image_type[0]).upper().strip() if image_type else ''
             if first_val == 'DERIVED':
+                # 白名单：ImageType 其余值是厂商语义标记（如拼合图像的 SPINE）
+                for extra_val in image_type[1:]:
+                    val_upper = str(extra_val).upper()
+                    for kw in DERIVED_IMAGE_TYPE_WHITELIST:
+                        if kw in val_upper:
+                            return False, ''
+                if series_desc:
+                    desc_upper = series_desc.upper()
+                    for kw in DERIVED_IMAGE_TYPE_WHITELIST:
+                        if kw in desc_upper:
+                            return False, ''
                 return True, 'ImageType=DERIVED'
         elif 'DERIVED' in str(image_type).upper():
+            if series_desc:
+                desc_upper = series_desc.upper()
+                for kw in DERIVED_IMAGE_TYPE_WHITELIST:
+                    if kw in desc_upper:
+                        return False, ''
             return True, 'ImageType=DERIVED'
-    matched_kw = match_derived_keyword(series_desc)
+    matched_kw = match_derived_keyword(series_desc, keywords=keywords)
     if matched_kw:
         return True, f"keyword '{matched_kw}'"
     return False, ''

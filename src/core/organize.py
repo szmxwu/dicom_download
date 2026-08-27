@@ -41,8 +41,14 @@ def _is_derived_series(series_desc: str, image_type=None) -> bool:
                 # 明确为原始采集，SeriesDescription 中的关键词（如 3D）不能覆盖此判断
                 return False
             if first_val == 'DERIVED':
-                # DERIVED 白名单：ADC/Dixon 等临床有意义的后处理序列应予保留
+                # DERIVED 白名单：ADC/Dixon/拼合图像等临床有意义的后处理序列应予保留。
+                # 检查 ImageType 其余值（厂商语义标记，如 SPINE 拼合）与 SeriesDescription
                 from src.core.constants import DERIVED_IMAGE_TYPE_WHITELIST
+                for extra_val in image_type[1:]:
+                    val_upper = str(extra_val).upper()
+                    for kw in DERIVED_IMAGE_TYPE_WHITELIST:
+                        if kw in val_upper:
+                            return False
                 if series_desc:
                     desc_upper = series_desc.upper()
                     for kw in DERIVED_IMAGE_TYPE_WHITELIST:
