@@ -1016,7 +1016,10 @@ def convert_dicom_to_nifti(
         )
 
         print("   ⚠️  dcm2niix not available, trying Python libraries...")
-        nifti_result = convert_with_python_libs(
+        # CPU 密集（pydicom 批量解析 + numpy 堆叠 + nibabel gzip 写盘），
+        # eventlet 下必须卸载到真实线程，否则整个 HTTP/SocketIO 层冻结（页面"卡死"）。
+        nifti_result = run_cpu_bound(
+            convert_with_python_libs,
             client, series_dir, series_name,
             dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality
         )
@@ -1358,7 +1361,8 @@ def convert_with_dcm2niix(
                                 dcm = pydicom.dcmread(dcm_file, force=True)
                                 # 探针归一化显示布局（需在删除 DICOM 之前，依赖其像素真值）：
                                 # dcm2niix 缺 IOP 时输出布局不稳定，逐文件实测校正
-                                normalize_2d_nifti_display(nifti_path, dcm, series_name)
+                                # CPU 密集（高分辨率像素探针），eventlet 下卸载到真实线程
+                                run_cpu_bound(normalize_2d_nifti_display, nifti_path, dcm, series_name)
                                 entry = _build_conversion_entry(
                                     nifti_file,
                                     dcm,

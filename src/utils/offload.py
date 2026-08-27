@@ -12,11 +12,18 @@ run_cpu_bound() 在 eventlet 环境下通过 tpool 把这类调用丢到真实 O
 """
 
 import logging
+import threading
 
 logger = logging.getLogger('DICOMApp')
 
 _tpool = None
 _tpool_checked = False
+
+# OS 线程级 TLS（eventlet 不打补丁 threading.local，同一线程上的 greenlet 共享它）。
+# 用途：防止 run_cpu_bound 嵌套——tpool 工作线程里再次调用 run_cpu_bound 时
+# 若再次 tpool.execute 会造成跨线程 green 事件等待（丢失唤醒/死锁风险），
+# 此时应直接在当前真实线程同步执行。
+_tls = threading.local()
 
 
 def fix_logging_locks_for_eventlet():
@@ -79,12 +86,23 @@ def _get_tpool():
 
 def run_cpu_bound(func, *args, **kwargs):
     """
-    在 eventlet 环境下将纯 CPU 密集函数放到真实 OS 线程执行，避免饿死事件循环。
+    在 eventlet 环境下将纯 CPU 密集/阻塞式磁盘 I/O 函数放到真实 OS 线程执行，
+    避免饿死事件循环。
 
     要求 func 内部不使用 eventlet 的 green 原语（green Lock/Queue/socket），
     只允许文件 I/O、subprocess 和纯计算。非 eventlet 环境等价于直接调用。
+
+    可嵌套：已运行在 tpool 工作线程内的调用直接同步执行，不会二次派发。
     """
     tpool = _get_tpool()
-    if tpool is None:
+    if tpool is None or getattr(_tls, 'in_tpool_worker', False):
         return func(*args, **kwargs)
-    return tpool.execute(func, *args, **kwargs)
+
+    def _runner():
+        _tls.in_tpool_worker = True
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _tls.in_tpool_worker = False
+
+    return tpool.execute(_runner)

@@ -40,7 +40,8 @@ API_DOWNLOAD = lambda task_id: f"{SERVER_URL}/api/download/{task_id}/zip"
 
 # 全局队列（生产者-消费者模式）
 task_submit_queue = Queue()  # 待提交任务队列 (accession, options)
-task_download_queue = Queue()  # 待下载任务队列 (task_id, accession, options)
+task_poll_queue = Queue()    # 待轮询任务队列 (task_id, accession, options)
+task_download_queue = Queue()  # 待下载任务队列 (task_id, accession, options)，服务端已完成
 task_process_queue = Queue()  # 待整理任务队列 (task_id, accession, zip_path, options)
 progress_lock = threading.Lock()
 
@@ -48,10 +49,12 @@ progress_lock = threading.Lock()
 def submit_task_worker(server_url, api_single, max_retries=3, retry_delay=2, queue_full_retry_delay=10):
     """生产者工作线程：提交任务到服务器"""
     while True:
+        item = None
+        got_item = False
         try:
             item = task_submit_queue.get(timeout=1)
+            got_item = True
             if item is None:  # 结束信号
-                task_submit_queue.put(None)  # 通知其他线程
                 break
 
             accession, options = item
@@ -73,7 +76,9 @@ def submit_task_worker(server_url, api_single, max_retries=3, retry_delay=2, que
                             time.sleep(queue_full_retry_delay)
                             continue
                         else:
-                            tqdm.write(f"[!] {accession} 达到最大重试次数，跳过")
+                            # 队列持续满时重新入队等待下一轮，而不是静默丢弃任务
+                            tqdm.write(f"[!] {accession} 服务器队列持续满，重新入队稍后重试")
+                            task_submit_queue.put((accession, options))
                             break
 
                     if response.status_code != 200:
@@ -89,7 +94,7 @@ def submit_task_worker(server_url, api_single, max_retries=3, retry_delay=2, que
 
                     if task_id:
                         tqdm.write(f"[+] 任务已{'加入队列' if status == 'queued' else '启动'}: {accession} (ID: {task_id})")
-                        task_download_queue.put((task_id, accession, options))
+                        task_poll_queue.put((task_id, accession, options))
                     break
 
                 except requests.exceptions.ConnectionError as e:
@@ -102,12 +107,13 @@ def submit_task_worker(server_url, api_single, max_retries=3, retry_delay=2, que
                     tqdm.write(f"[!] 提交异常 {accession}: {e}")
                     break
 
-            task_submit_queue.task_done()
-
         except QueueEmpty:
             continue
         except Exception as e:
             tqdm.write(f"[!] 提交工作线程异常: {e}")
+        finally:
+            if got_item:
+                task_submit_queue.task_done()
 
 
 def poll_task_status(task_id, server_url, api_status, timeout=30):
@@ -131,27 +137,62 @@ def poll_task_status(task_id, server_url, api_status, timeout=30):
             return False, str(e)
 
 
-def download_worker(output_dir, server_url, api_download, progress_tracker=None):
-    """消费者工作线程：轮询状态并下载结果"""
+def poll_worker(server_url, progress_tracker=None):
+    """消费者1：只轮询任务状态到终态，再把已完成任务转给下载线程。
+
+    与 ZIP 下载/解压拆池是关键设计：本地下载写盘慢时不再阻塞状态轮询，
+    服务端完成的任务能被立刻发现并转入下载队列，流水线不会因磁盘 I/O 停顿。
+    """
     api_status = lambda task_id: f"{server_url}/api/task/{task_id}/status"
 
     while True:
+        item = None
+        got_item = False
         try:
-            item = task_download_queue.get(timeout=1)
+            item = task_poll_queue.get(timeout=1)
+            got_item = True
             if item is None:
-                task_download_queue.put(None)
                 break
 
             task_id, accession, options = item
             tqdm.write(f"[*] 开始监控任务: {accession}")
 
-            # 轮询状态
             success, result = poll_task_status(task_id, server_url, api_status)
 
             if not success:
                 tqdm.write(f"[!] 任务失败 {accession}: {result}")
-                task_download_queue.task_done()
+                if progress_tracker is not None:
+                    with progress_lock:
+                        progress_tracker.setdefault('failed_accessions', set()).add(str(accession))
                 continue
+
+            task_download_queue.put((task_id, accession, options))
+
+        except QueueEmpty:
+            continue
+        except Exception as e:
+            tqdm.write(f"[!] 监控工作线程异常: {e}")
+            if item is not None and progress_tracker is not None:
+                with progress_lock:
+                    progress_tracker.setdefault('failed_accessions', set()).add(str(item[1]))
+        finally:
+            if got_item:
+                task_poll_queue.task_done()
+
+
+def download_worker(output_dir, server_url, api_download, progress_tracker=None):
+    """消费者2：仅下载 ZIP（轮询已由 poll_worker 完成）"""
+
+    while True:
+        item = None
+        got_item = False
+        try:
+            item = task_download_queue.get(timeout=1)
+            got_item = True
+            if item is None:
+                break
+
+            task_id, accession, options = item
 
             # 下载结果
             download_url = api_download(task_id)
@@ -161,7 +202,7 @@ def download_worker(output_dir, server_url, api_download, progress_tracker=None)
                 with requests.get(download_url, stream=True, timeout=(30, 300)) as r:
                     r.raise_for_status()
                     with open(target_zip, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192):
+                        for chunk in r.iter_content(chunk_size=262144):
                             f.write(chunk)
 
                 tqdm.write(f"[+] 下载完成: {accession}")
@@ -176,22 +217,31 @@ def download_worker(output_dir, server_url, api_download, progress_tracker=None)
 
             except Exception as e:
                 tqdm.write(f"[!] 下载失败 {accession}: {e}")
-
-            task_download_queue.task_done()
+                if progress_tracker is not None:
+                    with progress_lock:
+                        progress_tracker.setdefault('failed_accessions', set()).add(str(accession))
 
         except QueueEmpty:
             continue
         except Exception as e:
             tqdm.write(f"[!] 下载工作线程异常: {e}")
+            if item is not None and progress_tracker is not None:
+                with progress_lock:
+                    progress_tracker.setdefault('failed_accessions', set()).add(str(item[1]))
+        finally:
+            if got_item:
+                task_download_queue.task_done()
 
 
 def process_download_worker(output_dir, progress_tracker=None):
-    """整理工作线程：解压并整理下载的文件"""
+    """消费者3：解压并整理下载的文件"""
     while True:
+        item = None
+        got_item = False
         try:
             item = task_process_queue.get(timeout=1)
+            got_item = True
             if item is None:
-                task_process_queue.put(None)
                 break
 
             task_id, accession, zip_path, options = item
@@ -260,13 +310,20 @@ def process_download_worker(output_dir, progress_tracker=None):
 
             except Exception as e:
                 tqdm.write(f"[!] 整理失败 {accession}: {e}")
-
-            task_process_queue.task_done()
+                if progress_tracker is not None:
+                    with progress_lock:
+                        progress_tracker.setdefault('failed_accessions', set()).add(str(accession))
 
         except QueueEmpty:
             continue
         except Exception as e:
             tqdm.write(f"[!] 整理工作线程异常: {e}")
+            if item is not None and progress_tracker is not None:
+                with progress_lock:
+                    progress_tracker.setdefault('failed_accessions', set()).add(str(item[1]))
+        finally:
+            if got_item:
+                task_process_queue.task_done()
 
 
 def _col(row, *names, default=''):
@@ -523,9 +580,12 @@ def merge_metadata_excel(output_dir, accession_list):
 
 
 def download_list_parallel(acc_list, output_dir="./downloads", fmt='nifti', modality=None,
-                           min_files=10, exclude_derived=True, num_submitters=2, num_downloaders=3,
-                           num_processors=2, recover_dicom=False):
+                           min_files=10, exclude_derived=True, num_submitters=2, num_pollers=4,
+                           num_downloaders=3, num_processors=2, recover_dicom=False):
     """批量下载多个 AccessionNumber 的结果，使用生产者-消费者并行模式。
+
+    流水线为四级独立线程池：提交 → 轮询 → 下载 ZIP → 解压整理。
+    轮询与下载/解压拆池后，本地下载写盘慢不再阻塞状态监控，服务端持续被喂满。
 
     Args:
         acc_list: AccessionNumber 列表
@@ -535,6 +595,7 @@ def download_list_parallel(acc_list, output_dir="./downloads", fmt='nifti', moda
         min_files: 最小文件数
         exclude_derived: 是否排除衍生序列
         num_submitters: 任务提交线程数
+        num_pollers: 状态轮询线程数（默认 4）
         num_downloaders: 下载线程数
         num_processors: 整理线程数
         recover_dicom: 是否恢复 DICOM 文件
@@ -570,10 +631,11 @@ def download_list_parallel(acc_list, output_dir="./downloads", fmt='nifti', moda
         'submitted': 0,
         'downloaded': 0,
         'processed': 0,
-        'completed_accessions': set()
+        'completed_accessions': set(),
+        'failed_accessions': set()
     }
 
-    # 启动工作线程
+    # 启动工作线程（提交 → 轮询 → 下载 → 整理 四级独立线程池）
     threads = []
 
     # 提交线程（生产者）
@@ -587,7 +649,18 @@ def download_list_parallel(acc_list, output_dir="./downloads", fmt='nifti', moda
         t.start()
         threads.append(t)
 
-    # 下载线程（消费者1）
+    # 轮询线程（消费者1：纯网络等待，开销极低）
+    for i in range(num_pollers):
+        t = threading.Thread(
+            target=poll_worker,
+            args=(SERVER_URL, progress_tracker),
+            name=f"Poller-{i}"
+        )
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    # 下载线程（消费者2：仅下载 ZIP）
     for i in range(num_downloaders):
         t = threading.Thread(
             target=download_worker,
@@ -598,7 +671,7 @@ def download_list_parallel(acc_list, output_dir="./downloads", fmt='nifti', moda
         t.start()
         threads.append(t)
 
-    # 整理线程（消费者2）
+    # 整理线程（消费者3）
     for i in range(num_processors):
         t = threading.Thread(
             target=process_download_worker,
@@ -617,26 +690,41 @@ def download_list_parallel(acc_list, output_dir="./downloads", fmt='nifti', moda
     for _ in range(num_submitters):
         task_submit_queue.put(None)
 
-    # 使用 tqdm 显示进度
+    # 后台按流水线顺序逐级关闭 worker；主线程保持进度显示
+    def close_workers():
+        task_submit_queue.join()
+        for _ in range(num_pollers):
+            task_poll_queue.put(None)
+        task_poll_queue.join()
+        for _ in range(num_downloaders):
+            task_download_queue.put(None)
+        task_download_queue.join()
+        for _ in range(num_processors):
+            task_process_queue.put(None)
+        task_process_queue.join()
+
+    closer = threading.Thread(target=close_workers, name='BatchCloser', daemon=True)
+    closer.start()
+
+    # 使用 tqdm 显示进度（完成 + 失败都算已终结，避免个别失败任务导致进度条永不结束）
     with tqdm(total=total_pending, desc="下载进度") as pbar:
-        last_completed = 0
-        while True:
+        last_finalized = 0
+        while closer.is_alive():
             with progress_lock:
-                current_completed = len(progress_tracker['completed_accessions'])
+                current_finalized = len(progress_tracker['completed_accessions']) + len(progress_tracker['failed_accessions'])
 
-            if current_completed > last_completed:
-                pbar.update(current_completed - last_completed)
-                last_completed = current_completed
-
-            if current_completed >= total_pending and task_submit_queue.empty() and task_download_queue.empty() and task_process_queue.empty():
-                break
+            if current_finalized > last_finalized:
+                pbar.update(current_finalized - last_finalized)
+                last_finalized = current_finalized
 
             time.sleep(0.5)
 
-    # 等待队列处理完成
-    task_submit_queue.join()
-    task_download_queue.join()
-    task_process_queue.join()
+    closer.join()
+
+    with progress_lock:
+        failed_count = len(progress_tracker['failed_accessions'])
+    if failed_count:
+        tqdm.write(f"[!] 本轮失败 {failed_count} 条（未标记完成，下次运行会自动重试）")
 
     # 保存进度
     with progress_lock:
@@ -687,6 +775,7 @@ def main(cli_args=None):
         parser.add_argument("--recover-dicom", action="store_true", help="根据 meta Excel 恢复 DICOM 文件到 dicom/ 子目录")
         parser.add_argument("--parallel",default=True ,action="store_true", help="使用生产者-消费者并行模式（批量下载时推荐）")
         parser.add_argument("--num-submitters", type=int, default=2, help="并行模式：任务提交线程数 (默认: 2)")
+        parser.add_argument("--num-pollers", type=int, default=4, help="并行模式：状态轮询线程数 (默认: 4)")
         parser.add_argument("--num-downloaders", type=int, default=3, help="并行模式：下载线程数 (默认: 3)")
         parser.add_argument("--num-processors", type=int, default=2, help="并行模式：整理线程数 (默认: 2)")
         args = parser.parse_args()
@@ -704,6 +793,7 @@ def main(cli_args=None):
                 min_files=args.min_files,
                 exclude_derived=not args.include_derived,
                 num_submitters=args.num_submitters,
+                num_pollers=args.num_pollers,
                 num_downloaders=args.num_downloaders,
                 num_processors=args.num_processors,
                 recover_dicom=args.recover_dicom
@@ -714,8 +804,12 @@ def main(cli_args=None):
         return _main_single(args)
 
 
-def _main_single(args):
-    """单任务下载流程（原始逻辑）。"""
+def _submit_single(args):
+    """仅提交单个任务，返回 task_id（失败返回 None）。
+
+    从 _main_single 拆出：串行批量模式用它提前提交下一个任务，
+    使服务端在本地 下载/解压 期间保持工作，消除任务间空闲。
+    """
     filter_info = []
     if args.modality:
         filter_info.append(f"Modality={args.modality}")
@@ -762,30 +856,39 @@ def _main_single(args):
                     continue
                 else:
                     print(f"[!] 已达到最大重试次数")
-                    return False
+                    return None
 
             if response.status_code != 200:
                 print(f"[!] 提交任务失败 ({response.status_code}): {response.text}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                     continue
-                return False
+                return None
 
             data = response.json()
             task_id = data.get('task_id')
             status = data.get('status', 'started')
+            if not task_id:
+                print(f"[!] 服务端响应缺少 task_id: {response.text}")
+                return None
             if status == 'queued':
                 print(f"[+] 任务已加入队列，ID: {task_id} (等待中...)")
             else:
                 print(f"[+] 任务已启动，ID: {task_id}")
-            break
+            return task_id
         except Exception as e:
             print(f"[!] 提交失败: {e}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
             else:
-                return False
-    else:
+                return None
+    return None
+
+
+def _main_single(args):
+    """单任务下载流程。"""
+    task_id = _submit_single(args)
+    if not task_id:
         return False
 
     # 轮询状态
@@ -865,7 +968,7 @@ def download_and_extract(task_id, output_dir, accession=None):
         with requests.get(download_url, stream=True, timeout=(30, 300)) as r:
             r.raise_for_status()
             with open(target_zip, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_content(chunk_size=262144):
                     f.write(chunk)
 
         print(f"[+] 下载完成，正在解压...")
@@ -1182,18 +1285,22 @@ def save_progress(output_dir, completed_set, timings_dict=None, quality_records=
 
 def download_list(acc_list, output_dir="./downloads", fmt='nifti', modality=None, min_files=10,
                   exclude_derived=True, recover_dicom=False, parallel=False,
-                  num_submitters=2, num_downloaders=3, num_processors=2):
+                  num_submitters=2, num_pollers=4, num_downloaders=3, num_processors=2):
     """批量下载多个 AccessionNumber 的结果。
 
     支持串行或生产者-消费者并行模式。
+    串行模式同样做了流水化：当前任务的本地 下载/解压 与下一个任务的服务端处理重叠，
+    消除任务之间的服务端空闲。
     """
     if parallel:
         return download_list_parallel(
             acc_list, output_dir, fmt, modality, min_files, exclude_derived,
-            num_submitters, num_downloaders, num_processors, recover_dicom
+            num_submitters=num_submitters, num_pollers=num_pollers,
+            num_downloaders=num_downloaders, num_processors=num_processors,
+            recover_dicom=recover_dicom
         )
 
-    # 串行模式（原始逻辑，增加了 recover_dicom 支持）
+    # 串行模式（流水线：当前任务的本地 下载/解压 与下一个任务的服务端处理重叠）
     completed, timings, quality_records = load_progress(output_dir)
     total = len(acc_list)
 
@@ -1219,13 +1326,12 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti', modality=None
     if filter_info:
         tqdm.write(f"[i] 过滤条件: {', '.join(filter_info)}")
 
-    for accession in tqdm(acc_list):
-        if str(accession) in completed:
-            tqdm.write(f"\n--- 跳过（已完成） AccessionNumber: {accession} ---")
-            continue
-        tqdm.write(f"\n=== 处理 AccessionNumber: {accession} ===")
+    pending_list = [acc for acc in acc_list if str(acc) not in completed]
+    if len(pending_list) < total:
+        tqdm.write(f"[i] 跳过已完成 {total - len(pending_list)} 个，待处理 {len(pending_list)} 个")
 
-        main_args = argparse.Namespace(
+    def _make_args(accession):
+        return argparse.Namespace(
             accession=str(accession),
             output_dir=output_dir,
             format=fmt,
@@ -1235,8 +1341,39 @@ def download_list(acc_list, output_dir="./downloads", fmt='nifti', modality=None
             recover_dicom=False  # 在串行模式下不在这里处理，由外部统一处理
         )
 
-        start_t = time.time()
-        ok = _main_single(main_args)
+    def _submit_at(index):
+        """提交 pending_list[index] 并返回 (accession, task_id, start_t)；越界返回 None。"""
+        if index >= len(pending_list):
+            return None
+        next_acc = str(pending_list[index])
+        next_tid = _submit_single(_make_args(next_acc))
+        return (next_acc, next_tid, time.time())
+
+    # 预提交第一个任务，之后每当前任务在服务端一结束就立刻预提交下一个
+    current = _submit_at(0)
+
+    for i, accession in enumerate(tqdm(pending_list)):
+        accession = str(accession)
+        tqdm.write(f"\n=== 处理 AccessionNumber: {accession} ===")
+
+        if current is None or current[0] != accession:
+            # 防御：预提交状态与当前项不一致时重新提交
+            current = _submit_at(i)
+            if current is None:
+                continue
+        _, task_id, start_t = current
+
+        ok = False
+        if task_id:
+            success, _result = poll_task_status_single(task_id)
+            # 关键：服务端任务一到终态就提交下一个，本地 下载/解压 期间服务端不空闲
+            current = _submit_at(i + 1)
+            if success:
+                ok = bool(download_and_extract(task_id, output_dir, accession=accession))
+        else:
+            tqdm.write(f"[!] 提交失败: {accession}")
+            current = _submit_at(i + 1)
+
         elapsed = time.time() - start_t
 
         if ok:

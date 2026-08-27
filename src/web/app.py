@@ -93,6 +93,10 @@ import secrets
 # 导入我们的DICOM处理客户端
 from src.client.unified import DICOMDownloadClient
 from src.utils.packaging import create_result_zip
+# monkey_patch 已完成（见文件头部），此处导入 offload 是安全的。
+# create_result_zip/save_to_cache 涉及 GB 级磁盘读写，在 contended HDD 上的
+# 阻塞式 read/write 会把整个 eventlet hub 冻住（页面"卡死"），必须经 tpool 卸载。
+from src.utils.offload import run_cpu_bound
 from src.utils.cache import (
     get_cache_dir, cache_exists, copy_from_cache,
     save_to_cache, clear_all_cache, get_cache_stats,
@@ -2043,7 +2047,8 @@ def process_single_task(task):
                     task.add_log('Creating result ZIP...')
                     logger.info(f"Creating ZIP: source={results['organized_dir']}, task_id={task.task_id}, result_dir={app.config['RESULT_FOLDER']}")
                     try:
-                        zip_path = create_result_zip(
+                        zip_path = run_cpu_bound(
+                            create_result_zip,
                             results['organized_dir'],
                             task.task_id,
                             app.config['RESULT_FOLDER'],
@@ -2060,7 +2065,8 @@ def process_single_task(task):
                 
                 # --- 保存到磁盘缓存 ---
                 try:
-                    save_to_cache(
+                    run_cpu_bound(
+                        save_to_cache,
                         results['organized_dir'],
                         cache_dir,
                         zip_path=results.get('result_zip'),
@@ -2273,7 +2279,8 @@ def process_batch_task(task):
                     try:
                         zip_path = None
                         if result.get('organized_dir'):
-                            zip_path = create_result_zip(
+                            zip_path = run_cpu_bound(
+                                create_result_zip,
                                 result['organized_dir'],
                                 task.task_id,
                                 app.config['RESULT_FOLDER'],
@@ -2281,7 +2288,8 @@ def process_batch_task(task):
                                 include_subdirs=set(result.get('series_info', {}).keys())
                             )
                             result['result_zip'] = zip_path
-                        save_to_cache(
+                        run_cpu_bound(
+                            save_to_cache,
                             result['organized_dir'],
                             cache_dir,
                             zip_path=zip_path,
@@ -2305,7 +2313,8 @@ def process_batch_task(task):
         
         # 合并结果
         batch_result_dir = os.path.join(app.config['RESULT_FOLDER'], task.task_id)
-        zip_path = create_result_zip(
+        zip_path = run_cpu_bound(
+            create_result_zip,
             batch_result_dir,
             f"batch_{task.task_id}",
             app.config['RESULT_FOLDER']
@@ -2469,7 +2478,8 @@ def process_upload_task(task):
             task.update_status('running', 95, 'Creating result files')
             task.add_log("Creating result files...")
             zip_source = organized_dir or result_dir
-            zip_path = create_result_zip(
+            zip_path = run_cpu_bound(
+                create_result_zip,
                 zip_source,
                 task.task_id,
                 app.config['RESULT_FOLDER'],
@@ -2636,7 +2646,37 @@ def get_filter_keywords():
     })
 
 
+def _acquire_single_instance_lock():
+    """单实例锁：防止同一机器上启动多个服务实例。
+
+    eventlet 下两个进程可以同时 LISTEN 同一端口（SO_REUSEPORT 语义），
+    内核会把 HTTP 连接负载均衡到两个进程——任务状态、C-STORE SCP 被撕裂，
+    产生收不到文件的僵尸任务（2026-08-27 线上实测）。
+    返回锁文件句柄（必须保持引用防止 GC 释放锁）；已被占用则直接退出。
+    """
+    lock_path = os.path.join(project_root, 'logs', 'app.lock')
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = open(lock_path, 'a+')
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            fd.seek(0)
+            if not fd.read(1):
+                fd.write(b'\0')
+                fd.flush()
+            fd.seek(0)
+            msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.error(f"❌ 已有另一个实例在运行（锁文件 {lock_path} 被占用），本实例退出")
+        sys.exit(1)
+    return fd
+
+
 if __name__ == '__main__':
+    _single_instance_lock = _acquire_single_instance_lock()
     logger.info("="*60)
     logger.info("🏥 DICOM处理Web应用启动")
     logger.info("="*60)

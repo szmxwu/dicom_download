@@ -817,8 +817,16 @@ class DICOMDownloadClient:
                 # 保存文件
                 # 不做全量重编码（pydicom 3.x 默认 enforce_file_format=False，
                 # 2.x 默认 write_like_original=True），原样序列化 CPU 开销低一个量级；
-                # 同时卸载到真实线程，避免 eventlet 事件循环被写盘 CPU 饿死
+                # 同时卸载到真实线程，避免 eventlet 事件循环被写盘 CPU 饿死。
+                # 注意必须补 128 字节 preamble：网络接收的 dataset 没有文件 preamble，
+                # write_like_original 模式原样保存导致文件缺 DICM 魔数——显式 VR 文件
+                # dcm2niix 还能靠启发式嗅探识别，隐式 VR（老 Philips 等）直接被拒收
+                # （"Unable to find any DICOM images"），整个序列回退到慢速 python-libs 转换。
+                # pynetdicom 解码的 Dataset 可能根本没有 preamble 属性（AttributeError），
+                # 必须用 getattr 且放在 try 内，避免异常逃出 C-STORE 回调。
                 try:
+                    if getattr(dataset, 'preamble', None) is None:
+                        dataset.preamble = b"\x00" * 128
                     run_cpu_bound(dataset.save_as, filepath)
                 except Exception as e:
                     logger.error(f"❌ Failed to save dataset to {filepath}: {e}")
