@@ -611,31 +611,14 @@ def assess_image_quality_from_array(
             if over_exposed:
                 reasons.append(QualityReasons.OVER_EXPOSED)
 
-        # 边缘反转检测（检查边框与中心的差异）
-        slice_data = pixel_data
-        if slice_data.ndim > 2:
-            mid = slice_data.shape[-1] // 2
-            slice_data = slice_data[..., mid]
-        if slice_data.ndim == 2:
-            h, w = slice_data.shape
-            border = max(1, int(min(h, w) * 0.1))
-            border_mask = np.zeros((h, w), dtype=bool)
-            border_mask[:border, :] = True
-            border_mask[-border:, :] = True
-            border_mask[:, :border] = True
-            border_mask[:, -border:] = True
-            center_mask = ~border_mask
-            border_vals = slice_data[border_mask]
-            center_vals = slice_data[center_mask]
-            if border_vals.size > 0 and center_vals.size > 0:
-                border_mean = float(np.mean(border_vals))
-                center_mean = float(np.mean(center_vals))
-                # 检测灰度反转：边框比中心亮（对于医学影像通常不正常）
-                inverted_like = border_mean - center_mean > 0.1 * range_eps
-                if inverted_like:
-                    reasons.append(QualityReasons.GRAYSCALE_INVERTED)
-                    metrics['border_mean'] = round(border_mean, 2)
-                    metrics['center_mean'] = round(center_mean, 2)
+        # 灰度反转检测（border vs center 启发式）已退役。
+        # 该判据（边框比中心亮 > 0.1×range，原为 2D X 光设计）对胸部 CT 在解剖学上
+        # 天然成立（边框=胸壁软组织、中心=肺野空气），曾多次把正常 CT 误判为反转
+        # 并被 fix_nifti 真的反转（生产事故：/mnt/h/dicom/flip 儿童胸部 CT 4 个
+        # 诊断序列被"Fixed: grayscale"，好数据被静默反转）。
+        # 真正的灰度反转（含 tag 不可信场景）现在在转换阶段由
+        # convert.normalize_2d_nifti_display 以源 DICOM 像素为真值探针修正，
+        # 可靠且只发生在转换时一次。
 
         # 分割图/掩码检测
         # 主要针对2D X-ray图像（DX/DR/CR/MG等）以及CT/MR分割掩码，检测是否为分割掩码
@@ -674,24 +657,16 @@ def detect_nifti_orientation_error(
     dicom_metadata: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
-    检测 NIfTI 文件是否存在方向错误（dcm2niix bug）
-    
-    对于2D X-ray图像（DX/DR/CR），当原始DICOM缺少ImageOrientationPatient(IOP)时，
-    dcm2niix有时会生成Y轴翻转的NIfTI文件，导致图像上下颠倒。
-    
-    检测逻辑：
-    1. 只对2D X-ray模态（DX/DR/CR/RF）进行检测
-    2. 检查是否为2D或伪3D图像（第三维为1）
-    3. 如果有DICOM元数据，检查是否缺少IOP
-    4. 使用启发式方法检测NIfTI数据是否可能被翻转
-    
-    Args:
-        img: nibabel Nifti1Image 对象
-        modality: 模态代码 (DX, DR, CR, etc.)
-        dicom_metadata: 可选的DICOM元数据字典，用于辅助判断
-        
+    检测 NIfTI 文件是否存在方向错误（dcm2niix bug）——已停用。
+
+    历史逻辑：2D X-ray 缺少 ImageOrientationPatient 时判定 dcm2niix 输出
+    翻转并自动修复。但 dcm2niix 缺 IOP 时的输出布局随图像变化（多种家族），
+    该启发式既误杀也漏杀。现在 2D 显示方向在转换阶段由
+    convert.normalize_2d_nifti_display 用源 DICOM 像素探针实测保证，
+    本函数保留签名（兼容既有调用），对所有输入返回 False。
+
     Returns:
-        bool: 是否存在方向错误
+        bool: 恒为 False
     """
     try:
         modality = (modality or '').upper()
@@ -709,52 +684,15 @@ def detect_nifti_orientation_error(
             pass
         else:
             return False
-        
-        # 如果有DICOM元数据，检查是否缺少ImageOrientationPatient
-        # 这是dcm2niix产生方向错误的主要原因
-        if dicom_metadata is not None:
-            iop = dicom_metadata.get('ImageOrientationPatient')
-            if iop is None:
-                # 缺少IOP时，dcm2niix可能使用默认方向，导致翻转
-                return True
-        
-        # 启发式检测：分析NIfTI的affine矩阵和数据布局
-        # 对于典型的X-ray，如果affine的Y轴方向与数据存储不匹配，
-        # 可能存在方向问题
-        
-        affine = img.affine
-        
-        # 检查affine的Y轴（第二列）在图像平面内的投影
-        # 对于典型的2D X-ray，Y轴应该主要沿图像的垂直方向
-        y_axis_x = abs(affine[0, 1])  # Y轴在X方向的投影
-        y_axis_y = abs(affine[1, 1])  # Y轴在Y方向的投影
-        
-        # 如果Y轴主要在水平方向（X方向），说明坐标系可能有问题
-        if y_axis_x > y_axis_y:
-            return True
-        
-        # 数据驱动的启发式检测：
-        # 对于典型的骨盆/胸部X-ray，图像中心区域通常比边框亮
-        # 如果检测到数据分布异常，可能存在方向问题
-        
-        # 获取2D切片
-        slice_2d = data if data.ndim == 2 else data[:, :, 0]
-        h, w = slice_2d.shape
-        
-        # 检查上下边框的像素值分布
-        border_size = max(1, h // 20)  # 5%的边框
-        top_border = slice_2d[:border_size, :]
-        bottom_border = slice_2d[-border_size:, :]
-        
-        top_mean = np.mean(top_border)
-        bottom_mean = np.mean(bottom_border)
-        center_mean = np.mean(slice_2d[h//3:2*h//3, w//3:2*w//3])
-        
-        # 如果上下边框都比中心亮很多，可能存在异常
-        # 但这种检测不太可靠，容易产生假阳性
-        
+
+        # 2D X-ray 的显示方向已在转换阶段保证正确：
+        # convert.normalize_2d_nifti_display 用源 DICOM 像素探针实测归一化布局，
+        # python-libs 路径原生即为 DICOM 布局。此处任何基于"缺 IOP"或仿射形状的
+        # 启发式翻转都会二次翻转正确的数组（生产事故：M20112002685 全脊柱预览
+        # 头脚颠倒；归一化仿射恰为轴交换形态，会被旧的 y_axis_x>y_axis_y 规则误杀）。
+        # 因此本函数保留签名但不再判定 2D 方向错误。
         return False
-        
+
     except Exception:
         return False
 

@@ -602,7 +602,10 @@ def _probe_content_layout(
 
     在 G_d 网格上采样探针点（若干层的 (r,c) 网格），对全部 48 种带符号置换
     候选布局，计算 NIfTI 数据在 L(p) 处与 DICOM 像素在 p 处的皮尔逊相关系数，
-    返回相关度达标的布局矩阵。
+    按绝对值最大选取相关度达标的布局矩阵。
+
+    返回的相关系数带符号：强正 = 内容一致；强负 = 几何布局正确但灰度被
+    转换器反转（调用方据此还原灰度）。
 
     参数:
         data: NIfTI 体数据（3D）
@@ -652,7 +655,7 @@ def _probe_content_layout(
     pts = np.asarray(probe_pts, dtype=np.float64)  # (N, 3)
 
     best_layout = None
-    best_corr = -1.0
+    best_corr = 0.0  # 带符号最佳相关：按绝对值最大选取；强负 = 内容灰度被反转
     for perm in itertools.permutations(range(3)):
         expected_shape = tuple(gd_shape[perm[a]] for a in range(3))
         if expected_shape != tuple(data.shape[:3]):
@@ -669,10 +672,10 @@ def _probe_content_layout(
             if gathered.std() < 1e-6:
                 continue
             corr = float(np.corrcoef(gathered, probe_vals_arr)[0, 1])
-            if corr > best_corr:
+            if abs(corr) > abs(best_corr):
                 best_corr = corr
                 best_layout = L
-    if best_layout is not None and best_corr >= _PROBE_CORR_THRESHOLD:
+    if best_layout is not None and abs(best_corr) >= _PROBE_CORR_THRESHOLD:
         return best_layout, best_corr
     return None
 
@@ -772,6 +775,19 @@ def verify_and_fix_orientation(
         if probe is not None:
             layout_matrix, corr = probe
             result['probe_corr'] = corr
+            if corr <= -_PROBE_CORR_THRESHOLD:
+                # 正确布局下相关强负 = 转换器把体数据灰度反转了
+                # （如 dcm2niix 对 MONOCHROME1 处理不当的已知 bug；MR 偶发反转实证）。
+                # 以源 DICOM 像素为真值还原，再做后续仿射/镜像校验。
+                # max+min-v 在转换器纯反转模型（v'=C-v）下是精确还原。
+                data = float(data.max()) + float(data.min()) - data
+                nifti_img = _rebuild_nifti(nifti_img, data, nifti_affine)
+                result['fixes'].append('grayscale_inversion')
+                logger.warning(
+                    "[ORIENTATION] %s: grayscale inversion detected (probe corr=%.4f), "
+                    "content inverted back to match DICOM pixels",
+                    series_name, corr
+                )
             # 内容与仿射是否自洽：仿射隐含的布局（T）应等于实测内容布局
             if not np.allclose(layout_matrix, T, atol=_PERM_TOL, rtol=0):
                 # 不自洽（转换器 bug，如纯 Python 路径面内镜像）：修正仿射匹配实测布局
@@ -1334,11 +1350,15 @@ def convert_with_dcm2niix(
 
                     if result and result.returncode == 0:
                         nifti_file = f"{file_output_name}.nii.gz"
-                        if os.path.exists(os.path.join(series_dir, nifti_file)):
+                        nifti_path = os.path.join(series_dir, nifti_file)
+                        if os.path.exists(nifti_path):
                             output_files.append(nifti_file)
                             success_count += 1
                             try:
-                                dcm = pydicom.dcmread(dcm_file, force=True, stop_before_pixels=True)
+                                dcm = pydicom.dcmread(dcm_file, force=True)
+                                # 探针归一化显示布局（需在删除 DICOM 之前，依赖其像素真值）：
+                                # dcm2niix 缺 IOP 时输出布局不稳定，逐文件实测校正
+                                normalize_2d_nifti_display(nifti_path, dcm, series_name)
                                 entry = _build_conversion_entry(
                                     nifti_file,
                                     dcm,
@@ -1556,8 +1576,128 @@ def _build_2d_xray_affine(dcm: FileDataset) -> np.ndarray:
     # 原点设置为左上角 (RAS 坐标)
     # 左上角在患者坐标系中的位置：左-后-上
     affine[:3, 3] = [0.0, 0.0, 0.0]
-    
+
     return affine
+
+
+def normalize_2d_nifti_display(
+    nifti_path: str,
+    dcm: FileDataset,
+    series_name: str = '',
+    corr_threshold: float = 0.98
+) -> Dict[str, Any]:
+    """
+    将 2D X-ray NIfTI 归一化为 DICOM 显示布局（探针实测，不猜约定）。
+
+    dcm2niix 在缺少 IOP 时的输出布局随图像内容/尺寸而变化（实测同一家医院
+    出现 (cols,rows)+行翻转 与 (rows,cols)+列镜像 两种家族），任何硬编码
+    转置/翻转都会顾此失彼。本函数用源 DICOM 像素做真值，对 8 种二面体
+    变换（转置 × 上下/左右翻转）逐一计算相关系数，选取达标者重写 NIfTI，
+    使数组与 DICOM 像素逐点一致（行,列,1）。
+
+    顺带检测灰度反转：最佳布局的相关为强负（≤ -threshold）时说明转换器
+    反了灰度（tag 与像素不一致的场景），一并反转修正。
+
+    归一化后仿射统一为 _build_2d_xray_affine 约定，下游（预览/QC）
+    可直接使用原始数组，无需再做任何翻转。
+
+    返回:
+        result 字典：action ∈ {normalized, inverted_normalized, ok, not_verifiable, error}
+    """
+    result: Dict[str, Any] = {'action': 'ok', 'transform': None, 'corr': None, 'message': ''}
+    try:
+        img = nib.load(nifti_path)
+        data = np.asanyarray(img.dataobj).astype(np.float32)
+        while data.ndim > 2:
+            data = data[..., 0] if data.shape[-1] == 1 else data[..., data.shape[-1] // 2]
+
+        ref = dcm.pixel_array.astype(np.float32)
+        ref = apply_rescale(ref, dcm)
+        ref = apply_photometric(ref, dcm)
+        rows, cols = ref.shape
+
+        # 子采样网格（≤96 点/维），相关系数对线性灰度变换不变
+        sr = max(1, rows // 96)
+        sc = max(1, cols // 96)
+        ref_sub = ref[::sr, ::sc].ravel()
+        if float(ref_sub.std()) < 1e-6:
+            result['action'] = 'not_verifiable'
+            result['message'] = 'blank DICOM pixels, probe skipped'
+            return result
+
+        candidates = {
+            'identity': data,
+            'flipud': data[::-1, :],
+            'fliplr': data[:, ::-1],
+            'rot180': data[::-1, ::-1],
+            'transpose': data.T,
+            'transpose_flipud': data.T[::-1, :],
+            'transpose_fliplr': data.T[:, ::-1],
+            'transpose_rot180': data.T[::-1, ::-1],
+        }
+        best_name, best_corr, best_arr = None, 0.0, None
+        for name, cand in candidates.items():
+            if cand.shape != ref.shape:
+                continue
+            cand_sub = cand[::sr, ::sc].ravel()
+            if float(cand_sub.std()) < 1e-6:
+                continue
+            corr = float(np.corrcoef(cand_sub, ref_sub)[0, 1])
+            if abs(corr) > abs(best_corr):
+                best_name, best_corr, best_arr = name, corr, cand
+
+        if best_name is None or abs(best_corr) < corr_threshold:
+            result['action'] = 'not_verifiable'
+            result['corr'] = round(best_corr, 4) if best_name else None
+            result['message'] = f'no dihedral transform reached threshold (best={best_name}, corr={best_corr:.4f})'
+            logger.warning(
+                "[2D-NORMALIZE] %s: %s — keeping dcm2niix layout",
+                series_name, result['message']
+            )
+            return result
+
+        normalized = best_arr
+        action = 'normalized'
+        if best_corr < 0:
+            # 强负相关：转换器输出了灰度反转的像素，一并修正
+            normalized = float(normalized.max()) + float(normalized.min()) - normalized
+            action = 'inverted_normalized'
+
+        if best_name == 'identity' and best_corr > 0:
+            # 已经是 DICOM 布局，无需重写文件
+            result['corr'] = round(best_corr, 4)
+            result['transform'] = 'identity'
+            result['message'] = 'already in DICOM display layout'
+            return result
+
+        new_data = normalized.astype(np.float32)[:, :, np.newaxis]
+        new_affine = _build_2d_xray_affine(dcm)
+        new_img = nib.Nifti1Image(new_data, new_affine)
+        try:
+            new_img.set_qform(new_affine, code=1)
+            new_img.set_sform(new_affine, code=1)
+        except Exception:
+            pass
+        nib.save(new_img, nifti_path)
+
+        result.update({
+            'action': action,
+            'transform': best_name,
+            'corr': round(best_corr, 4),
+            'message': f'{best_name} corr={best_corr:.4f}'
+        })
+        logger.warning(
+            "[2D-NORMALIZE] %s: %s -> DICOM layout (transform=%s, corr=%.4f%s)",
+            series_name, os.path.basename(nifti_path), best_name, best_corr,
+            ', grayscale inverted' if action == 'inverted_normalized' else ''
+        )
+        return result
+    except Exception as e:
+        logger.warning("[2D-NORMALIZE] %s: normalize failed for %s: %s",
+                       series_name, os.path.basename(nifti_path), e)
+        result['action'] = 'error'
+        result['message'] = str(e)
+        return result
 
 
 def convert_with_python_libs(

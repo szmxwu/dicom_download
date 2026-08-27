@@ -17,6 +17,7 @@ import logging
 from typing import Optional, Dict
 
 from src.utils.offload import run_cpu_bound
+from src.core.constants import get_filter_rules_fingerprint
 
 # 使用共享 logger（项目约定），保证缓存步骤的耗时在 app.log 中可见
 logger = logging.getLogger('DICOMApp')
@@ -112,13 +113,23 @@ def _sanitize_accession(accession_number: str) -> str:
 
 
 def _compute_param_hash(accession_number: str, options: Dict) -> str:
-    """根据参数计算缓存哈希。"""
+    """根据参数计算缓存哈希。
+
+    除下载参数外，还混入两项与过滤结果直接相关的因子：
+    - derived_keywords：任务级关键词覆盖（options.derived_keywords），
+      不同关键词集合必须落到不同的缓存条目；
+    - filter_rules：constants.py 过滤规则指纹（关键词默认值/例外表/白名单），
+      规则代码修改后旧缓存条目自动失配，避免旧过滤逻辑的结果被命中。
+    """
+    task_keywords = options.get("derived_keywords")
     params = {
         "accession_number": accession_number,
         "modality_filter": options.get("modality_filter"),
         "min_series_files": options.get("min_series_files"),
         "exclude_derived": options.get("exclude_derived", True),
         "output_format": options.get("output_format", "nifti"),
+        "derived_keywords": sorted(str(k).upper() for k in task_keywords) if task_keywords else None,
+        "filter_rules": get_filter_rules_fingerprint(),
     }
     param_str = json.dumps(params, sort_keys=True, ensure_ascii=False)
     return hashlib.md5(param_str.encode("utf-8")).hexdigest()[:8]

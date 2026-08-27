@@ -168,6 +168,24 @@ def get_derived_keywords():
     return _runtime_derived_keywords
 
 
+def get_filter_rules_fingerprint():
+    """过滤规则指纹（短哈希），随规则内容自动变化。
+
+    覆盖：当前生效关键词 + DERIVED_KEYWORD_EXCEPTIONS 例外表 +
+    DERIVED_IMAGE_TYPE_WHITELIST 白名单。用于缓存键（cache.py），
+    任何一处规则修改都会使旧缓存条目失配——避免旧过滤逻辑
+    （如 iDose 误过滤、无全脊柱白名单）产生的结果被新代码命中。
+    """
+    import hashlib
+    import json
+    payload = json.dumps({
+        'kw': sorted(k.upper() for k in get_derived_keywords()),
+        'ex': sorted((k, tuple(v)) for k, v in DERIVED_KEYWORD_EXCEPTIONS.items()),
+        'wl': sorted(DERIVED_IMAGE_TYPE_WHITELIST),
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(payload.encode('utf-8')).hexdigest()[:8]
+
+
 def set_derived_keywords(keywords):
     """设置衍生序列过滤关键词列表（立即生效）。
 

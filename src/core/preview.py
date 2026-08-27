@@ -438,6 +438,17 @@ def _load_image_2d(preview_file: str, is_3d: bool, preview_idx: int, orientation
         elif preview_file.endswith(('.nii', '.nii.gz')):
             img = nib.load(preview_file)
 
+            if not is_3d:
+                # 2D X-ray：转换阶段（convert.normalize_2d_nifti_display 探针归一化，
+                # 或 python-libs 路径原生）已保证数组即 DICOM 显示布局（行,列），
+                # 直接使用原始数组。此处绝不可再做 canonical/翻转——dcm2niix 缺 IOP
+                # 时仿射是猜测值且布局家族不稳定，硬编码翻转已造成全脊柱预览
+                # 头脚颠倒的生产事故（M20112002685）。
+                image_2d = np.asarray(img.dataobj)
+                while image_2d.ndim > 2:
+                    image_2d = image_2d[..., 0]
+                return image_2d.astype(np.float32)
+
             # 对多参数/时间序列（4D及以上）先提取第一个序列，
             # 再进行 canonical 重排，避免 4D 与 3D 方向处理不一致。
             img_for_preview = img
