@@ -288,6 +288,8 @@ def apply_windowing(image_2d: np.ndarray, dcm, modality: str = None) -> np.ndarr
     """
     img = image_2d.astype(np.float32)
     modality_upper = (modality or '').upper()
+    if not modality_upper and dcm is not None:
+        modality_upper = str(getattr(dcm, 'Modality', '') or '').upper()
     window_fell_back = False
     
     # MR 模态不使用 DICOM Window 标签，因为 NPZ 数据经过 dcm2niix → NIfTI 转换后
@@ -309,10 +311,20 @@ def apply_windowing(image_2d: np.ndarray, dcm, modality: str = None) -> np.ndarr
         # 注意：仅影响预览渲染，不改动任何像素数据。
         if high > low and img.size > 0:
             inside_ratio = float(np.count_nonzero((img >= low) & (img <= high))) / img.size
-            if inside_ratio < 0.01:
+            fallback = inside_ratio < 0.01
+            if not fallback and modality_upper in ('DX', 'DR', 'CR', 'MG', 'RF', 'XA'):
+                # 2D X 光：窗口覆盖率可能存在中间地带（如覆盖 10% 但 85% 像素
+                # 堆积在窗口一侧被裁掉）。有效窗口必然框住数据主体——数据中位数
+                # 落在窗口之外即判定窗口不可信（抽样实证：异常窗口中位数全部在
+                # 窗外，正常窗口全部在窗内，分布干净可分）。
+                med = float(np.median(img))
+                if med < low or med > high:
+                    fallback = True
+            if fallback:
                 logger.warning(
-                    f"[PREVIEW] DICOM window [{low:.0f},{high:.0f}] covers only "
-                    f"{inside_ratio * 100:.2f}% pixels, fallback to adaptive window")
+                    f"[PREVIEW] DICOM window [{low:.0f},{high:.0f}] inconsistent with data "
+                    f"(coverage={inside_ratio * 100:.2f}%, median={float(np.median(img)):.0f}), "
+                    f"fallback to adaptive window")
                 if modality is None and dcm is not None:
                     modality = getattr(dcm, 'Modality', None)
                 low, high = _estimate_window_params(dcm, img, modality)
