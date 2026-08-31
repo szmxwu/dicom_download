@@ -71,6 +71,31 @@ XRAY_DERIVED_TOLERANT_MODALITIES = {
     'MG', 'MAMMO', 'MAMMOGRAPHY', 'BCT',         # 钼靶 processed view 同理
 }
 
+# 无像素数据的非图像模态（Presentation State / Key Object / Structured Report 等）。
+# 这些序列不含 PixelData，无法转换为 NIfTI/NPZ，下载下来只是几 KB 的原始
+# DICOM 垃圾文件混进输出目录。实证（2026-08-31）：Carestream DR 的
+# "KEY_IMAGES PR" 序列（Grayscale Softcopy Presentation State），任务级
+# derived_keywords 覆盖默认关键词列表漏掉 'KEY' 后被整体下载。
+# 在查询/接收/整理三个阶段无条件过滤，与 exclude_derived 开关无关。
+NON_IMAGE_MODALITIES = {
+    'PR',   # Presentation State（软拷贝显示状态，纯标注/窗宽窗位记录）
+    'KO',   # Key Object Selection（关键图像标记文档）
+    'SR',   # Structured Report（结构化报告，含 RDSR 剂量报告）
+    'OT',   # Other
+    'DOC',  # Encapsulated Document（封装 PDF/CDA 文档）
+    'REG',  # Spatial Registration（空间配准矩阵）
+    'FID',  # Fiducials（标记点）
+    'RWV',  # Real World Value Mapping（灰度-物理值映射表）
+}
+
+
+def is_non_image_modality(modality) -> bool:
+    """判断模态代码是否为无像素数据的非图像模态（PR/KO/SR 等）。"""
+    if not modality:
+        return False
+    return str(modality).upper().strip() in NON_IMAGE_MODALITIES
+
+
 # 运行时可修改的过滤关键词（模块级可变状态）
 # 通过 get_derived_keywords() / set_derived_keywords() 访问
 _runtime_derived_keywords = list(DEFAULT_DERIVED_SERIES_KEYWORDS)
@@ -206,6 +231,9 @@ def get_filter_rules_fingerprint():
         # 规则行为版本：X 光模态 DERIVED 宽容（2026-08-29 引入，此前 X 光
         # DERIVED 诊断图会被误杀，旧缓存条目结果不完整，必须失配）
         'xray_derived_tolerant': True,
+        # 非图像模态过滤（2026-08-31 引入）：旧缓存条目可能含 PR/KO/SR
+        # 垃圾序列（无法转换的几 KB dcm），必须失配
+        'non_image_modalities': sorted(NON_IMAGE_MODALITIES),
     }, sort_keys=True, ensure_ascii=False)
     return hashlib.md5(payload.encode('utf-8')).hexdigest()[:8]
 

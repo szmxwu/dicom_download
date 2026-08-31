@@ -871,6 +871,12 @@ class ProcessingTask:
             return
         
         self.status = status
+        # 终态时锁定计时终点：任何失败/完成分支忘记设置 end_time 都会导致
+        # get_duration() 退化为 (now - start_time)，监控页面的耗时显示无限增长
+        # （2026-08-31 实证："No result returned" 失败分支未设 end_time，
+        # 实际处理 2.4 分钟的任务在监控页显示 11+ 分钟且持续跳动）
+        if status in ('completed', 'failed', 'cancelled') and self.end_time is None:
+            self.end_time = time.time()
         if progress is not None:
             self.progress = progress
         if step is not None:
@@ -1009,9 +1015,13 @@ def process_single():
         data = request.json
         accession_number = data.get('accession_number')
         options = data.get('options', {})
-        
+
         if not accession_number:
             return jsonify({'error': 'Please provide AccessionNumber'}), 400
+
+        # INFO 级审计：记录提交来源与完整 options（历史上出现过客户端自定义
+        # derived_keywords 覆盖默认列表导致过滤漏网，DEBUG 级日志无法事后溯源）
+        logger.info(f"process_single submit: IP={request.remote_addr}, accession={accession_number}, options={options}")
         
         # 创建任务
         task_id = str(uuid.uuid4())
@@ -1042,9 +1052,12 @@ def process_batch():
         data = request.json
         accession_numbers = data.get('accession_numbers', [])
         options = data.get('options', {})
-        
+
         if not accession_numbers:
             return jsonify({'error': 'Please provide AccessionNumber list'}), 400
+
+        # INFO 级审计：记录提交来源与完整 options（accession 列表可能很长，只记数量）
+        logger.info(f"process_batch submit: IP={request.remote_addr}, accessions={len(accession_numbers)}, options={options}")
         
         # 创建任务
         task_id = str(uuid.uuid4())
@@ -1788,19 +1801,38 @@ def download_log_file(filename):
 def _parse_derived_keywords(options):
     """从任务 options 解析本次生效的衍生序列过滤关键词（仅当前任务，不修改全局配置）。
 
+    两种用法：
+    - ``derived_keywords``: 整体替换默认列表（web 页面关键词编辑器用此语义，
+      页面总是提交完整列表）。⚠️ API 客户端只传少数几个关键词会拆掉全部默认
+      防线（2026-08-31 实证：1 个关键词的自定义列表漏掉 'KEY'，KEY_IMAGES PR
+      序列被整体下载）。
+    - ``extra_derived_keywords``: 在默认列表基础上追加（API 客户端推荐），
+      返回 默认列表 + 追加项。
+
     Returns:
         list[str] | None: 合法的关键词列表；未提供或为空时返回 None（用全局默认）。
     """
+    def _validate(items):
+        validated = []
+        for k in items[:100]:  # 最多 100 个关键词
+            if isinstance(k, str):
+                k = k.strip().upper()
+                if k and len(k) <= 50 and k not in validated:
+                    validated.append(k)
+        return validated
+
+    extra = options.get('extra_derived_keywords')
+    if isinstance(extra, list) and extra:
+        merged = list(get_derived_keywords())
+        for k in _validate(extra):
+            if k not in merged:
+                merged.append(k)
+        return merged
+
     raw = options.get('derived_keywords')
     if not isinstance(raw, list):
         return None
-    validated = []
-    for k in raw[:100]:  # 最多 100 个关键词
-        if isinstance(k, str):
-            k = k.strip().upper()
-            if k and len(k) <= 50 and k not in validated:
-                validated.append(k)
-    return validated or None
+    return _validate(raw) or None
 
 
 def process_single_task(task):
@@ -1921,7 +1953,12 @@ def process_single_task(task):
         exclude_derived = options.get('exclude_derived', True)  # 默认启用衍生序列过滤
         derived_keywords = _parse_derived_keywords(options)  # 仅本任务生效的关键词覆盖
         if derived_keywords is not None:
-            task.add_log(f"Using task-specific derived keywords ({len(derived_keywords)} items)")
+            # 覆盖语义（整体替换默认列表），记录完整内容便于事后排查过滤漏网
+            task.add_log(f"Using task-specific derived keywords ({len(derived_keywords)} items, REPLACES defaults): {derived_keywords}")
+            logger.warning(
+                f"Task {task.task_id}: task-specific derived_keywords REPLACE the default list "
+                f"({len(derived_keywords)} items): {derived_keywords}"
+            )
         if min_series_files is not None:
             try:
                 min_series_files = int(min_series_files)
@@ -2090,7 +2127,8 @@ def process_single_task(task):
                 check_and_cleanup_results()
                 
             else:
-                error_msg = results.get('error', 'Unknown error during process') if results else 'No result returned'
+                error_msg = results.get('error', 'Unknown error during process') if results else \
+                    'No files received from PACS (accession may not exist in PACS, or images unavailable)'
                 task.add_log(f'Process failed: {error_msg}', 'error')
                 task.update_status('failed')
                 task.error = error_msg
@@ -2164,7 +2202,12 @@ def process_batch_task(task):
         if exclude_derived:
             task.add_log(f"Exclude derived series: enabled")
         if derived_keywords is not None:
-            task.add_log(f"Using task-specific derived keywords ({len(derived_keywords)} items)")
+            # 覆盖语义（整体替换默认列表），记录完整内容便于事后排查过滤漏网
+            task.add_log(f"Using task-specific derived keywords ({len(derived_keywords)} items, REPLACES defaults): {derived_keywords}")
+            logger.warning(
+                f"Task {task.task_id}: task-specific derived_keywords REPLACE the default list "
+                f"({len(derived_keywords)} items): {derived_keywords}"
+            )
 
         # 去重处理，保持顺序
         seen = set()

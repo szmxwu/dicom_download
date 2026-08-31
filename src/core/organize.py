@@ -17,7 +17,7 @@ from typing import Dict, List, Any, Optional, Tuple
 logger = logging.getLogger('DICOMApp')
 
 # 从常量模块导入获取当前关键词的函数
-from src.core.constants import get_derived_keywords, match_derived_keyword
+from src.core.constants import get_derived_keywords, match_derived_keyword, is_non_image_modality
 
 
 def _is_derived_series(series_desc: str, image_type=None, modality=None) -> bool:
@@ -184,6 +184,11 @@ def organize_dicom_files(
                 _desc = str(getattr(_hdr, 'SeriesDescription', '') or '')
                 _itype = getattr(_hdr, 'ImageType', None)
                 _mod = str(getattr(_hdr, 'Modality', '') or '')
+                # 非图像模态（PR/KO/SR 等）无条件过滤：无像素数据、无法转换，
+                # 落盘只会成为几 KB 的垃圾 dcm（接收端已过滤，此处为兜底）
+                if is_non_image_modality(_mod):
+                    logger.info(f"   🚫 Filtered non-image series (organize stage, modality={_mod}): '{_desc}' ({series_folder})")
+                    continue
                 if _is_derived_series(_desc, _itype, modality=_mod):
                     logger.info(f"   🚫 Filtered derived series (organize stage): '{_desc}' ({series_folder})")
                     continue

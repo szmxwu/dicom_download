@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Callable, Any, Tuple
 from types import SimpleNamespace
-from src.core.constants import get_derived_keywords, match_derived_keyword, is_derived_series
+from src.core.constants import get_derived_keywords, match_derived_keyword, is_derived_series, is_non_image_modality
 from src.core.metadata import extract_dicom_metadata as extract_dicom_metadata_impl
 from src.core.organize import organize_dicom_files as organize_dicom_files_impl
 from src.core.organize import process_single_series as process_single_series_impl
@@ -560,6 +560,13 @@ class DICOMDownloadClient:
                         if status and status.Status in [0xFF00, 0xFF01]:
                             if identifier and hasattr(identifier, 'SeriesInstanceUID'):
                                 series_modality = str(identifier.Modality) if hasattr(identifier, 'Modality') else ''
+                                series_desc = str(identifier.SeriesDescription) if hasattr(identifier, 'SeriesDescription') else ''
+
+                                # 非图像模态（PR/KO/SR 等）：无像素数据、无法转换，
+                                # 无条件过滤，与 exclude_derived 开关无关
+                                if is_non_image_modality(series_modality):
+                                    logger.info(f"   🚫 Filtered non-image series (modality={series_modality}): {series_desc}")
+                                    continue
 
                                 # Modality 过滤
                                 if modality_filter:
@@ -569,8 +576,6 @@ class DICOMDownloadClient:
                                     allowed_modalities = expand_modality_filter(modality_filter)
                                     if series_modality.upper() not in allowed_modalities:
                                         continue
-
-                                series_desc = str(identifier.SeriesDescription) if hasattr(identifier, 'SeriesDescription') else ''
 
                                 # 过滤衍生序列：ImageType DERIVED 或 SeriesDescription 命中关键词
                                 # （统一判定逻辑见 constants.is_derived_series，接收端首文件也用同一套）
@@ -769,20 +774,34 @@ class DICOMDownloadClient:
                     series_dir = storage_state['current_path']
 
                 # 接收端早丢弃：C-FIND 可能返回不全（缺 ImageType/SeriesDescription），
-                # 漏网的衍生序列用首文件头部（已在内存，零额外 I/O）再判一次；
+                # 漏网的序列用首文件头部（已在内存，零额外 I/O）再判一次；
                 # 判定拒绝的序列后续文件直接丢弃不落盘、不进转换队列。
                 # 注意 C-STORE 仍返回 0x0000 成功——返回失败码会导致部分 PACS 中止整个 C-MOVE。
-                if exclude_derived and series_instance_uid:
+                # 两类拒绝：
+                # 1) 非图像对象（PR/KO/SR 等模态，或首文件无 PixelData）——无条件，
+                #    与 exclude_derived 无关：它们无法转换，落盘只是几 KB 垃圾 dcm；
+                # 2) 衍生序列——仅当 exclude_derived 开启时判定。
+                if series_instance_uid:
                     if series_instance_uid in storage_state['recv_rejected_series']:
                         storage_state['recv_dropped_files'] += 1
                         return 0x0000
                     if series_instance_uid not in storage_state['recv_filter_decisions']:
-                        recv_reject, recv_reason = is_derived_series(
-                            getattr(dataset, 'SeriesDescription', None),
-                            getattr(dataset, 'ImageType', None),
-                            keywords=derived_keywords,
-                            modality=getattr(dataset, 'Modality', None)
-                        )
+                        recv_reject = False
+                        recv_reason = ''
+                        recv_modality = getattr(dataset, 'Modality', None)
+                        if is_non_image_modality(recv_modality):
+                            recv_reject = True
+                            recv_reason = f"non-image modality={recv_modality}"
+                        elif 'PixelData' not in dataset:
+                            recv_reject = True
+                            recv_reason = f"no PixelData (modality={recv_modality})"
+                        elif exclude_derived:
+                            recv_reject, recv_reason = is_derived_series(
+                                getattr(dataset, 'SeriesDescription', None),
+                                getattr(dataset, 'ImageType', None),
+                                keywords=derived_keywords,
+                                modality=recv_modality
+                            )
                         storage_state['recv_filter_decisions'][series_instance_uid] = recv_reject
                         if recv_reject:
                             storage_state['recv_rejected_series'].add(series_instance_uid)
@@ -1154,7 +1173,7 @@ class DICOMDownloadClient:
         if storage_state['recv_dropped_files'] > 0:
             logger.info(
                 f"🚫 Receive-time filter dropped {storage_state['recv_dropped_files']} file(s) "
-                f"from {len(storage_state['recv_rejected_series'])} derived series "
+                f"from {len(storage_state['recv_rejected_series'])} derived/non-image series "
                 f"(not written to disk)"
             )
         logger.info(f"📁 Files saved to: {output_path}")
