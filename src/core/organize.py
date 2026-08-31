@@ -20,7 +20,7 @@ logger = logging.getLogger('DICOMApp')
 from src.core.constants import get_derived_keywords, match_derived_keyword
 
 
-def _is_derived_series(series_desc: str, image_type=None) -> bool:
+def _is_derived_series(series_desc: str, image_type=None, modality=None) -> bool:
     """检查是否为衍生序列（MPR/MIP/3D重建等）。
 
     基于实际 DICOM 文件中的 SeriesDescription 和 ImageType 进行判断，
@@ -29,8 +29,13 @@ def _is_derived_series(series_desc: str, image_type=None) -> bool:
     优先级：
       1. ImageType[0] == 'ORIGINAL' → 明确不是衍生，直接返回 False
       2. ImageType[0] == 'DERIVED'  → 明确是衍生，直接返回 True
+         （但 2D X 光模态除外：DR/MG 等的诊断用 for-presentation 图像常规
+         即为 DERIVED，见 constants.XRAY_DERIVED_TOLERANT_MODALITIES，
+         此时退回关键词匹配）
       3. ImageType 缺失/不明         → 退回到 SeriesDescription 关键词匹配
     """
+    from src.core.constants import XRAY_DERIVED_TOLERANT_MODALITIES
+    xray_tolerant = bool(modality) and str(modality).upper().strip() in XRAY_DERIVED_TOLERANT_MODALITIES
     if image_type:
         # DICOM ImageType 第一个值才代表像素来源：DERIVED（衍生）或 ORIGINAL（原始采集）。
         # 第二个值 PRIMARY/SECONDARY 表示采集上下文，与是否为衍生序列无关，
@@ -54,7 +59,8 @@ def _is_derived_series(series_desc: str, image_type=None) -> bool:
                     for kw in DERIVED_IMAGE_TYPE_WHITELIST:
                         if kw in desc_upper:
                             return False
-                return True
+                if not xray_tolerant:
+                    return True
         else:
             itype_upper = str(image_type).upper()
             if 'DERIVED' in itype_upper:
@@ -64,7 +70,8 @@ def _is_derived_series(series_desc: str, image_type=None) -> bool:
                     for kw in DERIVED_IMAGE_TYPE_WHITELIST:
                         if kw in desc_upper:
                             return False
-                return True
+                if not xray_tolerant:
+                    return True
             if 'ORIGINAL' in itype_upper and 'DERIVED' not in itype_upper:
                 return False
 
@@ -176,7 +183,8 @@ def organize_dicom_files(
                 _hdr = pydicom.dcmread(dicom_files[0], force=True, stop_before_pixels=True)
                 _desc = str(getattr(_hdr, 'SeriesDescription', '') or '')
                 _itype = getattr(_hdr, 'ImageType', None)
-                if _is_derived_series(_desc, _itype):
+                _mod = str(getattr(_hdr, 'Modality', '') or '')
+                if _is_derived_series(_desc, _itype, modality=_mod):
                     logger.info(f"   🚫 Filtered derived series (organize stage): '{_desc}' ({series_folder})")
                     continue
             except Exception:
@@ -381,7 +389,8 @@ def process_single_series(
             _hdr = _pd.dcmread(dicom_files[0], force=True, stop_before_pixels=True)
             _desc = str(getattr(_hdr, 'SeriesDescription', '') or '')
             _itype = getattr(_hdr, 'ImageType', None)
-            if _is_derived_series(_desc, _itype):
+            _mod = str(getattr(_hdr, 'Modality', '') or '')
+            if _is_derived_series(_desc, _itype, modality=_mod):
                 logger.info(f"   🚫 Filtered derived series (organize stage): '{_desc}' ({series_folder})")
                 _cleanup_lock()
                 return None

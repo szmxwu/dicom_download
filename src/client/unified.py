@@ -577,7 +577,8 @@ class DICOMDownloadClient:
                                 if exclude_derived:
                                     is_derived, derived_reason = is_derived_series(
                                         series_desc, getattr(identifier, 'ImageType', None),
-                                        keywords=derived_keywords
+                                        keywords=derived_keywords,
+                                        modality=series_modality
                                     )
                                     if is_derived:
                                         logger.info(f"   🚫 Filtered derived series ({derived_reason}): {series_desc}")
@@ -779,7 +780,8 @@ class DICOMDownloadClient:
                         recv_reject, recv_reason = is_derived_series(
                             getattr(dataset, 'SeriesDescription', None),
                             getattr(dataset, 'ImageType', None),
-                            keywords=derived_keywords
+                            keywords=derived_keywords,
+                            modality=getattr(dataset, 'Modality', None)
                         )
                         storage_state['recv_filter_decisions'][series_instance_uid] = recv_reject
                         if recv_reject:

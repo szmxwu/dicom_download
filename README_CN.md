@@ -284,6 +284,7 @@ arr_zxy = np.transpose(arr, (0, 2, 1))  # 现在 shape == (Z, X, Y)
 - **衍生序列过滤**：
    - 自动过滤 MPR、MIP、3D VR 等人工重建/衍生序列。
    - 同时检查 `ImageType`（DERIVED/SECONDARY）和 `SeriesDescription` 关键词。
+   - 模态感知（2026-08-29）：对 2D X 光模态（DR/DX/CR/MG/RF/XA），仅凭 `ImageType=DERIVED` 不再过滤——DR 探测器的诊断用 for-presentation 图像常规即为 DERIVED（如 Mindray）。关键词匹配仍然生效（剂量报告、截屏等照旧过滤）。CT/MR 行为不变。
    - Web 界面和 CLI 默认启用（CLI 使用 `--include_derived` 可禁用）。
    - 可配置最小序列文件数（3D体积如 CT/MR 默认：10）。
 

@@ -58,6 +58,19 @@ DERIVED_IMAGE_TYPE_WHITELIST = [
     'SPINE', 'STITCH', 'LONGLEG', 'LONG LEG',
 ]
 
+# 2D X 光模态集合：这些模态的"诊断用"图像经常就是 ImageType=DERIVED
+# （DR 探测器输出的 for-presentation 处理图像常规为 DERIVED\PRIMARY/SECONDARY，
+# DSA 减影序列为 DERIVED\PRIMARY，MG processed view 同理）。
+# 实证（2026-08-29，136 生产事故）：Mindray DR 普通胸片/四肢片
+# （V04_0015、"W033 Thorax p.a." 等唯一诊断序列）ImageType[0]=DERIVED，
+# 被接收端过滤整体误杀 → 单序列检查 0 文件落盘 → 任务失败率 85%。
+# 对这些模态，ImageType=DERIVED 单独不足以判衍生，仍需 SeriesDescription
+# 命中关键词（剂量报告 RDSR/Screen Save 等仍会被关键词过滤）。
+XRAY_DERIVED_TOLERANT_MODALITIES = {
+    'DR', 'DX', 'CR', 'XR', 'RF', 'XA',          # 普放/透视/造影（DSA 减影是 DERIVED 诊断图）
+    'MG', 'MAMMO', 'MAMMOGRAPHY', 'BCT',         # 钼靶 processed view 同理
+}
+
 # 运行时可修改的过滤关键词（模块级可变状态）
 # 通过 get_derived_keywords() / set_derived_keywords() 访问
 _runtime_derived_keywords = list(DEFAULT_DERIVED_SERIES_KEYWORDS)
@@ -114,7 +127,7 @@ def match_derived_keyword(series_desc, keywords=None):
     return None
 
 
-def is_derived_series(series_desc, image_type, keywords=None):
+def is_derived_series(series_desc, image_type, keywords=None, modality=None):
     """统一的衍生序列判定：ImageType 首值为 DERIVED，或 SeriesDescription 命中关键词。
 
     查询阶段（C-FIND identifier）与接收阶段（C-STORE 首文件 dataset）共用同一套
@@ -124,14 +137,20 @@ def is_derived_series(series_desc, image_type, keywords=None):
     （ImageType 其余值 + SeriesDescription），命中白名单的序列（ADC/Dixon/
     全脊柱拼合等）保留。
 
+    modality 为 2D X 光模态（XRAY_DERIVED_TOLERANT_MODALITIES）时，
+    ImageType=DERIVED 单独不足以判衍生（DR for-presentation 图像常规即 DERIVED），
+    继续走关键词匹配。
+
     Args:
         series_desc: SeriesDescription 字符串（可为 None/空）
         image_type: ImageType 值（pydicom MultiValue / list / str / None）
         keywords: 可选，本次生效的关键词列表（每个任务可覆盖）；None 时用全局配置
+        modality: 可选，模态代码（DR/CT/MR...）；用于 X 光模态的 DERIVED 宽容
 
     Returns:
         (is_derived: bool, reason: str)；未判为衍生时 reason 为空串。
     """
+    xray_tolerant = bool(modality) and str(modality).upper().strip() in XRAY_DERIVED_TOLERANT_MODALITIES
     if image_type:
         # ImageType 第一个值才代表像素来源：DERIVED/ORIGINAL。
         # 第二个值 PRIMARY/SECONDARY 是采集上下文，不能用于过滤。
@@ -149,14 +168,16 @@ def is_derived_series(series_desc, image_type, keywords=None):
                     for kw in DERIVED_IMAGE_TYPE_WHITELIST:
                         if kw in desc_upper:
                             return False, ''
-                return True, 'ImageType=DERIVED'
+                if not xray_tolerant:
+                    return True, 'ImageType=DERIVED'
         elif 'DERIVED' in str(image_type).upper():
             if series_desc:
                 desc_upper = series_desc.upper()
                 for kw in DERIVED_IMAGE_TYPE_WHITELIST:
                     if kw in desc_upper:
                         return False, ''
-            return True, 'ImageType=DERIVED'
+            if not xray_tolerant:
+                return True, 'ImageType=DERIVED'
     matched_kw = match_derived_keyword(series_desc, keywords=keywords)
     if matched_kw:
         return True, f"keyword '{matched_kw}'"
@@ -182,6 +203,9 @@ def get_filter_rules_fingerprint():
         'kw': sorted(k.upper() for k in get_derived_keywords()),
         'ex': sorted((k, tuple(v)) for k, v in DERIVED_KEYWORD_EXCEPTIONS.items()),
         'wl': sorted(DERIVED_IMAGE_TYPE_WHITELIST),
+        # 规则行为版本：X 光模态 DERIVED 宽容（2026-08-29 引入，此前 X 光
+        # DERIVED 诊断图会被误杀，旧缓存条目结果不完整，必须失配）
+        'xray_derived_tolerant': True,
     }, sort_keys=True, ensure_ascii=False)
     return hashlib.md5(payload.encode('utf-8')).hexdigest()[:8]
 

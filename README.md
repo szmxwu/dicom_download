@@ -290,6 +290,7 @@ Recent improvements (2026-03-18):
 - **Derived Series Filtering**:
    - Automatically filter out MPR, MIP, 3D VR, and other derived/reconstructed series.
    - Checks both `ImageType` (DERIVED/SECONDARY) and `SeriesDescription` keywords.
+   - Modality-aware (2026-08-29): for 2D X-ray modalities (DR/DX/CR/MG/RF/XA), `ImageType=DERIVED` alone no longer causes rejection — diagnostic for-presentation images from DR detectors are routinely DERIVED (e.g. Mindray). Keyword matching still applies (dose reports, screen saves stay filtered). CT/MR behavior unchanged.
    - Enabled by default in both Web UI and CLI (use `--include_derived` to disable in CLI).
    - Configurable minimum series file count (default: 10 for 3D volumes like CT/MR).
 

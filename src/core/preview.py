@@ -9,11 +9,14 @@
 import os
 import re
 import json
+import logging
 import numpy as np
 import nibabel as nib
 from PIL import Image, ImageDraw, ImageFont
 from typing import Tuple, Optional, Callable, List
 from dotenv import load_dotenv
+
+logger = logging.getLogger('DICOMApp')
 
 
 def _get_project_root() -> str:
@@ -292,6 +295,7 @@ def apply_windowing(image_2d: np.ndarray, dcm, modality: str = None) -> np.ndarr
     """
     img = image_2d.astype(np.float32)
     modality_upper = (modality or '').upper()
+    window_fell_back = False
     
     # MR 模态不使用 DICOM Window 标签，因为 NPZ 数据经过 dcm2niix → NIfTI 转换后
     # nibabel.get_fdata() 会应用 scl_slope/scl_inter，数值范围可能与原始 DICOM
@@ -306,6 +310,20 @@ def apply_windowing(image_2d: np.ndarray, dcm, modality: str = None) -> np.ndarr
         # 使用 DICOM 标签中的窗宽窗位
         low = wc - ww / 2.0
         high = wc + ww / 2.0
+        # 窗口与像素数据严重不匹配时（如 Mindray MONOCHROME1 DX：像素集中在
+        # 0-1536，而设备写入的 WC/WW≈3169/1540 落在空数据区），窗口内几乎
+        # 没有像素会导致预览图整体纯白/纯黑。覆盖率 <1% 时回退到数据自适应窗口。
+        # 注意：仅影响预览渲染，不改动任何像素数据。
+        if high > low and img.size > 0:
+            inside_ratio = float(np.count_nonzero((img >= low) & (img <= high))) / img.size
+            if inside_ratio < 0.01:
+                logger.warning(
+                    f"[PREVIEW] DICOM window [{low:.0f},{high:.0f}] covers only "
+                    f"{inside_ratio * 100:.2f}% pixels, fallback to adaptive window")
+                if modality is None and dcm is not None:
+                    modality = getattr(dcm, 'Modality', None)
+                low, high = _estimate_window_params(dcm, img, modality)
+                window_fell_back = True
     else:
         # 根据模态估算窗宽窗位
         # 如果未提供 modality，尝试从 DICOM 读取
@@ -324,7 +342,19 @@ def apply_windowing(image_2d: np.ndarray, dcm, modality: str = None) -> np.ndarr
     try:
         if dcm is not None:
             photometric = str(getattr(dcm, 'PhotometricInterpretation', '')).upper()
-            if photometric == 'MONOCHROME1':
+            if window_fell_back and modality_upper in ('DX', 'DR', 'CR', 'MG', 'RF', 'XA'):
+                # 设备窗口已被证明不可信时，PhotometricInterpretation 标签同样
+                # 不可信（Mindray MONOCHROME1 实际按 MONO2 极性存储：骨骼高值、
+                # 体外背景低值）。解剖先验/边角启发式均不可靠（紧密 FOV 图像
+                # 边角含骨盆等亮组织会误判），因此回退时一律按诊断惯例
+                # （骨骼亮、背景暗的 MONO2 极性）渲染，忽略 PI 标签。
+                # 若未来出现真实 MONO1 存储 + 窗口损坏的设备，其预览将呈
+                # 白背景（肉眼可辨），可凭此 WARNING 中的 tag 排查。
+                if photometric == 'MONOCHROME1':
+                    logger.warning(
+                        f"[PREVIEW] window fallback: ignoring MONOCHROME1 tag, "
+                        f"rendering as MONO2 polarity (untrusted device metadata)")
+            elif photometric == 'MONOCHROME1':
                 img = 255 - img
     except Exception:
         pass

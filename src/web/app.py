@@ -2662,7 +2662,7 @@ def _acquire_single_instance_lock():
             import msvcrt
             fd.seek(0)
             if not fd.read(1):
-                fd.write(b'\0')
+                fd.write('\0')  # 文本模式打开，写 str；msvcrt 只需文件非空以锁定首字节
                 fd.flush()
             fd.seek(0)
             msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
