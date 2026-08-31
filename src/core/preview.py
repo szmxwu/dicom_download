@@ -235,19 +235,12 @@ def _estimate_window_params(dcm, image_2d: np.ndarray, modality: str) -> Tuple[f
             high = wl + ww / 2.0
             
         elif modality in ['DX', 'DR', 'CR', 'RF']:
-            # X-ray 数字成像
-            # 基于位深估算窗宽窗位
-            if dcm is not None:
-                bits_stored = getattr(dcm, 'BitsStored', 12)
-                # 假设有效范围是完整动态范围的一部分
-                # 对于 X-ray，通常使用较宽的窗宽
-                high = (2 ** bits_stored) - 1
-                low = 0
-            else:
-                # 基于图像实际范围
-                p1, p99 = np.percentile(img, [1, 99])
-                low = p1
-                high = p99
+            # X-ray 数字成像：按实际数据分布取窗。设备位深范围常远大于有效
+            # 信号范围（如 Mindray 12bit 数据解剖集中在 p99.9≈409），按位深
+            # 全范围渲染对比度极差；且此类设备 BitsStored 也常缺失/不可信。
+            p1, p99 = np.percentile(img, [1, 99.5])
+            low = p1
+            high = p99
                 
         elif modality == 'MG':
             # 乳腺钼靶：高对比度需求
