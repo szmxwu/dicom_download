@@ -189,8 +189,12 @@ MAX_CONCURRENT_TASKS = 3  # 最大并发任务数
 TASK_QUEUE_MAX_SIZE = 100  # 任务队列最大长度
 
 # 全局线程池执行器 - 限制并发数
+# 线程数 = 并发闸门 + 2 个冗余：真实并发由 _running_task_count 闸门限制为
+# MAX_CONCURRENT_TASKS；冗余线程用于吸收"卡死在不可中断阻塞调用中"的僵尸
+# worker——否则一个永远不退出的任务会永久占用一个 pool 线程，并发通道
+# 3→2 且不可恢复（2026-09-05 实证：136 任务卡死数小时，用户取消后通道永久减少）
 task_executor = ThreadPoolExecutor(
-    max_workers=MAX_CONCURRENT_TASKS,
+    max_workers=MAX_CONCURRENT_TASKS + 2,
     thread_name_prefix='TaskWorker'
 )
 
@@ -216,6 +220,91 @@ MAX_COMPLETED_TASK_CACHE = 500  # 已完成任务缓存上限，防止内存无�
 
 # 任务取消标志字典 - 用于真正中断任务执行
 _task_cancel_flags = {}
+
+# 运行中任务的硬超时（小时）：超过此时长视为卡死，看门狗自动取消并释放并发槽位
+MAX_TASK_DURATION_HOURS = 3
+
+
+def _release_task_slot(task, reason):
+    """释放卡死任务的并发槽位（取消/超时看门狗用）。
+
+    标志位取消是协作式的：若 worker 线程卡在不可中断的阻塞调用中（如无超时
+    的网络 recv），它永远到不了取消检查点，_task_wrapper 的 finally 永远不执行，
+    _running_task_count 永久 +1 → 并发通道永久减一（2026-09-05 136 实证）。
+    此函数在放弃等待 worker 退出时主动归还槽位，并 dump 卡死线程的调用栈便于定位。
+    slot_released 标记保证 worker 万一 later 退出时 finally 不会重复减计数。
+
+    Returns:
+        bool: 是否实际释放了槽位（False = 已释放过或任务未占用槽位）
+    """
+    global _running_task_count
+    with _queue_lock:
+        if getattr(task, 'slot_released', False) or task.start_time is None:
+            return False
+        task.slot_released = True
+        _running_task_count = max(0, _running_task_count - 1)
+    logger.warning(
+        f"🔓 Released queue slot for {reason} task {task.task_id} "
+        f"(step='{task.current_step}', progress={task.progress}%; "
+        f"worker thread may still be blocked, abandoned)"
+    )
+    _dump_worker_stack(task)
+    _process_queue()  # 槽位空出，尝试启动排队任务
+    return True
+
+
+def _dump_worker_stack(task):
+    """dump 卡死 worker 线程的调用栈到日志（尽力而为）。
+
+    要求 worker 启动时在 _task_wrapper 里记录了 worker_thread_ident。
+    eventlet monkey-patch 下 threading 是 greenlet，sys._current_frames() 只有
+    真实 OS 线程，可能找不到——找不到就放弃，不影响主流程。
+    """
+    try:
+        import sys
+        import traceback
+        ident = getattr(task, 'worker_thread_ident', None)
+        if not ident:
+            return
+        frame = sys._current_frames().get(ident)
+        if frame is None:
+            logger.warning(f"Worker thread stack unavailable for task {task.task_id} (greenlet or thread exited)")
+            return
+        logger.warning(
+            f"📌 Stuck worker stack for task {task.task_id}:\n"
+            + ''.join(traceback.format_stack(frame))
+        )
+    except Exception:
+        pass
+
+
+def _task_timeout_watchdog():
+    """后台看门狗：取消超过 MAX_TASK_DURATION_HOURS 的运行中任务并释放槽位。"""
+    while True:
+        try:
+            time.sleep(300)  # 每 5 分钟检查一次
+            now = time.time()
+            with _task_lock:
+                candidates = list(processing_tasks.values())
+            for task in candidates:
+                if (task.status == 'running' and task.start_time is not None
+                        and not getattr(task, 'slot_released', False)
+                        and now - task.start_time > MAX_TASK_DURATION_HOURS * 3600):
+                    logger.error(
+                        f"⏰ Task {task.task_id} ({task.parameters.get('accession_number', task.task_type)}) "
+                        f"running for {(now - task.start_time) / 3600:.1f}h > {MAX_TASK_DURATION_HOURS}h, "
+                        f"auto-cancelling stuck task"
+                    )
+                    task.cancel()
+                    task.add_log(f'任务运行超过 {MAX_TASK_DURATION_HOURS} 小时，被看门狗自动取消', 'error')
+                    _release_task_slot(task, reason='timeout-watchdog')
+        except Exception as e:
+            logger.error(f"任务超时看门狗异常: {e}")
+
+
+# 启动任务超时看门狗
+_watchdog_thread = threading.Thread(target=_task_timeout_watchdog, daemon=True)
+_watchdog_thread.start()
 
 # 任务清理配置
 TASK_MAX_AGE_HOURS = 24  # 任务最大保留时间（小时）
@@ -337,6 +426,8 @@ def _process_queue():
             global _running_task_count
             # 记录实际开始执行时间：耗时统计从出队这一刻起算，不含排队等待
             task.start_time = time.time()
+            # 记录 worker 线程 ident，任务卡死被取消时用于 dump 调用栈定位卡点
+            task.worker_thread_ident = threading.current_thread().ident
             queue_wait = task.start_time - task.created_at
             if queue_wait > 1:
                 task.add_log(f'Queue wait: {queue_wait:.0f}s (not counted in processing duration)')
@@ -351,7 +442,11 @@ def _process_queue():
                     pass
             finally:
                 with _queue_lock:
-                    _running_task_count -= 1
+                    # 卡死任务被取消时槽位已由 _release_task_slot 归还，
+                    # 若 worker 之后意外退出，此处不得重复减计数
+                    if not getattr(task, 'slot_released', False):
+                        task.slot_released = True
+                        _running_task_count -= 1
                 # 尝试处理队列中的下一个任务
                 _process_queue()
 
@@ -780,6 +875,8 @@ class ProcessingTask:
         self.end_time = None
         self.logs = []
         self._cancelled = False  # 取消标志
+        self.slot_released = False  # 并发槽位是否已归还（取消卡死任务时主动释放）
+        self.worker_thread_ident = None  # worker 线程 ident，用于卡死时 dump 调用栈
         self._log_buffer = []     # 日志缓冲区，用于批量发送
         self._last_emit_time = 0  # 上次发送时间
         self._emit_interval = 0.5  # 最小发送间隔（秒）
@@ -1292,6 +1389,11 @@ def cancel_task(task_id):
     # 设置取消标志，任务线程会在检查点抛出InterruptedError
     task.cancel()
     task.add_log('任务已被用户取消', 'warning')
+
+    # 若任务正在运行：worker 可能卡在不可中断的阻塞调用里永远到不了检查点，
+    # 主动归还并发槽位（并 dump 卡死线程栈），避免并发通道永久减一
+    if task.start_time is not None:
+        _release_task_slot(task, reason='user-cancel')
     
     # 强制发送更新
     task._emit_update(force=True)
