@@ -2,6 +2,10 @@
 
 这是一个统一的 DICOM 文件下载和处理工具，可以直接从 PACS 服务器下载数据，并进行元数据提取和格式转换。
 
+## 文档
+
+开发/agent 文档位于 `docs/`（结构说明见 `docs/DOCUMENTATION_SYSTEM.md`）：架构决策（`DECISIONS.md`）、已知问题（`KNOWN_ISSUES.md`）、已否定路线（`DEAD_ENDS.md`）、文件地图（`FILE_MAP.md`）、部署指南（`DEPLOY_INSTRUCTIONS.md`）。代理协作原则见 `AGENTS.md`。
+
 ## 功能特点
 
 - **PACS 直接集成**: 使用 DICOM 协议 (C-FIND, C-MOVE) 直接与 PACS 服务器通信。

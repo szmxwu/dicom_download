@@ -4,6 +4,10 @@
 
 A unified client for downloading DICOM files from PACS servers and processing them. This tool provides a web interface for managing downloads, extracting metadata, and converting images.
 
+## Documentation
+
+Developer/agent documentation lives in `docs/` (see `docs/DOCUMENTATION_SYSTEM.md` for the layout): architecture decisions (`DECISIONS.md`), known issues (`KNOWN_ISSUES.md`), rejected approaches (`DEAD_ENDS.md`), file map (`FILE_MAP.md`), and deployment guide (`DEPLOY_INSTRUCTIONS.md`). Agent collaboration principles are in `AGENTS.md`.
+
 ## Features
 
 - **Direct PACS Integration**: Communicate directly with PACS servers using DICOM protocols (C-FIND, C-MOVE).
