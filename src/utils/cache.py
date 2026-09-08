@@ -179,6 +179,23 @@ def copy_from_cache(cache_dir: str, target_dir: str, task_id: str) -> Dict:
         _remove_file_robust(target_zip)
     _link_or_copy(zip_file, target_zip)
 
+    # 刷新目标 ZIP 的时间戳（关键，勿删）：
+    # Windows 下硬链接沿用缓存原件的旧 mtime/ctime（NTFS 建链不刷新），
+    # copy2 回退路径同样保留旧 mtime —— 结果清理守护进程会把这条"旧" ZIP
+    # 当作超龄文件立即删掉，造成"任务 Completed 但 /api/download/zip 404"（K2）。
+    # Linux 下 link() 会刷 ctime，这里一并刷新 mtime 统一行为。
+    try:
+        os.utime(target_zip, None)
+    except OSError:
+        pass
+
+    # 刷新缓存条目的访问时间，保证 LRU 淘汰（按条目 atime 排序）把
+    # 刚被命中的条目视为最近使用，避免热数据被误淘汰。
+    try:
+        os.utime(cache_dir, None)
+    except OSError:
+        pass
+
     # 复制 Excel 到目标 organized 目录
     target_excel = None
     if os.path.isfile(excel_file):

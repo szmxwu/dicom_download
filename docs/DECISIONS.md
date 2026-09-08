@@ -47,6 +47,7 @@ DR/DX/CR/XR/RF/XA/MG 等模态（`XRAY_DERIVED_TOLERANT_MODALITIES`）仅凭 `Im
 ### D10. 磁盘背压与清理策略
 下载暂停/恢复按 `.env` 水位线；清理按 max(mtime, ctime) 排序（**不用 atime**——relatime 下清理自身的遍历会刷新 atime，Windows NTFS 常不更新 atime）；`CLEANUP_MIN_AGE_MINUTES`（默认 60）保护新生成的 ZIP；`results/cache/` 不参与清理（LRU 自管理——历史上清理删掉 38GB 缓存并与淘汰竞争 → WinError 3/5）。
 **理由/事故**：磁盘清理曾把新下载的批量任务 ZIP 清掉（2026-08）；Windows 上 atime 不可信。
+**配套陷阱（2026-09-08，K2）**：缓存命中用硬链接把缓存文件链入 `results/`，**Windows NTFS 建硬链不刷新 mtime/ctime**——链出的 ZIP 带着缓存原件的旧时间戳，会被 min-age 保护漏掉而遭立即清理。`copy_from_cache` 必须在链接/复制后显式 `os.utime` 刷新目标 ZIP（并顺手刷新缓存条目 atime 保证 LRU 准确）。任何"从旧文件硬链/copy2 出新结果文件"的路径都要想到这一点。
 
 ## 转换、QC 与预览
 

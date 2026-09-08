@@ -10,15 +10,17 @@
 - 已排除方向：队列槽位泄漏已修（D17，但那是并发减少不是崩溃）；Windows emoji 输出崩溃已修（commit 7418c22）。
 - 下次发生时：查 `logs/app.log` 末尾、`faulthandler` 输出、Windows 事件查看器；重点怀疑 eventlet/线程/文件句柄。
 
-### K2. Completed 但 ZIP 404（待复核是否已根除）
+### K2. Completed 但 ZIP 404 —— 已修复（2026-09-08）
 - 报告：2026-08，136 上 3933963、Z19121200215 任务状态 Completed 但 `/api/download/{task_id}/zip` 稳定 404（ZIP 未生成）。
-- 当时排查指向 Windows 打包路径/清理竞争；后续打包优化（commit 324b1be）与清理 min-age 保护（D10）可能已缓解，**未经生产复核确认**。再发生时优先查 `create_result_zip` 的 offload 调用与清理守护进程的交互。
+- **根因确认**：这两个 accession 反复出现 → 每次走缓存命中。`copy_from_cache` 用硬链接把缓存的 `result.zip` 链到 `results/result_{task_id}.zip`；**Windows NTFS 建硬链不刷新 mtime/ctime**（沿用缓存原件的数天旧值，`shutil.copy2` 回退同样保留旧 mtime）。缓存命中任务秒级 Completed 后，磁盘紧张时清理守护进程把这条"旧" ZIP 当作超出 `CLEANUP_MIN_AGE_MINUTES` 保护窗的文件立即删除 → 404。Linux 的 `link(2)` 会刷 ctime，故只在 Windows 复发。
+- **修复**：`copy_from_cache` 链接/复制目标 ZIP 后显式 `os.utime(target_zip, None)` 刷新时间戳（同时 `os.utime(cache_dir)` 刷新缓存条目 atime，保证 LRU 顺序准确）。已用 10 天前旧时间戳的模拟缓存验证：修复前目标 zip mtime 保持 10 天前，修复后为当前时刻。
 
 ### K3. Windows 缓存 LRU 淘汰偶发 WinError
 - 2026-08：136 缓存超 20GB 限额时 LRU 清理报 WinError 3/5（文件被占用/路径不存在）。已做：淘汰改异步后台线程、失败条目 30 分钟冷却、清理不再触碰 `results/cache/`。不影响新下载，但老旧 accession 缓存可能失效，重复下载需重新走 PACS。
 
-### K4. 厚层序列三视图的 Z 轴比例
-- 2026-08：排查缺 preamble 文件时自绘三视图曾忽略层厚导致冠状/矢状位压扁或拉长——那是临时脚本的 bug；**项目自身预览即三视图设计未被改动**。若预览出现 Z 轴比例异常，先确认是否真是项目预览输出。
+### K4. 厚层序列三视图的 Z 轴比例 —— 已复核排除（2026-09-08）
+- 2026-08：排查缺 preamble 文件时自绘三视图曾忽略层厚导致冠状/矢状位压扁或拉长——那是临时脚本的 bug；**项目自身预览即三视图设计未被改动**。
+- 2026-09-08 复核：`preview.py:_generate_3d_triplane_preview` 有完整的体素各向异性修正（`_scale_height()` 按 PixelSpacing 拉伸面内高度，矢状/冠状面板按 SliceThickness 修正层间距；nii 路径用 header zooms，npz 路径用 DICOM tag）。合成数据（19 层×5mm → 高度 95px）与真实数据（`MRplusDownloads/0000000099/004_t1_tse_sag_384`，dz=4.9mm）双验证通过，重新生成与存量预览一致。**项目三视图无此 bug**。若预览出现 Z 轴比例异常，先确认是否真是项目预览输出。
 
 ## 环境约束（长期有效，不是 bug）
 
