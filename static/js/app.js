@@ -150,6 +150,7 @@ class DICOMProcessor {
                 'history_tasks': 'History Tasks',
                 'refresh': 'Refresh',
                 'task_id': 'Task ID',
+                'client_ip': 'Client IP',
                 'accession_number': 'AccessionNumber',
                 'task_type': 'Type',
                 'task_summary': 'Summary',
@@ -335,6 +336,7 @@ class DICOMProcessor {
                 'history_tasks': '历史任务',
                 'refresh': '刷新',
                 'task_id': '任务ID',
+                'client_ip': '客户端IP',
                 'accession_number': '检查号',
                 'task_type': '类型',
                 'task_summary': '摘要',
@@ -2342,7 +2344,7 @@ class DICOMProcessor {
 
             return `
                 <tr>
-                    <td><small>${task.task_id.substring(0, 8)}...</small></td>
+                    <td><small>${this.escapeHtml(task.client_ip || '--')}</small></td>
                     <td>${task.type}${taskInfo ? '<br>' + taskInfo : ''}</td>
                     <td>${statusBadge}</td>
                     <td>${progressBar}</td>

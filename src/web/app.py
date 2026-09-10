@@ -875,6 +875,7 @@ class ProcessingTask:
         self.end_time = None
         self.logs = []
         self._cancelled = False  # 取消标志
+        self.client_ip = None  # 提交任务的客户端 IP（监控页展示用）
         self.slot_released = False  # 并发槽位是否已归还（取消卡死任务时主动释放）
         self.worker_thread_ident = None  # worker 线程 ident，用于卡死时 dump 调用栈
         self._log_buffer = []     # 日志缓冲区，用于批量发送
@@ -1126,6 +1127,7 @@ def process_single():
             'accession_number': accession_number,
             'options': options
         })
+        task.client_ip = request.remote_addr
         
         processing_tasks[task_id] = task
 
@@ -1162,6 +1164,7 @@ def process_batch():
             'accession_numbers': accession_numbers,
             'options': options
         })
+        task.client_ip = request.remote_addr
         
         processing_tasks[task_id] = task
 
@@ -1211,6 +1214,7 @@ def process_upload():
             'filename': filename,
             'options': options
         })
+        task.client_ip = request.remote_addr
         
         processing_tasks[task_id] = task
 
@@ -1695,6 +1699,7 @@ def get_system_monitoring():
                     'status': task.status,
                     'progress': task.progress,
                     'current_step': task.current_step,
+                    'client_ip': getattr(task, 'client_ip', None),
                     'start_time': task.start_time if task.start_time is not None else task.created_at,
                     # 运行中显示实际处理时长；排队中显示已等待时长
                     'elapsed_seconds': round(time.time() - (task.start_time if task.start_time is not None else task.created_at), 1),
