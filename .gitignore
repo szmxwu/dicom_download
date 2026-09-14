@@ -84,7 +84,7 @@ target/
 # IPython
 profile_default/
 ipython_config.py
-offline_packages
+offline_packages/*
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:
@@ -203,8 +203,11 @@ uploads
 results/
 !results/.gitkeep
 test/*
-offline_packages
+!test/test_conversion_failures.py
+offline_packages/*
+!offline_packages/install.ps1
 temp
 .qoder
 .mimocode
 docs
+test

@@ -21,6 +21,7 @@ DICOM 转换模块。
 from __future__ import annotations
 
 import logging
+import locale
 import os
 import json
 import shutil
@@ -44,88 +45,77 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger('DICOMApp')
 
-# 全局锁用于保护 dcm2niix 调用，避免 Windows 下多进程/多线程并发问题
-dcm2niix_global_lock = threading.Lock()
+# Resolve before entering tpool; its worker must not import/patch green primitives.
+try:
+    from eventlet.patcher import original
+    _native_subprocess = original('subprocess')
+    # original(subprocess) can still refer to monkey-patched dependency modules.
+    # Replace references in this private module, not in global threading/time.
+    _native_subprocess.threading = original('threading')
+    _native_subprocess.time = original('time')
+    dcm2niix_global_lock = original('threading').Lock()
+except ImportError:
+    _native_subprocess = subprocess
+    dcm2niix_global_lock = threading.Lock()
 
 
 def _run_subprocess_with_timeout(cmd, timeout, capture_output=True, text=True):
-    """
-    运行子进程并设置超时，超时后强制终止进程。
-    在 Windows 上使用 taskkill 确保进程树被彻底终止，避免句柄泄漏。
-    """
-    import subprocess
-    import sys
-    import time
+    def run():
+        # Acquire the native lock only in the worker, never on the eventlet hub.
+        with dcm2niix_global_lock:
+            return _run_native_subprocess(cmd, timeout, capture_output, text)
+    return run_cpu_bound(run)
 
-    stdout = None
-    stderr = None
 
-    if capture_output:
-        stdout = subprocess.PIPE
-        stderr = subprocess.PIPE
-
-    try:
-        proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, text=text)
-    except Exception as e:
-        class FakeResult:
-            returncode = -1
-            stdout = ''
-            stderr = str(e)
-        return FakeResult()
-
-    try:
-        out, err = proc.communicate(timeout=timeout)
-        class Result:
-            pass
-        result = Result()
-        result.returncode = proc.returncode
-        result.stdout = out or ''
-        result.stderr = err or ''
-        return result
-    except subprocess.TimeoutExpired:
-        logger.warning(f"dcm2niix timeout after {timeout}s, forcing termination (PID={proc.pid})")
-        # 先尝试优雅终止
+def _run_native_subprocess(cmd, timeout, capture_output=True, text=True):
+    """Native process wait in an OS worker; temporary files avoid Windows pipe readers."""
+    native = _native_subprocess
+    empty = '' if text else b''
+    # Unlike PIPE, file handles need no reader threads (which eventlet patches).
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
-            pass
+            proc = native.Popen(
+                cmd, stdout=stdout if capture_output else None,
+                stderr=stderr if capture_output else None
+            )
+        except OSError as exc:
+            error = str(exc) if text else str(exc).encode('utf-8', errors='replace')
+            return native.CompletedProcess(cmd, -1, empty, error)
 
-        # 如果还在运行，强制 kill
-        if proc.poll() is None:
+        timed_out = False
+        try:
             try:
+                proc.wait(timeout=timeout)
+            except native.TimeoutExpired:
+                timed_out = True
+                # Kill the tree before the parent exits, while taskkill can find it.
+                if sys.platform.startswith('win'):
+                    try:
+                        native.run(
+                            ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                            stdout=native.DEVNULL, stderr=native.DEVNULL, timeout=5
+                        )
+                    except (OSError, native.TimeoutExpired):
+                        pass
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=2)
-            except Exception:
-                pass
+                proc.wait(timeout=5)
 
-        # Windows: 使用 taskkill 确保进程树被彻底终止
-        if sys.platform.startswith('win') and proc.poll() is None:
-            try:
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-                               capture_output=True, timeout=5)
-            except Exception:
-                pass
-
-        # 最后一次等待
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-
-        # 收集已输出的内容
-        try:
-            out, err = proc.communicate(timeout=1)
-        except Exception:
-            out, err = '', ''
-
-        class Result:
-            pass
-        result = Result()
-        result.returncode = -1
-        result.stdout = out or ''
-        result.stderr = err or f"Timeout after {timeout}s"
-        return result
+        stdout.seek(0)
+        stderr.seek(0)
+        out, err = stdout.read(), stderr.read()
+        if text:
+            encoding = locale.getpreferredencoding(False)
+            out = out.decode(encoding, errors='replace')
+            err = err.decode(encoding, errors='replace')
+        if timed_out:
+            message = f'Timeout after {timeout}s'
+            err = (err + '\n' + message) if text else err + b'\n' + message.encode()
+        return native.CompletedProcess(cmd, -1 if timed_out else proc.returncode, out, err)
 
 
 def _build_conversion_entry(output_file: str, dcm: FileDataset, file_index: Optional[int] = None, source_file: Optional[str] = None) -> Dict[str, str]:
@@ -1271,7 +1261,9 @@ def convert_with_dcm2niix(
                 dcm2niix_cmd = bundled
 
         try:
-            subprocess.run([dcm2niix_cmd, '-h'], capture_output=True, check=True)
+            probe = _run_subprocess_with_timeout([dcm2niix_cmd, '-h'], timeout=10)
+            if probe.returncode != 0:
+                return {'success': False, 'error': 'dcm2niix not available: ' + str(probe.stderr)}
         except (subprocess.CalledProcessError, FileNotFoundError):
             logger.warning("dcm2niix not found or not executable: %s", dcm2niix_cmd)
             return {'success': False, 'error': 'dcm2niix not available'}
@@ -1343,8 +1335,7 @@ def convert_with_dcm2niix(
                     # 添加重试机制应对 Windows 文件句柄未释放问题
                     result = None
                     for attempt in range(3):
-                        with dcm2niix_global_lock:
-                            result = _run_subprocess_with_timeout(cmd, timeout=60)
+                        result = _run_subprocess_with_timeout(cmd, timeout=60)
                         if result.returncode == 0:
                             break
                         if attempt < 2:
@@ -1394,6 +1385,11 @@ def convert_with_dcm2niix(
                     if temp_dir and os.path.exists(temp_dir):
                         shutil.rmtree(temp_dir, ignore_errors=True)
 
+            if success_count != len(dicom_files):
+                error = f'Incomplete conversion: {success_count}/{len(dicom_files)} files; original DICOM retained'
+                logger.error(error)
+                return {'success': False, 'error': error, 'file_count': success_count}
+
             if success_count > 0:
                 logger.info("dcm2niix conversion succeeded: %d/%d files", success_count, len(dicom_files))
 
@@ -1432,8 +1428,7 @@ def convert_with_dcm2niix(
         # 添加重试机制应对 Windows 文件句柄未释放问题
         result = None
         for attempt in range(3):
-            with dcm2niix_global_lock:
-                result = _run_subprocess_with_timeout(cmd, timeout=300)
+            result = _run_subprocess_with_timeout(cmd, timeout=300)
             if result.returncode == 0:
                 break
             if attempt < 2:
@@ -1830,6 +1825,11 @@ def convert_with_python_libs(
                 except Exception as e:
                     logger.warning("Failed converting file %d (%s): %s", idx + 1, os.path.basename(dcm_file), e)
                     continue
+
+            if success_count != len(dicom_files):
+                error = f'Incomplete conversion: {success_count}/{len(dicom_files)} files; original DICOM retained'
+                logger.error(error)
+                return {'success': False, 'error': error, 'file_count': success_count}
 
             if success_count > 0:
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)

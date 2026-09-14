@@ -908,21 +908,24 @@ class DICOMDownloadClient:
         else:
             logger.info(f"🔓 C-MOVE lock acquired for {accession_number}, starting download...")
 
-        # 启动C-STORE SCP
-        ae_scp = AE(ae_title=self.pacs_config['CALLING_AET'])
-        ae_scp.supported_contexts = AllStoragePresentationContexts
-        ae_scp.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
-
-        server = ae_scp.start_server(
-            ('', self.pacs_config['CALLING_PORT']),
-            block=False,
-            evt_handlers=[(evt.EVT_C_STORE, handle_store)]
-        )
-
         # P0: 跟踪失败的序列以便重试
         failed_series = []
 
+        # SCP 启动必须纳入 try：若 start_server 抛异常（典型：CALLING_PORT 被
+        # 前一次崩溃残留的僵尸进程占用），异常会绕过 finally 导致 _cmove_lock
+        # 永不释放，后续所有任务永久阻塞在 acquire（2026-09-13 136 事故）。
+        server = None
         try:
+            # 启动C-STORE SCP
+            ae_scp = AE(ae_title=self.pacs_config['CALLING_AET'])
+            ae_scp.supported_contexts = AllStoragePresentationContexts
+            ae_scp.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+
+            server = ae_scp.start_server(
+                ('', self.pacs_config['CALLING_PORT']),
+                block=False,
+                evt_handlers=[(evt.EVT_C_STORE, handle_store)]
+            )
             # P1: 使用上下文管理器管理关联
             with AssociationManager(self.ae, self.pacs_config) as assoc:
                 # 下载每个Series（P0: 失败隔离）
@@ -1150,7 +1153,11 @@ class DICOMDownloadClient:
             logger.error(f"❌ Download error: {e}", exc_info=True)
             return None
         finally:
-            server.shutdown()
+            if server is not None:
+                try:
+                    server.shutdown()
+                except Exception as e:
+                    logger.warning(f"Error shutting down C-STORE SCP: {e}")
             # P2: 确保锁被释放（防御性编程，防止异常导致死锁）
             if DICOMDownloadClient._cmove_lock.locked():
                 try:
@@ -2145,6 +2152,11 @@ class DICOMDownloadClient:
                     derived_keywords=derived_keywords
                 )
                 download_dir_holder['path'] = download_path
+            except Exception as e:
+                # 必须记录：线程内未捕获异常默认只写 stderr（Windows 服务下不可见），
+                # 历史上曾因此出现"任务秒败、无任何错误日志"的隐形崩溃
+                logger.error(f"❌ Download worker crashed: {e}", exc_info=True)
+                download_dir_holder['path'] = None
             finally:
                 download_done.set()
 
@@ -2303,6 +2315,15 @@ class DICOMDownloadClient:
                         raise ValueError("File organization failed: no DICOM files found")
                 results['organized_dir'] = organized_dir
                 results['series_info'] = series_info
+
+            conversion_errors = {
+                name: info['conversion_error']
+                for name, info in series_info.items() if info.get('conversion_error')
+            }
+            if conversion_errors:
+                results['error'] = f"Series conversion failed: {conversion_errors}"
+                logger.error(results['error'])
+                return results
 
             if auto_metadata:
                 # 步骤3: 提取元数据 (独立线程)

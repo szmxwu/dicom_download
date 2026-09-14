@@ -146,6 +146,8 @@ QC_DEFAULT_SERIES_LOW_QUALITY_RATIO=0.3
    ```bash
    python -m src.web.app
    ```
+   Windows 下先激活已安装离线依赖的环境，再在该终端运行 `run_on_windows.bat`。
+   脚本检查并使用当前 Python 环境；不创建虚拟环境、不联网安装依赖。
 2. 打开浏览器访问 `http://localhost:5005`。
 3. 使用界面查询患者并开始下载/处理任务。
 

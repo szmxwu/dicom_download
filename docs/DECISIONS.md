@@ -87,6 +87,11 @@ DR/DX/CR/XR/RF/XA/MG 等模态（`XRAY_DERIVED_TOLERANT_MODALITIES`）仅凭 `Im
 ### D20. 单实例锁（`logs/app.lock`，posix flock / windows msvcrt）
 eventlet 下两进程可同时 LISTEN 同一端口（SO_REUSEPORT 语义），任务状态与 C-STORE SCP 被撕裂 → 僵尸任务（2026-08-27 实测）。**重启纪律**：先确认旧进程已死再启动；远程重启用 `kill <pid>` 精确杀（`pkill -f` 会匹配到 ssh 远程 shell 自己的命令行导致会话自杀）。
 
+### D23. 转换完整性与原生子进程边界（2026-09-13）
+逐张转换仅在全部输入成功后删除原始 DICOM；部分失败保留整组输入以支持完整回退，最终失败传递到工作流。理由：旧代码在 1/2 成功时删除失败原件且报告成功，合成 DX 故障注入已复现（K10）。
+
+dcm2niix 的原生串行锁、创建进程、等待和清理均位于真实线程；eventlet hub 只派发任务。原生 subprocess 的 threading/time 引用也必须为原生模块。输出使用临时文件而非 PIPE，Windows 超时先终止进程树再回收父进程。理由：Windows 管道读取在绿化线程下可阻塞整个 hub，导致超时失效（K11）；禁止把包含 green 锁/队列的整个转换流程直接卸载（D19）。
+
 ## 可观测性
 
 ### D21. 提交审计日志（2026-08-31）

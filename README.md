@@ -149,6 +149,9 @@ Note: MR signal intensity is in arbitrary units, so absolute thresholds caused ~
    ```bash
    python -m src.web.app
    ```
+   On Windows, activate the environment containing your offline-installed dependencies,
+   then run `run_on_windows.bat` from that terminal. It checks the current environment
+   and starts the service; it does not create a virtual environment or install packages.
 2. Open your browser and navigate to `http://localhost:5005`.
 3. Use the interface to search for patients and start download/processing tasks.
 

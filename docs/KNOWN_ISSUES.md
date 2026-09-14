@@ -22,6 +22,20 @@
 - 2026-08：排查缺 preamble 文件时自绘三视图曾忽略层厚导致冠状/矢状位压扁或拉长——那是临时脚本的 bug；**项目自身预览即三视图设计未被改动**。
 - 2026-09-08 复核：`preview.py:_generate_3d_triplane_preview` 有完整的体素各向异性修正（`_scale_height()` 按 PixelSpacing 拉伸面内高度，矢状/冠状面板按 SliceThickness 修正层间距；nii 路径用 header zooms，npz 路径用 DICOM tag）。合成数据（19 层×5mm → 高度 95px）与真实数据（`MRplusDownloads/0000000099/004_t1_tse_sag_384`，dz=4.9mm）双验证通过，重新生成与存量预览一致。**项目三视图无此 bug**。若预览出现 Z 轴比例异常，先确认是否真是项目预览输出。
 
+### K10. 单张转换部分失败后删除失败原件 —— 已修复（2026-09-13，未 commit）
+- 审查实证：两张 DX 输入，模拟第二张转换失败，旧代码仍返回 success=True 且删除两张 DICOM；Python 回退分支同样只检查 success_count > 0。
+- 修复：逐张转换必须全部成功才删除原件；部分失败保留整组 DICOM，允许完整 Python 回退；最终失败由整理层传递到工作流，禁止作为成功检查写入缓存。既有缓存中的历史缺片结果不会自动修复。
+- 回归：`test/test_conversion_failures.py` 覆盖两种转换器、内存返回模式、完整回退、串行整理和并行工作流失败传播。仅用合成 DICOM，无 PACS 连接。
+
+### K11. Windows/eventlet 子进程管道阻塞 —— 已修复路径，待 Windows 原生复核（2026-09-13）
+- 审查实证：eventlet 0.41.0 + 标准库 Windows 管道读取逻辑的 Linux 模拟中，50ms 超时仍阻塞事件循环约 572ms。
+- 修复：dcm2niix 执行及 `-h` 探测统一有超时，在真实线程内使用原生 subprocess/threading/time；输出写临时文件，避免 Windows PIPE 读取线程被绿化；原生串行锁只在真实线程内获取。Windows 超时先 taskkill 整棵树，再兜底 kill/wait。
+- 回归：`test/test_conversion_failures.py` 验证输出解码、超时、启动失败、eventlet 心跳及嵌套并发。不能据此认定已解决 K1 进程自动退出；仍需用户手动同步并在 Windows 服务器复核。
+
+### K12. Windows 启动环境与离线安装环境分离 —— 已修复（2026-09-13，未 commit）
+- 代码实证：旧 `run_on_windows.bat` 创建新 venv 并联网安装，安装失败仍启动；`offline_packages/install.ps1:11` 的 `2&1` 为错误重定向。
+- 修复：启动脚本使用当前已激活环境，显示解释器路径，依赖/导入检查失败即退出，不安装包；PowerShell 重定向改为 `2>&1`。离线 wheel 和 requirements 未调整，用户自行补齐。
+
 ## 环境约束（长期有效，不是 bug）
 
 ### K5. `.env` 只由 web app 加载
@@ -31,7 +45,7 @@
 见 DECISIONS D19。排查工具：193 上有 `~/py-spy`（需 sudo，ptrace_scope=1）可 dump 运行中进程全线程栈定位冻结点。
 
 ### K7. 无包安装 / 测试现实
-不能 `pip install -e .`，必须从仓库根目录运行（PYTHONPATH 含根）。无正式测试套件；`pytest test/` 目前 14 个用例（MR clean、方位修正等），`test.py` 是上传流程集成测试且硬编码只测 nifti。
+不能 `pip install -e .`，必须从仓库根目录运行（PYTHONPATH 含根）。`pytest test/` 覆盖 MR clean、方位修正、转换失败和子进程回归；eventlet 专项在未安装 eventlet 时跳过。`test.py` 是上传流程集成测试且硬编码只测 nifti。
 
 ### K8. `offline_packages/` 版本可能与 requirements.txt 不一致
 离线安装时以 requirements.txt 为准逐个人工核对。
@@ -54,6 +68,7 @@
 | 2026-08-31 | QC 边框-中心启发式反转健康胸部 CT | 判据退役（D12），存量 33364 个 nii 已批量恢复并验证 |
 | 2026-08-31 | 监控页 failed 任务耗时无限增长 | d67c171（D18） |
 | 2026-09-05 | 卡死任务取消后并发通道永久 3→2 | 2b6a2e4（D17） |
+| 2026-09-13 | C-STORE SCP 启动失败（CALLING_PORT 被占）异常在 try 之外 → `_cmove_lock` 永不释放 → 全部任务永久卡在 acquire；线程静默死亡无任何错误日志 | SCP 启动移入 try（finally 兜底 shutdown+释放锁）+ `_download_worker` 补 except 日志（未 commit） |
 | 2026-05-14 | '3D' 关键词误杀原始 MR 序列 | 17ee220 移除 |
 | 2026-05-14 | QueueWatchdog 误报 | e8da48b |
 | 2026-05-15 | GE Propeller (RM) 序列 MR_clean 不识别 | d2530db |

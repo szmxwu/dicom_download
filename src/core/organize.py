@@ -245,10 +245,13 @@ def organize_dicom_files(
             }
 
             # 执行格式转换
+            conversion_result = None
             if output_format == 'nifti':
-                client.convert_dicom_to_nifti(series_path, series_folder)
+                conversion_result = client.convert_dicom_to_nifti(series_path, series_folder)
             elif output_format == 'npz':
-                client._convert_to_npz(series_path, series_folder)
+                conversion_result = client._convert_to_npz(series_path, series_folder)
+            if output_format in ('nifti', 'npz') and not (conversion_result or {}).get('success'):
+                raise RuntimeError(f"Series {series_folder} conversion failed: {(conversion_result or {}).get('error', 'No result')}")
 
     print(f"✅ DICOM organization complete! Processed {processed_files} files")
 
@@ -475,22 +478,27 @@ def process_single_series(
                 print(f"   ✅ All {verified_count} files verified with checksums")
 
         # 执行格式转换（传入已扫描的 dicom_files 和 sample_dcm/modality，避免重复 I/O）
+        conversion_error = None
         try:
+            conversion_result = None
             if output_format == 'nifti':
-                client.convert_dicom_to_nifti(
+                conversion_result = client.convert_dicom_to_nifti(
                     series_path, series_folder,
                     dicom_files=dicom_files,
                     sample_dcm=sample_dcm,
                     modality=modality
                 )
             elif output_format == 'npz':
-                client._convert_to_npz(
+                conversion_result = client._convert_to_npz(
                     series_path, series_folder,
                     dicom_files=dicom_files,
                     sample_dcm=sample_dcm,
                     modality=modality
                 )
+            if output_format in ('nifti', 'npz') and not (conversion_result or {}).get('success'):
+                conversion_error = (conversion_result or {}).get('error', 'No conversion result')
         except Exception as e:
+            conversion_error = str(e)
             logger.error(f"   ❌ Series {series_folder} conversion failed: {e}")
         # P0: 原地处理 - 不再移动到 organized 子目录
         # 文件已经在正确的位置，直接返回原路径
@@ -498,7 +506,8 @@ def process_single_series(
         return {
             'path': series_path,
             'file_count': len(dicom_files),
-            'files': dicom_files
+            'files': dicom_files,
+            'conversion_error': conversion_error
         }
     finally:
         # 确保锁文件总是被清理，避免 WinError 5
