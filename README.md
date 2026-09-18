@@ -55,6 +55,16 @@ CLEANUP_TARGET_GB=160
 CLEANUP_MIN_AGE_MINUTES=30
 ```
 
+Metadata extraction runs with a timeout so a stuck extraction cannot occupy a
+task worker forever. Very large legacy studies (thousands of slices) on slow
+disks may need a larger value; metadata failure never fails the task itself
+(the download/conversion results are kept, only the Excel is skipped):
+
+```ini
+# Metadata (Excel) extraction timeout in seconds (default 1800)
+METADATA_TIMEOUT_SEC=1800
+```
+
 Key behavior:
 - `running` and `pending` tasks are never cleaned.
 - Items newer than `CLEANUP_MIN_AGE_MINUTES` are skipped.

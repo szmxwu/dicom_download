@@ -209,5 +209,5 @@ offline_packages/*
 temp
 .qoder
 .mimocode
-docs
+docs/
 test

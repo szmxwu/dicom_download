@@ -52,6 +52,15 @@ CLEANUP_TARGET_GB=160
 CLEANUP_MIN_AGE_MINUTES=30
 ```
 
+元数据提取带超时保护，避免卡死永久占用任务线程。超大老序列（数千层）在慢速
+磁盘上可能需要更长时间；元数据失败不会导致任务失败（下载/转换结果保留，
+仅跳过 Excel）：
+
+```ini
+# 元数据（Excel）提取超时时间（秒，默认 1800）
+METADATA_TIMEOUT_SEC=1800
+```
+
 清理规则：
 - `running` / `pending` 状态的任务结果永远不会被清理。
 - 生成时间小于 `CLEANUP_MIN_AGE_MINUTES` 的结果会被跳过。

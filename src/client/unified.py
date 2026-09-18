@@ -2344,11 +2344,17 @@ class DICOMDownloadClient:
 
                 metadata_thread = threading.Thread(target=_metadata_worker, daemon=True)
                 metadata_thread.start()
-                # 带超时等待：元数据提取卡死时不能永久占用任务 worker
-                _safe_thread_join(metadata_thread, timeout=600)
+                # 带超时等待：元数据提取卡死时不能永久占用任务 worker。
+                # 超大老序列（数千层）在慢盘上 QC 单序列可达数分钟，600s 不够，
+                # 可通过 METADATA_TIMEOUT_SEC 调整
+                try:
+                    metadata_timeout = int(os.getenv('METADATA_TIMEOUT_SEC', '1800'))
+                except ValueError:
+                    metadata_timeout = 1800
+                _safe_thread_join(metadata_thread, timeout=metadata_timeout)
                 if metadata_thread.is_alive():
                     logger.error(
-                        "❌ Metadata extraction timed out after 600s, "
+                        f"❌ Metadata extraction timed out after {metadata_timeout}s, "
                         "continuing without metadata (background thread will be abandoned)"
                     )
                     excel_holder['path'] = None
@@ -2356,9 +2362,16 @@ class DICOMDownloadClient:
                 excel_file = excel_holder['path']
                 if excel_file:
                     results['excel_file'] = excel_file
-                    results['success'] = True
                 else:
                     logger.warning("⚠️  Metadata extraction failed, previous steps completed")
+
+                # 元数据（Excel）是可选产物：下载/整理/转换已全部成功即视为任务成功。
+                # 历史上此处 success 依赖 excel_file，metadata 超时会把一个完全
+                # 下载成功的任务误判为 "Unknown error during process"（2026-09-17，
+                # 193 上多个 2019 年老 CT 因此失败）
+                results['success'] = True
+                if not excel_file:
+                    results['metadata_warning'] = 'metadata extraction failed or timed out'
 
         # 打印最终结果
         logger.info(f"\n{'='*80}")
