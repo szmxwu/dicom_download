@@ -56,6 +56,12 @@ DERIVED_IMAGE_TYPE_WHITELIST = [
     # 实证：Philips DR 拼合 ImageType=DERIVED\SECONDARY\SPINE\VIEWER VB15A，
     # SeriesDescription 如 "W LongSpine ap large"（520010500096DR 生产事故）
     'SPINE', 'STITCH', 'LONGLEG', 'LONG LEG',
+    # 减影（subtraction）序列：DCE 乳腺/血管减影是临床核心诊断序列。
+    # 实证（2026-09-18）：GE SIGNA Voyager 乳腺 DCE 减影
+    # ImageType=DERIVED\SECONDARY\OTHER\SUBTRACT，SeriesDescription
+    # 形如 "(16889/604/1)-(16889/600/1)"（动态期减平扫）。
+    # 'SUB' 子串同时覆盖 Siemens 描述中的 "_SUB" 命名。
+    'SUB',
 ]
 
 # 2D X 光模态集合：这些模态的"诊断用"图像经常就是 ImageType=DERIVED
@@ -177,6 +183,15 @@ def is_derived_series(series_desc, image_type, keywords=None, modality=None):
     """
     xray_tolerant = bool(modality) and str(modality).upper().strip() in XRAY_DERIVED_TOLERANT_MODALITIES
     if image_type:
+        # pydicom MultiValue（ConstrainedList）不是 list/tuple 子类，先统一转成
+        # 普通 list——否则走下方 str 分支，白名单只查 SeriesDescription，
+        # ImageType 其余值（SUBTRACT/SPINE 等）永远漏判
+        # （2026-09-18 乳腺 DCE 减影序列误杀事故）
+        if not isinstance(image_type, (list, tuple)) and not isinstance(image_type, str):
+            try:
+                image_type = [str(v) for v in image_type]
+            except TypeError:
+                pass
         # ImageType 第一个值才代表像素来源：DERIVED/ORIGINAL。
         # 第二个值 PRIMARY/SECONDARY 是采集上下文，不能用于过滤。
         if isinstance(image_type, (list, tuple)):

@@ -37,6 +37,15 @@ def _is_derived_series(series_desc: str, image_type=None, modality=None) -> bool
     from src.core.constants import XRAY_DERIVED_TOLERANT_MODALITIES
     xray_tolerant = bool(modality) and str(modality).upper().strip() in XRAY_DERIVED_TOLERANT_MODALITIES
     if image_type:
+        # pydicom MultiValue（ConstrainedList）不是 list/tuple 子类，先统一转成
+        # 普通 list——否则走下方 str 分支，白名单只查 SeriesDescription，
+        # ImageType 其余值（SUBTRACT/SPINE 等）永远漏判
+        # （2026-09-18 乳腺 DCE 减影序列误杀事故）
+        if not isinstance(image_type, (list, tuple)) and not isinstance(image_type, str):
+            try:
+                image_type = [str(v) for v in image_type]
+            except TypeError:
+                pass
         # DICOM ImageType 第一个值才代表像素来源：DERIVED（衍生）或 ORIGINAL（原始采集）。
         # 第二个值 PRIMARY/SECONDARY 表示采集上下文，与是否为衍生序列无关，
         # 不能用于过滤（许多正常 MR/CT 序列第二值即为 SECONDARY）。

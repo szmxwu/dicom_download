@@ -70,6 +70,7 @@
 | 2026-09-05 | 卡死任务取消后并发通道永久 3→2 | 2b6a2e4（D17） |
 | 2026-09-13 | C-STORE SCP 启动失败（CALLING_PORT 被占）异常在 try 之外 → `_cmove_lock` 永不释放 → 全部任务永久卡在 acquire；线程静默死亡无任何错误日志 | SCP 启动移入 try（finally 兜底 shutdown+释放锁）+ `_download_worker` 补 except 日志（未 commit） |
 | 2026-09-17 | 超大老序列（单层 1711 文件、6.4GB）metadata 提取超 600s 超时 → `success` 依赖 excel_file → 下载转换全部成功却报 "Unknown error during process"（193 上一批 2019 年 CT 全部因此失败） | metadata 变为可选产物：超时/失败仅记 warning，success=True；超时改 `METADATA_TIMEOUT_SEC`（默认 1800）（未 commit） |
+| 2026-09-18 | GE 乳腺 DCE 减影序列（ImageType `DERIVED\SECONDARY\OTHER\SUBTRACT`）被衍生过滤误杀：pydicom `MultiValue` 非 `list/tuple` 子类 → 白名单对 ImageType 其余值从未生效 | 白名单加 `SUB`；`is_derived_series` 与 `organize._is_derived_series` 入口统一 MultiValue→list（未 commit） |
 | 2026-05-14 | '3D' 关键词误杀原始 MR 序列 | 17ee220 移除 |
 | 2026-05-14 | QueueWatchdog 误报 | e8da48b |
 | 2026-05-15 | GE Propeller (RM) 序列 MR_clean 不识别 | d2530db |

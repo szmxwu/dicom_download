@@ -25,6 +25,7 @@ DR/DX/CR/XR/RF/XA/MG 等模态（`XRAY_DERIVED_TOLERANT_MODALITIES`）仅凭 `Im
 `DERIVED_KEYWORD_EXCEPTIONS`（iDose≠剂量报告、MRCP≠厚层MPR、veLOCity≠定位像、KEYHOLE≠关键图像…）与 `DERIVED_IMAGE_TYPE_WHITELIST`（ADC/Dixon/DWI + DR 全脊柱/全长下肢拼合 SPINE/STITCH/LONGLEG）。
 **理由**：各厂商迭代/深度学习重建（iDose/IMR、ASIR、SAFIRE/ADMIRE、AIDR/AiCE、KARL/DELTA、ClearView、IPV、iDream）均为 ORIGINAL 诊断序列，命名与过滤关键词存在大量子串碰撞；短子串关键词（REF/LOC/KEY/SUM/VR）有误伤面。实证事故：Philips iCT iDose 被整体剔除只剩定位像（2026-08）；Philips DR 全脊柱拼合 520010500096DR 无法下载（2026-08）。
 **规则**：新增关键词前先排查是否命中真实诊断序列命名；关键词匹配时两侧都 upper 归一化（历史上混入小写 'nodule' 成为从未生效的死代码）。
+**补充（2026-09-18）**：白名单新增 `SUB`（乳腺 DCE/血管减影，GE `SUBTRACT`、Siemens `_SUB` 命名）。**陷阱**：pydicom 的 `MultiValue` 不是 `list/tuple` 子类（是 `ConstrainedList`），`isinstance(image_type, (list, tuple))` 为 False 会落入 str 分支，白名单只查 SeriesDescription——ImageType 其余值（SUBTRACT/SPINE）形同虚设，此前 SPINE 案例只是侥幸靠描述里的 "LongSpine" 命中。`is_derived_series` 与 `organize._is_derived_series` 入口已统一把 MultiValue 转 list。实证：GE SIGNA Voyager 乳腺减影 `DERIVED\SECONDARY\OTHER\SUBTRACT` 被误杀（/mnt/h/dicom/breat/）。
 
 ### D6. 过滤规则指纹并入缓存键（2026-08）
 `get_filter_rules_fingerprint()` 覆盖关键词+例外表+白名单+行为版本标志，任何规则修改使旧缓存条目自动失配。
