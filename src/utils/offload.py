@@ -47,6 +47,17 @@ def fix_logging_locks_for_eventlet():
         return
     real_threading = original('threading')
 
+    # 让 logging 模块内部统一使用真实 threading：
+    # Python 3.13 LogRecord.__init__ 执行 threading.current_thread().name，
+    # monkey_patch 后这是 eventlet 的 green 版本——从 tpool 真实线程首次调用时会走
+    # patch_function → SysModulesSaver.__init__ → imp.acquire_lock()（CPython 导入锁）。
+    # 若导入锁恰被主线程上某个挂起的 greenlet 持有（import 途中被切出），
+    # 真实线程永久阻塞在锁上：tpool 结果永不返回 → 转换 greenlet 挂起 →
+    # 任务持 _cmove_lock 不放 → 全部排队任务冻结（2026-09-20 线上实证，
+    # py-spy 显示 worker 卡在 logging → current_thread → patcher.imp.acquire_lock）。
+    # 副作用：hub 线程上的日志 threadName 统一显示 MainThread，可接受。
+    logging.threading = real_threading
+
     # 模块级锁（handler 注册表操作用）
     logging._lock = real_threading.RLock()
 

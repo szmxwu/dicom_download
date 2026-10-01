@@ -83,7 +83,7 @@ DR/DX/CR/XR/RF/XA/MG 等模态（`XRAY_DERIVED_TOLERANT_MODALITIES`）仅凭 `Im
 **理由/事故**：`process_single_task` 的 "No result returned" 失败分支漏设 `end_time` → `get_duration()` 退化为 now-start_time → 监控页耗时无限增长（实际 2.4 分钟的任务显示 11+ 分钟）。
 
 ### D19. eventlet 三大纪律
-① `Thread.join(timeout)` 在 monkey-patch 下抛 `BaseException`（eventlet.Timeout），统一走 `_safe_thread_join()`，任务处理兜底 catch `BaseException`；② CPU 密集/阻塞磁盘 I/O 必须走 `run_cpu_bound()`（tpool → 真实线程，可重入），否则饿死事件循环（py-spy 实证 python-libs 转换曾在 hub 线程冻结全站 7-10s/次；GB 级 ZIP 打包/缓存写盘同理）；③ tpool 真实线程内禁止碰 green 锁/队列（lost wakeup → `greenlet.error` → C-MOVE 永不返回 → 全站假死），logging 锁已由 `fix_logging_locks_for_eventlet()` 替换为真实锁。
+① `Thread.join(timeout)` 在 monkey-patch 下抛 `BaseException`（eventlet.Timeout），统一走 `_safe_thread_join()`，任务处理兜底 catch `BaseException`；② CPU 密集/阻塞磁盘 I/O 必须走 `run_cpu_bound()`（tpool → 真实线程，可重入），否则饿死事件循环（py-spy 实证 python-libs 转换曾在 hub 线程冻结全站 7-10s/次；GB 级 ZIP 打包/缓存写盘同理）；③ tpool 真实线程内禁止碰 green 锁/队列（lost wakeup → `greenlet.error` → C-MOVE 永不返回 → 全站假死），logging 由 `fix_logging_locks_for_eventlet()` 双重加固：锁替换为真实锁，且 `logging.threading` 重绑原生 threading 模块——py3.13 `LogRecord.__init__` 的 `threading.current_thread()` 在 green 版下会经 `patch_function` 抢 CPython 导入锁，被挂起 greenlet 持锁即永久死锁（2026-09-20 全站假死 24h 实证）。
 
 ### D20. 单实例锁（`logs/app.lock`，posix flock / windows msvcrt）
 eventlet 下两进程可同时 LISTEN 同一端口（SO_REUSEPORT 语义），任务状态与 C-STORE SCP 被撕裂 → 僵尸任务（2026-08-27 实测）。**重启纪律**：先确认旧进程已死再启动；远程重启用 `kill <pid>` 精确杀（`pkill -f` 会匹配到 ssh 远程 shell 自己的命令行导致会话自杀）。

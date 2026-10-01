@@ -469,7 +469,7 @@ def _do_cleanup_old_tasks():
     with _task_lock:
         # 找出过期任务
         expired_tasks = []
-        for task_id, task in processing_tasks.items():
+        for task_id, task in list(processing_tasks.items()):
             if task.end_time and task.end_time < cutoff_time:
                 expired_tasks.append(task_id)
 
@@ -744,7 +744,7 @@ def cleanup_old_results():
             return
 
         # 排除正在进行的任务
-        active_task_ids = [task.task_id for task in processing_tasks.values()
+        active_task_ids = [task.task_id for task in list(processing_tasks.values())
                           if task.status in ['running', 'pending']]
 
         # 过滤掉正在进行的任务
@@ -961,14 +961,16 @@ class ProcessingTask:
         # 通过WebSocket发送更新（节流控制）
         self._emit_update()
 
-    def update_status(self, status, progress=None, step=None):
+    def update_status(self, status, progress=None, step=None, error=None):
         """更新任务状态"""
         # 如果任务已取消，不再更新状态
         if self.is_cancelled() and status not in ['cancelled', 'failed']:
             logger.warning(f"Task {self.task_id} is cancelled, ignoring status update to {status}")
             return
-        
+
         self.status = status
+        if error is not None:
+            self.error = error
         # 终态时锁定计时终点：任何失败/完成分支忘记设置 end_time 都会导致
         # get_duration() 退化为 (now - start_time)，监控页面的耗时显示无限增长
         # （2026-08-31 实证："No result returned" 失败分支未设 end_time，
@@ -1265,7 +1267,9 @@ def get_queue_status():
         pending_tasks = []
 
         with _task_lock:
-            for task_id, task in processing_tasks.items():
+            # 快照遍历：提交/清理路径并非全部持有 _task_lock，
+            # 直接迭代会在并发写入时抛 dictionary changed size during iteration
+            for task_id, task in list(processing_tasks.items()):
                 task_info = {
                     'task_id': task.task_id,
                     'task_type': task.task_type,
@@ -1329,7 +1333,7 @@ def _parse_pagination_param(value, default, min_value=1, max_value=None):
 
 
 def _refresh_completed_cache_from_tasks():
-    completed_tasks = [t for t in processing_tasks.values() if t.status == 'completed']
+    completed_tasks = [t for t in list(processing_tasks.values()) if t.status == 'completed']
     completed_tasks.sort(key=lambda x: x.end_time or x.start_time or x.created_at, reverse=True)
     with _completed_tasks_lock:
         _completed_tasks_cache.clear()
@@ -1506,7 +1510,7 @@ def system_status():
     
     response = {
         'status': 'running',
-        'active_tasks': len([t for t in processing_tasks.values() if t.status == 'running']),
+        'active_tasks': len([t for t in list(processing_tasks.values()) if t.status == 'running']),
         'total_tasks': len(processing_tasks),
         'dicom_service_status': dicom_status,
         'storage': {
@@ -1691,7 +1695,7 @@ def get_system_monitoring():
     # 获取活跃任务详情
     active_tasks_info = []
     try:
-        for task_id, task in processing_tasks.items():
+        for task_id, task in list(processing_tasks.items()):
             if task.status in ['running', 'pending']:
                 task_info = {
                     'task_id': task_id,
@@ -1717,7 +1721,7 @@ def get_system_monitoring():
     recent_completed = []
     try:
         all_tasks = []
-        for task_id, task in processing_tasks.items():
+        for task_id, task in list(processing_tasks.items()):
             if task.status in ['completed', 'failed', 'cancelled']:
                 # 提取 AccessionNumber 或标识
                 accession_number = ''
@@ -1804,11 +1808,11 @@ def get_system_monitoring():
         'recent_completed': recent_completed,
         'pacs_connection': pacs_status,
         'task_summary': {
-            'running': len([t for t in processing_tasks.values() if t.status == 'running']),
-            'pending': len([t for t in processing_tasks.values() if t.status == 'pending']),
-            'completed': len([t for t in processing_tasks.values() if t.status == 'completed']),
-            'failed': len([t for t in processing_tasks.values() if t.status == 'failed']),
-            'cancelled': len([t for t in processing_tasks.values() if t.status == 'cancelled']),
+            'running': len([t for t in list(processing_tasks.values()) if t.status == 'running']),
+            'pending': len([t for t in list(processing_tasks.values()) if t.status == 'pending']),
+            'completed': len([t for t in list(processing_tasks.values()) if t.status == 'completed']),
+            'failed': len([t for t in list(processing_tasks.values()) if t.status == 'failed']),
+            'cancelled': len([t for t in list(processing_tasks.values()) if t.status == 'cancelled']),
             'total': len(processing_tasks)
         }
     })
@@ -2825,6 +2829,26 @@ def _acquire_single_instance_lock():
     return fd
 
 
+def _get_lan_ip():
+    """获取本机局域网 IP（仅用于启动横幅展示；服务本身绑定 0.0.0.0）。
+
+    UDP connect 不实际发包，只让内核选出外发网卡，离线环境同样可用；
+    历史上此处硬编码了 172.17.250.136，导致 193 的启动日志打印错误地址。
+    """
+    import socket as _socket
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        try:
+            return _socket.gethostbyname(_socket.gethostname())
+        except Exception:
+            return '127.0.0.1'
+
+
 if __name__ == '__main__':
     _single_instance_lock = _acquire_single_instance_lock()
     logger.info("="*60)
@@ -2845,7 +2869,7 @@ if __name__ == '__main__':
         except Exception as ssl_err:
             logger.error(f"❌ HTTPS 启动失败，回退为 HTTP: {ssl_err}")
 
-    logger.info(f"📡 访问地址: {protocol}://172.17.250.136:5005")
+    logger.info(f"📡 访问地址: {protocol}://{_get_lan_ip()}:5005")
     
     # 检查DICOM服务连接状态
     try:
@@ -2871,7 +2895,7 @@ if __name__ == '__main__':
     logger.info("📡 访问地址:")
     logger.info(f"   - {protocol}://localhost:5005")
     logger.info(f"   - {protocol}://127.0.0.1:5005")
-    logger.info(f"   - {protocol}://172.17.250.136:5005")
+    logger.info(f"   - {protocol}://{_get_lan_ip()}:5005")
     logger.info("="*60)
 
     # 启动应用

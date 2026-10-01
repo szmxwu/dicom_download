@@ -70,6 +70,8 @@
 | 2026-09-05 | 卡死任务取消后并发通道永久 3→2 | 2b6a2e4（D17） |
 | 2026-09-13 | C-STORE SCP 启动失败（CALLING_PORT 被占）异常在 try 之外 → `_cmove_lock` 永不释放 → 全部任务永久卡在 acquire；线程静默死亡无任何错误日志 | SCP 启动移入 try（finally 兜底 shutdown+释放锁）+ `_download_worker` 补 except 日志（未 commit） |
 | 2026-09-17 | 超大老序列（单层 1711 文件、6.4GB）metadata 提取超 600s 超时 → `success` 依赖 excel_file → 下载转换全部成功却报 "Unknown error during process"（193 上一批 2019 年 CT 全部因此失败） | metadata 变为可选产物：超时/失败仅记 warning，success=True；超时改 `METADATA_TIMEOUT_SEC`（默认 1800）（未 commit） |
+| 2026-10-01 | 队列满拒绝路径调用 `update_status('failed', error=...)` 但该方法无 error 形参 → TypeError → 兜底 except 里再调一次又炸 → 客户端收到 500 而非 503 → 礼貌退避失效，客户端狂轰滥炸（136 实证 3033 次 ERROR、队列持续爆满）；附带监控接口裸迭代 `processing_tasks` 偶发 dictionary changed size | `update_status` 增加 `error=None` 形参；所有 `processing_tasks` 迭代改为 `list(...)` 快照（未 commit） |
+| 2026-09-20 | tpool 真实线程在 `logging` 里触发 eventlet green `current_thread()` → `patch_function` → `imp.acquire_lock()`，导入锁被主线程挂起 greenlet 持有 → worker 永久阻塞 → 任务持 `_cmove_lock` 不放 → 全站假死 24h+（HTTP 200 但零处理，py-spy 实证） | `fix_logging_locks_for_eventlet()` 增加 `logging.threading = original('threading')`（未 commit） |
 | 2026-09-18 | GE 乳腺 DCE 减影序列（ImageType `DERIVED\SECONDARY\OTHER\SUBTRACT`）被衍生过滤误杀：pydicom `MultiValue` 非 `list/tuple` 子类 → 白名单对 ImageType 其余值从未生效 | 白名单加 `SUB`；`is_derived_series` 与 `organize._is_derived_series` 入口统一 MultiValue→list（未 commit） |
 | 2026-05-14 | '3D' 关键词误杀原始 MR 序列 | 17ee220 移除 |
 | 2026-05-14 | QueueWatchdog 误报 | e8da48b |
