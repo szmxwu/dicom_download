@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import nibabel as nib
@@ -263,12 +264,10 @@ def build_affine_from_dicom(
         col_spacing = float(pixel_spacing[1])
 
         affine_lps = np.eye(4, dtype=np.float64)
-        # DICOM pixel_array is (Rows, Columns) stacked as (Rows, Columns, Slices)
-        # dim 0 = Rows (vertical, top to bottom) = -Y in patient coordinates (since row 0 is top)
-        # dim 1 = Columns (horizontal, left to right) = X in patient coordinates
-        # So: X axis = column direction, Y axis = -row direction
-        affine_lps[:3, 0] = col_cosine * col_spacing  # x-axis = column direction
-        affine_lps[:3, 1] = -row_cosine * row_spacing  # y-axis = negative row direction (flip vertical)
+        # pixel_array axis0 follows IOP[3:6] at row spacing;
+        # axis1 follows IOP[0:3] at column spacing. No display flip belongs here.
+        affine_lps[:3, 0] = col_cosine * row_spacing  # pixel_array axis0 = DICOM rows
+        affine_lps[:3, 1] = row_cosine * col_spacing  # pixel_array axis1 = DICOM columns
         affine_lps[:3, 2] = slice_cosines * float(slice_spacing)
         affine_lps[:3, 3] = np.array([float(i) for i in ipp], dtype=np.float64)
 
@@ -468,15 +467,13 @@ def _canonical_slice_order(positions: np.ndarray) -> Tuple[np.ndarray, np.ndarra
     positions = np.asarray(positions, dtype=np.float64)
     if len(positions) < 2:
         return np.arange(len(positions)), np.zeros(3, dtype=np.float64)
-    # 找距离最远的一对点确定层分布主轴
-    diff = positions[:, None, :] - positions[None, :, :]
-    dist = np.linalg.norm(diff, axis=-1)
-    i, j = np.unravel_index(int(np.argmax(dist)), dist.shape)
-    spread = positions[j] - positions[i]
+    # O(N) memory. The former all-pairs NxNx3 allocation could exhaust memory
+    # on long CTA, and its sign depended on input enumeration order.
+    spread = np.ptp(positions, axis=0)
     dom = int(np.argmax(np.abs(spread)))
     step_dir = np.zeros(3, dtype=np.float64)
-    step_dir[dom] = 1.0 if spread[dom] >= 0 else -1.0
-    order = np.argsort(positions @ step_dir)
+    step_dir[dom] = 1.0
+    order = np.argsort(positions @ step_dir, kind='stable')
     sorted_pos = positions[order]
     step_vec = np.diff(sorted_pos, axis=0).mean(axis=0)
     return order, step_vec
@@ -510,7 +507,31 @@ def build_dicom_truth_affine(datasets: List[FileDataset]) -> Optional[Tuple[np.n
             positions.append([float(v) for v in ipp])
         positions = np.asarray(positions, dtype=np.float64)
 
+        if not np.isfinite(positions).all():return None
+        reference_iop=np.asarray(iop,dtype=float)
+        reference_spacing=np.asarray(pixel_spacing,dtype=float)
+        if reference_iop.shape!=(6,) or reference_spacing.shape!=(2,) or (reference_spacing<=0).any():return None
+        if not (np.isclose(np.linalg.norm(reference_iop[:3]),1,atol=.01) and
+                np.isclose(np.linalg.norm(reference_iop[3:]),1,atol=.01) and
+                abs(float(reference_iop[:3]@reference_iop[3:]))<.01):return None
+        for ds in datasets:
+            if not np.allclose(getattr(ds,'ImageOrientationPatient',[]),reference_iop,atol=1e-4):return None
+            if not np.allclose(getattr(ds,'PixelSpacing',[]),reference_spacing,atol=1e-4):return None
+            if (int(getattr(ds, 'Rows', 0)), int(getattr(ds, 'Columns', 0))) != (
+                    int(getattr(first, 'Rows', 0)), int(getattr(first, 'Columns', 0))):return None
+            if int(getattr(ds, 'NumberOfFrames', 1)) != 1:return None
+        # Matching geometry does not make different source series one volume.
+        # Compare identity strings without silently normalizing/replacing UIDs.
+        for tag in ('StudyInstanceUID', 'SeriesInstanceUID', 'FrameOfReferenceUID'):
+            if len({str(getattr(ds, tag, '')) for ds in datasets}) != 1:return None
+        sops = [str(getattr(ds, 'SOPInstanceUID', '')) for ds in datasets]
+        if any(sops) and (not all(sops) or len(set(sops)) != len(sops)):return None
+
         order, step_vec = _canonical_slice_order(positions)
+        if len(datasets)>1:
+            increments=np.diff(positions[order],axis=0)
+            if np.linalg.norm(step_vec)<1e-6 or not np.allclose(increments,step_vec,atol=.05,rtol=.01):
+                return None  # duplicates/missing slices/nonuniform grids are not one affine
         sorted_datasets = [datasets[i] for i in order]
         if len(datasets) == 1:
             # 单层：步进方向用叉积法向 * 层厚
@@ -684,14 +705,29 @@ def _flip_image_axis(data: np.ndarray, affine: np.ndarray, axis: int) -> Tuple[n
 def _rebuild_nifti(img: nib.Nifti1Image, data: np.ndarray, affine: np.ndarray) -> nib.Nifti1Image:
     """以新数据/仿射重建 NIfTI 图像，保留原 header 并同步 qform/sform。"""
     header = img.header.copy() if img.header is not None else None
-    new_img = nib.Nifti1Image(np.asanyarray(data), affine, header)
+    values=np.asanyarray(data)
+    target_dtype=img.get_data_dtype()
+    # ArrayProxy has already applied slope/intercept. Letting nibabel write
+    # float HU through the old integer header auto-quantizes them to a new
+    # slope. Keep exact integer HU when representable; otherwise keep the
+    # actual float dtype instead of introducing a second quantization.
+    if np.issubdtype(target_dtype,np.integer) and np.issubdtype(values.dtype,np.floating):
+        limits=np.iinfo(target_dtype);exact_integer=True
+        for chunk in np.nditer(values,flags=['external_loop','buffered'],buffersize=1024*1024):
+            if not (np.isfinite(chunk).all() and (chunk>=limits.min).all() and (chunk<=limits.max).all() and np.equal(chunk,np.rint(chunk)).all()):
+                exact_integer=False;break
+        if exact_integer:values=values.astype(target_dtype)
+    new_img = nib.Nifti1Image(values, affine, header)
+    new_img.set_data_dtype(values.dtype)
+    qcode = int(img.header['qform_code']) if img.header is not None else 1
+    scode = int(img.header['sform_code']) if img.header is not None else 1
+    new_img.set_sform(affine, code=scode if scode > 0 else 1)
     try:
-        qcode = int(img.header['qform_code']) if img.header is not None else 1
-        scode = int(img.header['sform_code']) if img.header is not None else 1
-        new_img.set_qform(affine, code=qcode if qcode > 0 else 1)
-        new_img.set_sform(affine, code=scode if scode > 0 else 1)
-    except Exception:
-        pass
+        new_img.set_qform(affine, code=qcode if qcode > 0 else 1, strip_shears=False)
+    except nib.spatialimages.HeaderDataError:
+        # qform cannot represent shear. Retain the source-proven sform rather
+        # than advertise a second, approximated physical geometry as valid.
+        new_img.set_qform(None, code=0)
     return new_img
 
 
@@ -739,25 +775,16 @@ def verify_and_fix_orientation(
         truth = build_dicom_truth_affine(datasets)
         if truth is None:
             result['action'] = ORIENTATION_CHECK_SKIPPED
-            result['message'] = 'missing DICOM geometry tags (IOP/IPP/PixelSpacing), check skipped'
+            result['message'] = 'DICOM geometry missing, inconsistent, or nonuniform; verification skipped'
             return nifti_img, result
         affine_d, sorted_datasets = truth
 
         nifti_affine = np.array(nifti_img.affine, dtype=np.float64)
         T = np.linalg.inv(nifti_affine) @ affine_d
         perm = _analyze_signed_permutation(T)
-        if perm is None:
-            # T 不是置换矩阵：产出被重采样/插值过，不自动改，记 QC 告警
-            result['action'] = ORIENTATION_CHECK_NOT_VERIFIABLE
-            result['message'] = 'relative transform is not a signed permutation (resampled?)'
-            logger.warning(
-                "[ORIENTATION] %s: T is not a signed permutation, skip auto-fix (QC warning)",
-                series_name
-            )
-            return nifti_img, result
-        perm_matrix, _ = perm
-        det_t = float(np.linalg.det(perm_matrix))
-        result['det_t'] = det_t
+        if perm is not None:
+            perm_matrix, _ = perm
+            result['det_t'] = float(np.linalg.det(perm_matrix))
 
         # 探针实测内容布局
         probe = _probe_content_layout(data, sorted_datasets, slice_loader=slice_loader)
@@ -778,10 +805,18 @@ def verify_and_fix_orientation(
                     "content inverted back to match DICOM pixels",
                     series_name, corr
                 )
+            # Check physical corner positions too: a tiny spacing error on a
+            # long CT can accumulate beyond the voxel-layout tolerance.
+            fixed_affine = affine_d @ np.linalg.inv(layout_matrix)
+            import itertools
+            corners = np.array([(*point, 1.) for point in itertools.product(
+                *[(0., float(size-1)) for size in data.shape])])
+            errors = (corners @ (nifti_affine-fixed_affine).T)[:, :3]
+            result['max_source_geometry_error_mm'] = float(np.linalg.norm(errors, axis=1).max())
             # 内容与仿射是否自洽：仿射隐含的布局（T）应等于实测内容布局
-            if not np.allclose(layout_matrix, T, atol=_PERM_TOL, rtol=0):
+            if (not np.allclose(layout_matrix, T, atol=_PERM_TOL, rtol=0) or
+                    result['max_source_geometry_error_mm'] > .05):
                 # 不自洽（转换器 bug，如纯 Python 路径面内镜像）：修正仿射匹配实测布局
-                fixed_affine = affine_d @ np.linalg.inv(layout_matrix)
                 nifti_img = _rebuild_nifti(nifti_img, data, fixed_affine)
                 nifti_affine = fixed_affine
                 result['fixes'].append('affine_mismatch')
@@ -790,8 +825,21 @@ def verify_and_fix_orientation(
                     series_name, corr
                 )
         else:
-            # 探针无法判定（如空白数据）：信任仿射隐含布局，仅按 handedness 处理
-            layout_matrix = T.copy()
+            # Header agreement is insufficient. Preserve raw DICOM on failure;
+            # never relayout content based only on handedness or FFS.
+            result['action']=ORIENTATION_CHECK_NOT_VERIFIABLE
+            result['message']='source pixel layout could not be verified'
+            return nifti_img,result
+
+        # The preferred affine alone cannot clear contradictory encoded forms.
+        # This branch is reached only after independent source pixel probing.
+        qform, qcode = nifti_img.get_qform(coded=True)
+        sform, scode = nifti_img.get_sform(coded=True)
+        forms_mismatch = (not scode or not np.allclose(sform, nifti_affine, atol=1e-3, rtol=0)
+                          or (qcode and not np.allclose(qform, nifti_affine, atol=1e-3, rtol=0)))
+        if forms_mismatch:
+            nifti_img = _rebuild_nifti(nifti_img, data, nifti_affine)
+            result['fixes'].append('geometry_forms_mismatch')
 
         # 左手性网格 = 镜像处方签名：真值网格（规范排序）在 RAS 下 det>0。
         # 该签名只取决于 DICOM 几何，与转换器布局惯例无关（实测：
@@ -855,10 +903,14 @@ def verify_and_fix_orientation_file(
                 readable_files.append(filepath)
             except Exception:
                 continue
-        if not datasets:
+        if len(datasets) != len(dicom_files) or not datasets:
             return {'action': ORIENTATION_CHECK_SKIPPED, 'fixes': [],
                     'det_t': None, 'det_grid': None, 'flip_axis': None,
-                    'probe_corr': None, 'message': 'no readable DICOM files'}
+                    'probe_corr': None, 'message': 'source DICOM header set incomplete'}
+        if any(not str(getattr(ds, tag, '')) for ds in datasets
+               for tag in ('StudyInstanceUID', 'SeriesInstanceUID', 'SOPInstanceUID')):
+            return {'action': ORIENTATION_CHECK_NOT_VERIFIABLE, 'fixes': [],
+                    'probe_corr': None, 'message': 'source DICOM identity missing'}
         # 与 build_dicom_truth_affine 相同的排序，供探针层定位源文件
         file_of_dataset = {id(ds): f for ds, f in zip(datasets, readable_files)}
 
@@ -1437,6 +1489,13 @@ def convert_with_dcm2niix(
 
         if result and result.returncode == 0:
             nifti_files = [f for f in os.listdir(series_dir) if f.endswith(('.nii.gz', '.nii'))]
+            if modality=='CT':
+                # Do not select an unrelated/stale NIfTI via os.listdir()[0].
+                expected={output_name+'.nii.gz',output_name+'.nii'}
+                nifti_files=[f for f in nifti_files if f in expected]
+                extras=[f for f in os.listdir(series_dir) if f.startswith(output_name) and f.endswith(('.nii.gz','.nii')) and f not in expected]
+                if len(nifti_files)!=1 or extras:
+                    return {'success':False,'error':'Ambiguous CT conversion outputs; original DICOM retained'}
             if nifti_files:
                 logger.info("   ✅ dcm2niix conversion succeeded: %s", nifti_files[0])
 
@@ -1451,6 +1510,10 @@ def convert_with_dcm2niix(
 
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
                 client._record_orientation_check(series_dir, orientation_check)
+
+                if modality=='CT' and len(dicom_files)>1 and orientation_check.get('action') not in (ORIENTATION_CHECK_OK,ORIENTATION_CHECK_MIRROR_CORRECTED):
+                    return {'success':False,'error':'CT geometry not verified; original DICOM retained',
+                            'orientation_check':orientation_check}
 
                 for file in os.listdir(series_dir):
                     if file.startswith('.'):
@@ -1792,8 +1855,9 @@ def convert_with_python_libs(
                     # 因为这会导致 Y 轴翻转，与 dcm2niix 的问题相同
                     iop = getattr(dcm, 'ImageOrientationPatient', None)
                     if iop is not None:
-                        # 有 IOP 时，可以使用 canonical 转换
-                        nifti_img = nib.as_closest_canonical(nifti_img)
+                        # 有 IOP 时可以使用 canonical 转换；_safe 版在 affine
+                        # 含 NaN/inf 时退化为可分解 affine，不会 SVD 崩溃
+                        nifti_img = _safe_as_closest_canonical(nifti_img)
                     # 否则：保持原方向，_build_2d_xray_affine 已经构建了正确的 RAS 矩阵
 
                     output_filename = f"{client._sanitize_folder_name(series_name)}_{idx+1:04d}.nii.gz"
@@ -1879,10 +1943,10 @@ def convert_with_python_libs(
 
             nifti_img = nib.Nifti1Image(pixel_data.astype(np.float32), affine)
             
-            # 对于缺少 IOP 的 2D 图像，不使用 as_closest_canonical 以避免方向问题
+            # 对于缺少 IOP 的 2D 图像，不使用 canonical 转换以避免方向问题
             iop = getattr(dcm, 'ImageOrientationPatient', None)
             if iop is not None:
-                nifti_img = nib.as_closest_canonical(nifti_img)
+                nifti_img = _safe_as_closest_canonical(nifti_img)
             # 否则：保持原方向，build_affine_from_dicom 已经构建了正确的矩阵
 
             # 方向一致性校验与镜像校正（内存中完成后再写盘）
@@ -1940,21 +2004,42 @@ def convert_with_python_libs(
         if not slice_info:
             return {'success': False, 'error': 'Could not sort slices'}
 
-        slice_info.sort(key=lambda x: x[0])
+        if all(item[3] is not None for item in slice_info):
+            order,_=_canonical_slice_order(np.asarray([item[3] for item in slice_info]))
+            slice_info=[slice_info[int(i)] for i in order]
+        else:
+            slice_info.sort(key=lambda x: x[0])
 
         slices: List[np.ndarray] = []
-        positions: List[np.ndarray] = []
-        for _, _, dcm, ipp in slice_info:
+        valid_info: List[Tuple[float, str, FileDataset, Optional[List[float]]]] = []
+        for entry in slice_info:
+            _, _, dcm, ipp = entry
             if hasattr(dcm, 'pixel_array'):
                 pixel_data = dcm.pixel_array
                 pixel_data = apply_rescale(pixel_data, dcm)
                 pixel_data = apply_photometric(pixel_data, dcm)
                 slices.append(pixel_data)
-                if ipp is not None:
-                    positions.append(np.array(ipp, dtype=np.float64))
+                valid_info.append(entry)
 
         if not slices:
             return {'success': False, 'error': 'No pixel data found'}
+
+        # 同一序列混入不同矩阵尺寸的图像（打印排版/AI 报告等拼装序列）时，
+        # np.stack 会整体崩溃。保留多数派 shape 的切片，丢弃少数派并记录数量。
+        shape_counts = Counter(s.shape for s in slices)
+        if len(shape_counts) > 1:
+            modal_shape = shape_counts.most_common(1)[0][0]
+            keep_idx = [i for i, s in enumerate(slices) if s.shape == modal_shape]
+            logger.warning(
+                f"   ⚠️  {series_name}: mixed pixel shapes {dict(shape_counts)}, "
+                f"keeping {len(keep_idx)}/{len(slices)} slices with modal shape {modal_shape}"
+            )
+            slices = [slices[i] for i in keep_idx]
+            valid_info = [valid_info[i] for i in keep_idx]
+
+        positions: List[np.ndarray] = [
+            np.array(entry[3], dtype=np.float64) for entry in valid_info if entry[3] is not None
+        ]
 
         # DICOM pixel_array is (Rows, Columns)
         # Stack directly: dim 0 = Rows (vertical), dim 1 = Columns (horizontal), dim 2 = Slices
@@ -1962,8 +2047,8 @@ def convert_with_python_libs(
 
         if len(positions) > 1:
             slice_spacing = float(np.linalg.norm(positions[1] - positions[0]))
-        elif len(slice_info) > 1:
-            slice_spacing = abs(slice_info[1][0] - slice_info[0][0])
+        elif len(valid_info) > 1:
+            slice_spacing = abs(valid_info[1][0] - valid_info[0][0])
         else:
             slice_spacing = float(getattr(first_dcm, 'SliceThickness', 1.0))
 
@@ -1975,19 +2060,32 @@ def convert_with_python_libs(
         else:
             slice_cosines = None
 
+        # Stack and affine must share the same first slice and signed IPP step.
+        # The old first_dcm came from unsorted input and cross(IOP)*abs(spacing)
+        # could describe the opposite direction or a different origin.
+        first_dcm=valid_info[0][2]
+        if len(positions)>1:
+            actual_step=positions[1]-positions[0]
+            slice_cosines=actual_step/np.linalg.norm(actual_step)
         affine = build_affine_from_dicom(first_dcm, slice_spacing=slice_spacing, slice_cosines=slice_cosines)
 
         nifti_img = nib.Nifti1Image(volume.astype(np.float32), affine)
 
-        # 对于缺少 IOP 的序列，不使用 as_closest_canonical 以避免方向问题
+        # 对于缺少 IOP 的序列，不使用 canonical 转换以避免方向问题。
+        # affine 含 NaN/inf（几何头损坏）时 nibabel io_orientation 的 SVD 会直接
+        # 崩溃（"SVD did not converge"）；_safe 版本退化为可分解 affine，不抛异常
         if iop is not None:
-            nifti_img = nib.as_closest_canonical(nifti_img)
+            nifti_img = _safe_as_closest_canonical(nifti_img)
         # 否则：保持原方向，build_affine_from_dicom 已经处理了回退方案
 
         # 方向一致性校验与镜像校正（内存中完成后再写盘）
         nifti_img, orientation_check = verify_and_fix_orientation(
-            nifti_img, [dcm for _, _, dcm, _ in slice_info], series_name
+            nifti_img, [dcm for _, _, dcm, _ in valid_info], series_name
         )
+
+        if modality=='CT' and len(dicom_files)>1 and orientation_check.get('action') not in (ORIENTATION_CHECK_OK,ORIENTATION_CHECK_MIRROR_CORRECTED):
+            return {'success':False,'error':'CT geometry not verified; original DICOM retained',
+                    'orientation_check':orientation_check}
 
         output_filename = f"{client._sanitize_folder_name(series_name)}.nii.gz"
 

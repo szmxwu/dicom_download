@@ -211,3 +211,8 @@ temp
 .mimocode
 docs/
 test
+!test/
+test/*
+!test/test_conversion_failures.py
+!test/test_cta_geometry_regression.py
+!test/test_orientation_fix.py

@@ -47,7 +47,11 @@ src/
 
 ## 运维要点速查
 
+- 2026-10-02方向事件补丁：已复现超过1,024层的转换器提前返回；本地`convert.py`、`unified.py`、`metadata.py`与v3缓存几何版本及完整真实17导出重放已验证，本地46通过/2环境专项跳过、193独立运行环境48通过/0跳过，**136/193生产尚未部署**。见KNOWN_ISSUES K13；不要把本地修复误报为生产已生效。
+
 - 生产 193：`yusi@192.0.0.193:~/work2/dicom_download`，conda `/home/yusi/anaconda3`，rsync 同步 + 精确 kill 重启（D20）
 - 生产 136：Windows 单机，只能用户手动更新，curl 需 `--noproxy '*'`
 - 排障：193 上 `~/py-spy`（sudo）dump 全线程栈定位冻结点
 - 日志：`logs/app.log`（INFO 级；提交审计含 IP+options）
+
+- 2026-10-02：生产几何v3剩余验收已移交[具体交接清单](CTA_GEOMETRY_V3_PRODUCTION_ACCEPTANCE_HANDOFF_20261002.md)，下载空闲时实施；不阻塞CT_YOLO存量数据清理与主线。

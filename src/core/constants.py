@@ -5,6 +5,8 @@
 集中管理跨模块共享的常量，避免重复定义。
 """
 
+CONVERSION_GEOMETRY_VERSION = '20261002-source-pixel-geometry-v3'
+
 # 衍生序列关键词列表（默认值）
 # 用于在 PACS 查询阶段和整理阶段过滤 MPR/MIP/3D 重建等衍生序列。
 #

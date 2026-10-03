@@ -17,7 +17,7 @@ import logging
 from typing import Optional, Dict
 
 from src.utils.offload import run_cpu_bound
-from src.core.constants import get_filter_rules_fingerprint
+from src.core.constants import get_filter_rules_fingerprint, CONVERSION_GEOMETRY_VERSION
 
 # 使用共享 logger（项目约定），保证缓存步骤的耗时在 app.log 中可见
 logger = logging.getLogger('DICOMApp')
@@ -128,6 +128,7 @@ def _compute_param_hash(accession_number: str, options: Dict) -> str:
         "min_series_files": options.get("min_series_files"),
         "exclude_derived": options.get("exclude_derived", True),
         "output_format": options.get("output_format", "nifti"),
+        "conversion_geometry": CONVERSION_GEOMETRY_VERSION if options.get("output_format", "nifti") == "nifti" else None,
         "derived_keywords": sorted(str(k).upper() for k in task_keywords) if task_keywords else None,
         "filter_rules": get_filter_rules_fingerprint(),
     }

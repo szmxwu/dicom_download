@@ -70,6 +70,7 @@
 | 2026-09-05 | 卡死任务取消后并发通道永久 3→2 | 2b6a2e4（D17） |
 | 2026-09-13 | C-STORE SCP 启动失败（CALLING_PORT 被占）异常在 try 之外 → `_cmove_lock` 永不释放 → 全部任务永久卡在 acquire；线程静默死亡无任何错误日志 | SCP 启动移入 try（finally 兜底 shutdown+释放锁）+ `_download_worker` 补 except 日志（未 commit） |
 | 2026-09-17 | 超大老序列（单层 1711 文件、6.4GB）metadata 提取超 600s 超时 → `success` 依赖 excel_file → 下载转换全部成功却报 "Unknown error during process"（193 上一批 2019 年 CT 全部因此失败） | metadata 变为可选产物：超时/失败仅记 warning，success=True；超时改 `METADATA_TIMEOUT_SEC`（默认 1800）（未 commit） |
+| 2026-10-02 | 拼装序列（printingSeries/shukunlist，混合矩阵尺寸）dcm2niix+python-libs 双失败 → `Series conversion failed` 株连整个任务不出 zip（136 一天 20 次）；几何头损坏的 CT 触发 nibabel SVD 崩溃；K13 严格门禁拒绝的 CT 同样株连 | D24：任务级部分成功 + 混合 shape 多数派容错 + `_safe_as_closest_canonical` 全面替换裸调用（未 commit） |
 | 2026-10-01 | 队列满拒绝路径调用 `update_status('failed', error=...)` 但该方法无 error 形参 → TypeError → 兜底 except 里再调一次又炸 → 客户端收到 500 而非 503 → 礼貌退避失效，客户端狂轰滥炸（136 实证 3033 次 ERROR、队列持续爆满）；附带监控接口裸迭代 `processing_tasks` 偶发 dictionary changed size | `update_status` 增加 `error=None` 形参；所有 `processing_tasks` 迭代改为 `list(...)` 快照（未 commit） |
 | 2026-09-20 | tpool 真实线程在 `logging` 里触发 eventlet green `current_thread()` → `patch_function` → `imp.acquire_lock()`，导入锁被主线程挂起 greenlet 持有 → worker 永久阻塞 → 任务持 `_cmove_lock` 不放 → 全站假死 24h+（HTTP 200 但零处理，py-spy 实证） | `fix_logging_locks_for_eventlet()` 增加 `logging.threading = original('threading')`（未 commit） |
 | 2026-09-18 | GE 乳腺 DCE 减影序列（ImageType `DERIVED\SECONDARY\OTHER\SUBTRACT`）被衍生过滤误杀：pydicom `MultiValue` 非 `list/tuple` 子类 → 白名单对 ImageType 其余值从未生效 | 白名单加 `SUB`；`is_derived_series` 与 `organize._is_derived_series` 入口统一 MultiValue→list（未 commit） |
@@ -82,3 +83,20 @@
 - **Y 轴翻转 nii 批量恢复（2026-08-30 完成）**：33364 个受影响文件全部恢复并逐像素 GT 验证（corr=1.0000），header 标记 `REVERTED_2026-08-28`。脚本：`test/verify_restore.py`、`test/backfill_marker.py`、`test/gt_check.py`；清单：`test/output/xray_affected.json`。
 - **预览图全量重生（2026-08-31 完成）**：35014 个序列目录，34926 ok / 88 SKIP / 0 ERR，用 D14 最终代码覆盖全部旧预览。日志 `logs/regen_all.log`。
 - **PR 垃圾目录清理（2026-09-01 完成）**：75 个 `*_KEY_IMAGES_PR` 目录删除，75 个 xlsx 清除 152 行 PR 记录（备份 `.bak_pr_clean`）。脚本：`test/clean_pr_junk.py`。
+### K13. 长CT超过1,024层跳过几何计算及历史校验放行缺口（2026-10-02，本地修复、生产待部署）
+
+CT_YOLO第17项用户提供2,432层PACS客户端导出，与历史C-MOVE的Series/SOP UID及HU不同，保留来源差异。导出IPP步进−0.45mm、SliceThickness=0.9mm、SpacingBetweenSlices=0.45mm。直接跑本项目捆绑dcm2niix独立生成+0.45mm错误头；全部637,534,208源HU体素与本次转换精确相等，原2,432文件SHA未变。此前历史NIfTI派生修正版与历史旧图像素全等，不能称作等于新导出。
+
+已定位执行文件触发边界：1,024层正确，1,025层开始错误。上游2025-05-19 f6b6cda在sliceTimingCore加入dim3>kMaxEPI3D的early-return，跳过headerDcm2Nii2；2026-05-13 1cd1620修复。仅加/删该条件的编译实验能切换6项合成序列的故障；带guard构建与捆绑执行文件的Z列/原点/层序/q-s冲突全部一致。版本横幅v1.0.20250505不能唯一证明构建commit，绑定执行文件SHA与行为。C++float层距仍能积累约0.178mm误差，最终出口按全部IPP重建及角点位置校验。
+
+本地v3修复：源像素无法匹配则CT拒绝成功、保留DICOM；全部源头可读、Study/Series/Frame UID一致、SOP唯一、矩阵维度一致及非多帧才可建立当前真值几何；缺身份或头子集不得默许。preferred affine正确但有效q/s冲突也修正；shear无法由qform表达时禁用qform、保留精确sform。物理角点误差>0.05mm即修正，真实HU精确保留。缓存几何策略20261002-source-pixel-geometry-v3，阻止旧NIfTI缓存静默复用。此前O(N)排序、Python行列/有符号步进、wrapper output_format传参、可选metadata成功语义及所有校验状态留痕修复保留。
+
+最终补丁对完整真实17导出转换重放通过，全部637,534,208体素保持原值与次序，q/s一致且匹配源几何。历史Python防线究竟为何没有修正那次旧下载，具体运行时分支仍不能唯一恢复；不把故障注入当历史诊断。没有技师或FFS错误证据。
+
+本地python3 -m pytest test/ -q：46通过、2eventlet专项因未安装环境跳过。生产136/193未部署、未重启，Windows实证待复核；193于2026-10-02核对3运行/17排队/3并发上限，不能为本补丁中断其他下载。独立193环境验证目录使用生产解释器及同SHA转换器48通过，包含2项eventlet专项、无跳过；不属于生产部署，原进程及生产源码未动。
+
+全CTA1,831序列重新审计风险：1,138序列超过1,024层，不是1,138均已污染；16几何候选人工12颠倒/4头脚正常，全部继续隔离。旧53/65拉伸分别有约2倍/1.64倍q/s间距冲突。新CTA门禁1123待源复核/16隔离/692头相容，整库源像素验证未闭环。详../CT_YOLO/docs/CTA017_DIRECTION_INCIDENT_20261002.md。
+
+存量修复检查点：本项目test/output/cta_slice_count_v1、cta_slice_count_guard_injected_v1、cta_slice_count_no_earlyreturn_v1为无患者信息的可恢复根因实验；真实源审计和独立修正版在CT_YOLO/derived/anatomy_sensor_v3/20261001_phase0/direction_incident_v2。未覆盖原下载目录或批量修改1,831源图。
+
+- 2026-10-02：生产几何v3剩余验收已移交[具体交接清单](CTA_GEOMETRY_V3_PRODUCTION_ACCEPTANCE_HANDOFF_20261002.md)，下载空闲时实施；不阻塞CT_YOLO存量数据清理与主线。

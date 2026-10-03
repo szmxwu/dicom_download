@@ -1334,7 +1334,7 @@ class DICOMDownloadClient:
         但结果此前只存在于转换返回值中，QC/Excel 看不到。这里写入 cache 的
         orientation_check 字段，由 metadata 提取阶段合并进记录。
         """
-        if not orientation_check or not orientation_check.get('fixes'):
+        if not orientation_check:
             return
         cache_path = os.path.join(series_dir, "dicom_metadata_cache.json")
         try:
@@ -1342,10 +1342,9 @@ class DICOMDownloadClient:
             if os.path.exists(cache_path):
                 with open(cache_path, 'r', encoding='utf-8') as f:
                     cache = json.load(f)
-            cache['orientation_check'] = {
-                'action': orientation_check.get('action'),
-                'fixes': orientation_check.get('fixes'),
-            }
+            from src.core.constants import CONVERSION_GEOMETRY_VERSION
+            cache['orientation_check'] = dict(orientation_check)
+            cache['orientation_check']['policy_version']=CONVERSION_GEOMETRY_VERSION
             with open(cache_path, 'w', encoding='utf-8') as f:
                 json.dump(cache, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -1567,7 +1566,8 @@ class DICOMDownloadClient:
 
     def _process_single_series(self, series_path, series_folder, output_format='nifti', min_series_files=None):
         """处理单个Series目录：统计、转换（原地处理，不再移动到 organized_dir）。"""
-        return process_single_series_impl(self, series_path, series_folder, output_format, min_series_files=min_series_files)
+        return process_single_series_impl(self, series_path, series_folder, series_path,
+                                          output_format=output_format, min_series_files=min_series_files)
     
     def convert_dicom_to_nifti(self, series_dir, series_name, dicom_files=None, sample_dcm=None, modality=None):
         """将DICOM序列转换为NIfTI格式"""
@@ -2201,25 +2201,10 @@ class DICOMDownloadClient:
                 except Exception as e:
                     err = e
 
-                # 转换无结果时的兜底：若已存在 NIfTI 输出则直接采用
-                if not info:
-                    try:
-                        existing_nifti = [
-                            f for f in os.listdir(series_dir)
-                            if f.endswith(('.nii.gz', '.nii')) and not f.startswith('.')
-                        ]
-                    except Exception:
-                        existing_nifti = []
-                    if existing_nifti:
-                        logger.info(
-                            f"   ✅ Series {series_folder} has existing NIfTI output, using it: {existing_nifti[0]}"
-                        )
-                        info = {
-                            'path': series_dir,
-                            'file_count': 0,  # 未知，但非关键
-                            'files': []
-                        }
-                        err = None
+                # A partial NIfTI can exist after failed verification. Its mere
+                # existence must never clear an error or approve the series.
+                if err:
+                    info={'path':series_dir,'conversion_error':str(err)}
 
                 if info:
                     with series_lock:
@@ -2321,9 +2306,21 @@ class DICOMDownloadClient:
                 for name, info in series_info.items() if info.get('conversion_error')
             }
             if conversion_errors:
-                results['error'] = f"Series conversion failed: {conversion_errors}"
-                logger.error(results['error'])
-                return results
+                # 单序列失败不再株连整个任务（2026-10-02 决策，修订 D23 的序列级传播）：
+                # 失败序列保留原始 DICOM 随 zip 交付，失败清单记入 results['conversion_errors']
+                # 供客户端审阅。全部序列都失败时仍判任务失败（无可交付数据）。
+                # D23 的序列内逐张转换完整性约束（成功才删原始文件）不受影响。
+                succeeded = [n for n, i in series_info.items() if not i.get('conversion_error')]
+                if succeeded:
+                    results['conversion_errors'] = conversion_errors
+                    logger.warning(
+                        f"⚠️  {len(conversion_errors)} series failed conversion (kept as raw DICOM): "
+                        f"{conversion_errors}; continuing with {len(succeeded)} successfully converted series"
+                    )
+                else:
+                    results['error'] = f"Series conversion failed (all series): {conversion_errors}"
+                    logger.error(results['error'])
+                    return results
 
             if auto_metadata:
                 # 步骤3: 提取元数据 (独立线程)
@@ -2372,6 +2369,11 @@ class DICOMDownloadClient:
                 results['success'] = True
                 if not excel_file:
                     results['metadata_warning'] = 'metadata extraction failed or timed out'
+
+        # Reaching here means download and any requested conversion succeeded.
+        # Optional metadata, or disabled organizing for raw-DICOM retrieval,
+        # must not leave a fully downloaded study in the default failed state.
+        results['success']=True
 
         # 打印最终结果
         logger.info(f"\n{'='*80}")

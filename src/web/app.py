@@ -2165,6 +2165,15 @@ def process_single_task(task):
                 task.update_status('running', 90, 'Generating results')
                 task.add_log('Process successful, generating results...')
 
+                # 部分序列转换失败时显性提示（原始 DICOM 已保留在 zip 中）
+                if results.get('conversion_errors'):
+                    failed_series = results['conversion_errors']
+                    task.add_log(
+                        f"⚠️ Partial success: {len(failed_series)} series failed conversion "
+                        f"(kept as raw DICOM in zip): {list(failed_series.keys())}",
+                        'warning'
+                    )
+
                 # --- MR 序列重命名 ---
                 if options.get('rename_mr_series') and results.get('organized_dir') and results.get('excel_file'):
                     task.add_log('Renaming MR series folders...')

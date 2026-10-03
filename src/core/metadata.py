@@ -213,6 +213,14 @@ def _merge_orientation_fixes(record: Dict, cache: Optional[Dict]) -> None:
     if not cache:
         return
     oc = cache.get('orientation_check') or {}
+    if oc:
+        record['OrientationStatus']=oc.get('action','unknown')
+        record['OrientationMessage']=oc.get('message','')
+        record['OrientationProbeCorrelation']=oc.get('probe_corr')
+        record['OrientationPolicyVersion']=oc.get('policy_version','legacy_unversioned')
+        record['OrientationPixelGeometryVerified']=bool(
+            oc.get('action') in ('ok','orientation_mirror_corrected') and
+            oc.get('probe_corr') is not None and abs(oc['probe_corr'])>=.98)
     fixes = oc.get('fixes') or []
     if not fixes:
         return
