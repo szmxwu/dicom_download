@@ -649,6 +649,26 @@ class DICOMDownloadClient:
 
                     series_metadata = filtered_metadata
 
+                # 按 SeriesInstanceUID 去重：同一 accession 下部分 PACS 会返回重复
+                # 序列条目（多 study 合并或 PACS 自身重复）。重复条目会让同一序列被
+                # C-MOVE 两次、on_series_downloaded 回调两次——第二次 organize 命中
+                # 第一次写入的 metadata 缓存，曾触发 UnboundLocalError 并覆盖掉
+                # 第一次的成功结果（2026-10-09 M26052802565：Series 401/402 各重复一次）。
+                seen_uids = set()
+                deduped_metadata = []
+                for series_info in series_metadata:
+                    uid = str(series_info.get('SeriesInstanceUID') or '').strip()
+                    if uid and uid in seen_uids:
+                        logger.warning(
+                            f"   ⚠️  Duplicate series entry dropped: Series {series_info.get('SeriesNumber')} "
+                            f"({series_info.get('SeriesDescription')}), UID ...{uid[-24:]}"
+                        )
+                        continue
+                    if uid:
+                        seen_uids.add(uid)
+                    deduped_metadata.append(series_info)
+                series_metadata = deduped_metadata
+
                 logger.info(f"📊 Find {len(series_metadata)} Series (after filtering)")
                 if modality_filter:
                     from src.core.constants import expand_modality_filter
@@ -721,8 +741,33 @@ class DICOMDownloadClient:
             'disk_full': False,  # 磁盘剩余空间不足标志，触发后快速失败
             'recv_filter_decisions': {},  # SeriesInstanceUID -> bool，接收端衍生判定缓存
             'recv_rejected_series': set(),  # 接收端判定为衍生、直接丢弃不落盘的序列
-            'recv_dropped_files': 0  # 接收端丢弃的文件数
+            'recv_dropped_files': 0,  # 接收端丢弃的文件数
+            'used_series_dirs': {}  # 序列目录名 -> SeriesInstanceUID，检测目录名冲突
         }
+
+        def _resolve_series_dir(series_num, series_desc, series_uid):
+            """计算序列目录，消解不同 UID 映射到同一目录名的情况。
+
+            同一 accession 下多个 study 可能复用相同的 SeriesNumber+SeriesDescription
+            （2026-10-09 M26052802565：两个 study 各有 Series 401/402），若不加区分，
+            两个序列的文件会混入同一目录，转换出混合体积。冲突时追加 UID 后缀。
+            同一 UID 重复解析（主流程/重试）必须返回同一目录。
+            """
+            base_name = f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}"
+            uid_key = str(series_uid).strip() if series_uid else ''
+            existing_uid = storage_state['used_series_dirs'].get(base_name)
+            if existing_uid is None or existing_uid == uid_key:
+                storage_state['used_series_dirs'][base_name] = uid_key
+                return os.path.join(output_path, base_name)
+            suffix = uid_key[-8:] if uid_key else 'nouid'
+            new_name = f"{base_name}_{suffix}"
+            logger.warning(
+                f"⚠️  Series folder name collision: '{base_name}' already used by UID "
+                f"...{existing_uid[-16:] if existing_uid else '?'}; "
+                f"using '{new_name}' for UID ...{uid_key[-16:] if uid_key else '?'}"
+            )
+            storage_state['used_series_dirs'][new_name] = uid_key
+            return os.path.join(output_path, new_name)
 
         def handle_store(event):
             """P3: 处理C-STORE请求，包含数据完整性校验"""
@@ -933,7 +978,7 @@ class DICOMDownloadClient:
                     series_num = series.get('SeriesNumber', f'Series{i+1}')
                     series_desc = series.get('SeriesDescription', 'Unknown')
                     series_uid = series.get('SeriesInstanceUID')
-                    series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
+                    series_dir = _resolve_series_dir(series_num, series_desc, series_uid)
 
                     # P0: 注册SeriesInstanceUID到目录的映射，用于C-STORE回调查找
                     # 这避免了竞态条件：C-STORE可能在下一个Series的循环开始后才到达
@@ -1074,7 +1119,8 @@ class DICOMDownloadClient:
                             try:
                                 series_num = series_info.get('SeriesNumber', 'Unknown')
                                 series_desc = series_info.get('SeriesDescription', 'Unknown')
-                                series_dir = os.path.join(output_path, f"{series_num:0>3}_{self._sanitize_folder_name(series_desc)}")
+                                # 与主流程共用同一解析逻辑，确保同一 UID 解析到同一目录
+                                series_dir = _resolve_series_dir(series_num, series_desc, series_uid)
 
                                 # P2: 重试前清理旧文件
                                 removed = self._cleanup_series_dir(series_dir)

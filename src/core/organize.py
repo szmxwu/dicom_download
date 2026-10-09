@@ -434,6 +434,11 @@ def process_single_series(
                     return None
 
         # P3: 如果有缓存的模态信息，直接使用，避免重新读取DICOM
+        # 注意：pydicom 必须无条件导入——下方 isinstance(sample_dcm, pydicom.Dataset)
+        # 在缓存命中路径也会执行；原来 import 在 `if not modality:` 分支内，
+        # 缓存提供模态时 import 被跳过，pydicom 成为未赋值局部变量直接崩溃
+        # （2026-10-09 生产实证：M26052802565 全序列失败）
+        import pydicom
         sample_dcm = None
         modality = ''
         if cached_metadata and use_cached_metadata:
@@ -453,7 +458,6 @@ def process_single_series(
         # 如果没有缓存的模态信息，重新读取样本文件
         if not modality:
             try:
-                import pydicom
                 sample_dcm = pydicom.dcmread(dicom_files[0], force=True)
                 modality = str(getattr(sample_dcm, 'Modality', ''))
             except Exception:

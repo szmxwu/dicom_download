@@ -100,3 +100,18 @@ CT_YOLO第17项用户提供2,432层PACS客户端导出，与历史C-MOVE的Serie
 存量修复检查点：本项目test/output/cta_slice_count_v1、cta_slice_count_guard_injected_v1、cta_slice_count_no_earlyreturn_v1为无患者信息的可恢复根因实验；真实源审计和独立修正版在CT_YOLO/derived/anatomy_sensor_v3/20261001_phase0/direction_incident_v2。未覆盖原下载目录或批量修改1,831源图。
 
 - 2026-10-02：生产几何v3剩余验收已移交[具体交接清单](CTA_GEOMETRY_V3_PRODUCTION_ACCEPTANCE_HANDOFF_20261002.md)，下载空闲时实施；不阻塞CT_YOLO存量数据清理与主线。
+
+### K14. PACS 返回重复序列条目 → 二次 organize 崩溃并覆盖首次成功结果（2026-10-09，本地已修复、193 待重启）
+
+- 事故：M26052802565 任务整体失败，报 `Series conversion failed (all series): cannot access local variable 'pydicom'`。
+- 完整链条（193 日志实证）：
+  1. C-FIND 返回的序列列表中 Series 401/402 各出现**两次**（同一 accession 下多 study 复用相同 SeriesNumber+SeriesDescription，或 PACS 重复返回）。`_query_series_metadata` 不去重。
+  2. 下载循环对重复条目各发一次 C-MOVE（日志：Series 402 完成于 16:12:00 和 16:12:58 两次），`on_series_downloaded` 回调也触发两次。
+  3. 第一次 organize：无缓存 → `if not modality:` 分支内 `import pydicom` 正常执行 → 写 metadata 缓存（含 modality）→ 转换成功。
+  4. 第二次 organize：缓存命中使 modality 非空 → 条件分支被跳过 → `import pydicom` 未执行 → 函数末尾 `isinstance(sample_dcm, pydicom.Dataset)` 抛 `UnboundLocalError`（HEAD 快照复现验证通过）。异常被 organize worker 记为 conversion_error，**覆盖了第一次的成功结果**。
+  5. 附带数据风险：若重复条目是**不同 SeriesInstanceUID**（多 study 同 SeriesNumber），两序列文件会混入同一 `{num}_{desc}` 目录，转换出混合体积。
+- 修复（三层）：
+  1. `organize.py`：`import pydicom` 提升为无条件导入（消除崩溃本身）。回归 `test/test_organize_cached_modality.py`。
+  2. `unified.py:_query_series_metadata`：按 SeriesInstanceUID 去重，重复条目记 warning 丢弃（消除重复下载/回调）。
+  3. `unified.py:download_study`：新增 `_resolve_series_dir()`，检测目录名冲突——不同 UID 映射到同一 `{num}_{desc}` 目录名时追加 UID 后缀（防止数据混合）；同一 UID 重复解析（主流程/重试）返回同一目录。
+- 教训：目录命名键（SeriesNumber+Description）不是唯一键，只有 SeriesInstanceUID 是；任何"以缓存存在与否分支"的代码路径都要保证分支两侧的局部变量一致可用。
