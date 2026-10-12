@@ -104,6 +104,30 @@ def compute_file_checksum(filepath: str, algorithm: str = 'md5') -> Optional[str
         return None
 
 
+def _convert_series(client, series_path, series_folder, output_format, **kwargs):
+    """Return a nonempty error on failure; D23 cleanup stays in the converters.
+
+    Both organizers must finish the other series after a conversion failure.
+    Never infer conversion success from residual NIfTI/NPZ files.
+    """
+    if output_format is True:
+        output_format = 'nifti'
+    if output_format not in ('nifti', 'npz'):
+        return None
+    try:
+        converter = (client.convert_dicom_to_nifti if output_format == 'nifti'
+                     else client._convert_to_npz)
+        result = converter(series_path, series_folder, **kwargs)
+        if result and result.get('success'):
+            return None
+        error = (result or {}).get('error') or 'No successful conversion result'
+    except Exception as exc:
+        error = str(exc) or type(exc).__name__
+    error = str(error)
+    logger.error("Series %s conversion failed: %s", series_folder, error)
+    return error
+
+
 def organize_dicom_files(
     client,
     extract_dir: str,
@@ -125,7 +149,8 @@ def organize_dicom_files(
         min_series_files: 可选，最小文件数验证，实际文件数少于此值则跳过
 
     Returns:
-        Tuple[str, Dict]: (组织后的目录路径, 序列信息字典)
+        Tuple[str, Dict]: (组织后的目录路径, 序列信息字典)。每项的 conversion_error
+        为 None 或失败原因；任务级调用者必须汇总，全部转换失败不得报告成功。
 
     Example:
         >>> organized_dir, series_info = organize_dicom_files(
@@ -253,14 +278,11 @@ def organize_dicom_files(
                 'files': dicom_files
             }
 
-            # 执行格式转换
-            conversion_result = None
-            if output_format == 'nifti':
-                conversion_result = client.convert_dicom_to_nifti(series_path, series_folder)
-            elif output_format == 'npz':
-                conversion_result = client._convert_to_npz(series_path, series_folder)
-            if output_format in ('nifti', 'npz') and not (conversion_result or {}).get('success'):
-                raise RuntimeError(f"Series {series_folder} conversion failed: {(conversion_result or {}).get('error', 'No result')}")
+            # D24: retain failed series in series_info so ZIP delivery includes
+            # their raw DICOM; decide task success only after all series finish.
+            series_info[series_folder]['conversion_error'] = _convert_series(
+                client, series_path, series_folder, output_format
+            )
 
     print(f"✅ DICOM organization complete! Processed {processed_files} files")
 
@@ -491,28 +513,10 @@ def process_single_series(
                 print(f"   ✅ All {verified_count} files verified with checksums")
 
         # 执行格式转换（传入已扫描的 dicom_files 和 sample_dcm/modality，避免重复 I/O）
-        conversion_error = None
-        try:
-            conversion_result = None
-            if output_format == 'nifti':
-                conversion_result = client.convert_dicom_to_nifti(
-                    series_path, series_folder,
-                    dicom_files=dicom_files,
-                    sample_dcm=sample_dcm,
-                    modality=modality
-                )
-            elif output_format == 'npz':
-                conversion_result = client._convert_to_npz(
-                    series_path, series_folder,
-                    dicom_files=dicom_files,
-                    sample_dcm=sample_dcm,
-                    modality=modality
-                )
-            if output_format in ('nifti', 'npz') and not (conversion_result or {}).get('success'):
-                conversion_error = (conversion_result or {}).get('error', 'No conversion result')
-        except Exception as e:
-            conversion_error = str(e)
-            logger.error(f"   ❌ Series {series_folder} conversion failed: {e}")
+        conversion_error = _convert_series(
+            client, series_path, series_folder, output_format,
+            dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality
+        )
         # P0: 原地处理 - 不再移动到 organized 子目录
         # 文件已经在正确的位置，直接返回原路径
 

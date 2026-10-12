@@ -2249,6 +2249,7 @@ def process_single_task(task):
             else:
                 error_msg = results.get('error', 'Unknown error during process') if results else \
                     'No files received from PACS (accession may not exist in PACS, or images unavailable)'
+                task.result = results  # Preserve structured conversion errors on failure.
                 task.add_log(f'Process failed: {error_msg}', 'error')
                 task.update_status('failed')
                 task.error = error_msg
@@ -2650,13 +2651,13 @@ def process_upload_task(task):
                 include_subdirs=set(series_info.keys())
             )
 
-            task.result = {
-                'extract_dir': result.get('extract_dir'),
-                'organized_dir': organized_dir,
-                'excel_file': excel_file,
-                'result_zip': zip_path,
-                'series_count': len(series_info)
-            }
+            # Preserve conversion_errors/metadata_warning and per-series results.
+            task.result = dict(result, result_zip=zip_path)
+            if result.get('conversion_errors'):
+                task.add_log(
+                    f"Partial success: series kept as raw DICOM in zip: "
+                    f"{result['conversion_errors']}", 'warning'
+                )
 
             task.update_status('completed', 100, 'Upload process completed')
             task.add_log('Upload process completed')
@@ -2666,6 +2667,7 @@ def process_upload_task(task):
             # 上传文件处理完成后检查并清理结果目录
             check_and_cleanup_results()
         else:
+            task.result = result
             task.add_log('Upload processing failed', 'error')
             task.update_status('failed')
             task.error = result.get('error') or 'Failed to process uploaded file'

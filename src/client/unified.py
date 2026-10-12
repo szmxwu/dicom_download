@@ -58,6 +58,32 @@ from pydicom.dataset import Dataset
 logger = logging.getLogger('DICOMApp')
 
 
+def _accept_series_results(results, series_info):
+    """Apply D24 once for serial, parallel and uploaded studies."""
+    conversion_errors = {
+        name: info['conversion_error']
+        for name, info in series_info.items() if info.get('conversion_error')
+    }
+    if conversion_errors:
+        results['conversion_errors'] = conversion_errors
+    if not series_info:
+        results['error'] = 'File organization failed: no eligible series'
+    elif len(conversion_errors) == len(series_info):
+        results['error'] = f"Series conversion failed (all series): {conversion_errors}"
+    else:
+        if conversion_errors:
+            logger.warning(
+                "Partial success: %s series failed conversion (kept as raw DICOM): %s; "
+                "continuing with %s successfully converted series",
+                len(conversion_errors), conversion_errors,
+                len(series_info) - len(conversion_errors)
+            )
+        return True
+    results['success'] = False
+    logger.error(results['error'])
+    return False
+
+
 # ==================== P0/P1: 健壮性辅助类和函数 ====================
 
 @dataclass
@@ -2102,18 +2128,27 @@ class DICOMDownloadClient:
                 output_format=options.get('output_format', 'nifti')
             )
 
-        if options.get('auto_metadata', True):
-            excel_file = self.extract_dicom_metadata(organized_dir)
-
-        return {
-            'success': True,
+        results = {
+            'success': False,
             'extract_dir': extract_dir,
             'organized_dir': organized_dir,
             'excel_file': excel_file,
             'series_info': series_info,
             'series_count': len(series_info)
         }
-    
+        if options.get('auto_organize', True) and not _accept_series_results(results, series_info):
+            return results
+
+        if options.get('auto_metadata', True):
+            try:
+                results['excel_file'] = self.extract_dicom_metadata(organized_dir)
+            except Exception as exc:
+                logger.warning("Optional upload metadata extraction failed: %s", exc)
+            if not results['excel_file']:
+                results['metadata_warning'] = 'metadata extraction failed or timed out'
+        results['success'] = True
+        return results
+
     def process_complete_workflow(self, accession_number, base_output_dir="./downloads",
                                 auto_extract=True, auto_organize=True, auto_metadata=True,
                                 keep_zip=True, keep_extracted=False, output_format='nifti',
@@ -2250,7 +2285,7 @@ class DICOMDownloadClient:
                 # A partial NIfTI can exist after failed verification. Its mere
                 # existence must never clear an error or approve the series.
                 if err:
-                    info={'path':series_dir,'conversion_error':str(err)}
+                    info = {'path': series_dir, 'conversion_error': str(err) or type(err).__name__}
 
                 if info:
                     with series_lock:
@@ -2334,39 +2369,11 @@ class DICOMDownloadClient:
                 # 检查下载目录中的文件状态
                 self._wait_for_files_stable(download_dir)
                 _, series_info = self.organize_dicom_files(download_dir, output_format=output_format, min_series_files=min_series_files)
-                if not series_info:
-                    # 区分真正的组织失败 vs 所有序列都被过滤掉
-                    import glob
-                    dicom_files = glob.glob(os.path.join(download_dir, '**', '*.dcm'), recursive=True)
-                    if dicom_files:
-                        logger.error(f"❌ All {len(dicom_files)} DICOM files were filtered out (min_files={min_series_files}). This accession has insufficient data.")
-                        raise ValueError(f"All series filtered out: only {len(dicom_files)} files found, min required is {min_series_files}. This may be a scout/locator scan or incomplete study.")
-                    else:
-                        logger.error("❌ File organization failed: no DICOM files found in download directory")
-                        raise ValueError("File organization failed: no DICOM files found")
                 results['organized_dir'] = organized_dir
                 results['series_info'] = series_info
 
-            conversion_errors = {
-                name: info['conversion_error']
-                for name, info in series_info.items() if info.get('conversion_error')
-            }
-            if conversion_errors:
-                # 单序列失败不再株连整个任务（2026-10-02 决策，修订 D23 的序列级传播）：
-                # 失败序列保留原始 DICOM 随 zip 交付，失败清单记入 results['conversion_errors']
-                # 供客户端审阅。全部序列都失败时仍判任务失败（无可交付数据）。
-                # D23 的序列内逐张转换完整性约束（成功才删原始文件）不受影响。
-                succeeded = [n for n, i in series_info.items() if not i.get('conversion_error')]
-                if succeeded:
-                    results['conversion_errors'] = conversion_errors
-                    logger.warning(
-                        f"⚠️  {len(conversion_errors)} series failed conversion (kept as raw DICOM): "
-                        f"{conversion_errors}; continuing with {len(succeeded)} successfully converted series"
-                    )
-                else:
-                    results['error'] = f"Series conversion failed (all series): {conversion_errors}"
-                    logger.error(results['error'])
-                    return results
+            if not _accept_series_results(results, series_info):
+                return results
 
             if auto_metadata:
                 # 步骤3: 提取元数据 (独立线程)
