@@ -109,8 +109,9 @@ def test_organizer_propagates_conversion_failure(study):
     info = process_single_series(client, str(folder), '001_DX', str(folder.parent))
     assert info['conversion_error'] == 'incomplete'
     assert not (folder / '.processing_lock').exists()
-    with pytest.raises(RuntimeError, match='incomplete'):
-        organize_dicom_files(client, str(folder.parent), output_format='nifti')
+    _, series_info = organize_dicom_files(client, str(folder.parent), output_format='nifti')
+    assert series_info['001_DX']['conversion_error'] == 'incomplete'
+    assert all(Path(p).exists() for p in files)
 
 
 def test_subprocess_output_and_timeout():
