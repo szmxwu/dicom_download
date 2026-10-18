@@ -1,0 +1,48 @@
+# DICOM处理Web应用所需的Python包
+
+# Web框架
+Flask>=2.3.0
+Flask-SocketIO>=5.3.0
+
+# 网络请求
+requests>=2.28.0
+
+# DICOM文件处理
+pydicom>=2.3.0
+pynetdicom>=3.0.0
+# Excel文件处理
+pandas>=1.5.0
+openpyxl>=3.0.10
+
+# WebSocket支持
+python-socketio>=5.8.0
+python-engineio>=4.7.0
+
+# Windows 打包工具
+pyinstaller>=6.0.0
+
+# 环境变量管理
+python-dotenv>=1.0.0
+
+# 文件处理工具
+Werkzeug>=2.3.0
+
+# NIfTI文件处理 (DICOM转换)
+nibabel>=5.1.0
+numpy>=1.21.0
+pillow>=10.0.0
+
+# 系统监控（可选，用于监控页面显示内存/CPU使用率）
+# 离线环境若安装失败可跳过，监控页面将使用替代方案显示磁盘信息
+# psutil>=5.9.0
+
+# 生产环境部署（可选）
+# gunicorn>=21.0.0
+# eventlet 用于 SocketIO 大量长轮询/WebSocket 连接场景，避免线程爆炸
+eventlet>=0.41.0
+
+# 注意: dcm2niix 是外部工具，需要单独安装
+# 在Ubuntu/Debian上: sudo apt-get install dcm2niix
+# 在CentOS/RHEL上: sudo yum install dcm2niix
+# 在macOS上: brew install dcm2niix
+# 在Windows上: 需要从官网下载安装

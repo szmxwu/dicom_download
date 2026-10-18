@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree -L 2 -I '__pycache__|*.pyc|node_modules|venv' /home/ubuntu/work/python/dicom_download 2>/dev/null || find /home/ubuntu/work/python/dicom_download -maxdepth 2 -type d | head -50)"
+    ]
+  }
+}
