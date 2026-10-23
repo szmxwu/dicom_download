@@ -101,6 +101,12 @@ CT_YOLO第17项用户提供2,432层PACS客户端导出，与历史C-MOVE的Serie
 
 - 2026-10-02：生产几何v3剩余验收已移交[具体交接清单](CTA_GEOMETRY_V3_PRODUCTION_ACCEPTANCE_HANDOFF_20261002.md)，下载空闲时实施；不阻塞CT_YOLO存量数据清理与主线。
 
+**2026-10-22补充：K13历史存量四肢范围（非本次生产代码故障复现）**。CT_YOLO对2609＋supplement索引7051原生NIfTI核验，43初始header／metadata／解剖冲突及4同检查保守隔离，47原源held。5项q/s冲突有限计划中4项通过同次重建物理对齐与元数据端点佐证，发布保留头后载荷的独立修正版，原源SHA不变；PJT151为旧+0.9mm／qform约+0.45mm而端点及厚重建支持−0.45mm，兼有倒置与两倍拉伸。1项未达冻结门槛不放行。并非246个>1024层序列全部有错。
+
+PJT059原1025层与153层厚重建在原物理框架下对齐但共享解剖方向疑点，不能单因>1024盲修；PJT124仅691层但xlsx数量／面内间距／IPP与图像身份冲突，需匹配原始DICOM。FFS／mirror_relayout均不足以唯一归因。PJT203用户撤回，为正常上举摆位。当前无证据证明新生产转换路径仍有同一缺陷，未部署／重启或修改本项目生产代码。技术恢复角色不解封临床测试。
+
+可复用入口为兄弟项目[治理报告](../../CT_YOLO/docs/LIMB_NATIVE_GEOMETRY_AUDIT_AND_REPAIR_20261022.md)、`configs/native_geometry_holds.json`与222独立`derived/native_geometry_consumer_release_20261022_v1/`。4份修正仅为同次重建／元数据佐证等级，非完整原DICOM像素验证；剩余原源保持隔离，原始DICOM补齐后按源探针路径继续，不在QC／预览层盲改源CT。
+
 ### K14. PACS 返回重复序列条目 → 二次 organize 崩溃并覆盖首次成功结果（2026-10-09，本地已修复、193 待重启）
 
 - 事故：M26052802565 任务整体失败，报 `Series conversion failed (all series): cannot access local variable 'pydicom'`。
@@ -115,3 +121,24 @@ CT_YOLO第17项用户提供2,432层PACS客户端导出，与历史C-MOVE的Serie
   2. `unified.py:_query_series_metadata`：按 SeriesInstanceUID 去重，重复条目记 warning 丢弃（消除重复下载/回调）。
   3. `unified.py:download_study`：新增 `_resolve_series_dir()`，检测目录名冲突——不同 UID 映射到同一 `{num}_{desc}` 目录名时追加 UID 后缀（防止数据混合）；同一 UID 重复解析（主流程/重试）返回同一目录。
 - 教训：目录命名键（SeriesNumber+Description）不是唯一键，只有 SeriesInstanceUID 是；任何"以缓存存在与否分支"的代码路径都要保证分支两侧的局部变量一致可用。
+
+### K15. RF 模态未列入 2D X-ray 家族导致预览三视图化 + nii 布局未归一 —— 已修复（2026-10-19，待同步服务器）
+
+- 现象：X-ray_YOLO 侧发现 RF（胃肠机）胸片预览为 8838×2946（3× 宽黑画布，仅左 1/3 有图像），平台 nii 视图旋转 90°。实证 accession 521112900030DR。
+- 根因（两处同源遗漏）：
+  1. `convert.py` dcm2niix/python-libs 的逐文件 2D 分支 `modality in ['DR','MG','DX','CR']` 不含 RF → RF 落入"整序列单 nii"的 3D 分支，`normalize_2d_nifti_display` 探针归一化未执行，nii 保持 dcm2niix 原始 (cols,rows) 布局。
+  2. `preview.py is_2d_xray` 同样不含 RF → 单文件 2D RF 序列走进 `_generate_3d_triplane_preview`，三面板横拼（3×宽），仅 axial 面板有内容。
+- 修复（2026-10-19）：5 处 2D X-ray 模态清单统一补 'RF'（convert.py 两分支、preview.py is_2d_xray、metadata.py read_all ×2、unified.py read_all）。`pytest test/` 139 passed。
+- 未纳入 XA/US：XA 常见多帧造影（cine），逐文件 2D 化可能误拆 multi-frame；如出现需求再专项评估。
+- 存量数据：修复前下载的 RF 序列 nii 布局与预览均不可信，需重下；X-ray_YOLO 侧以 preview/nii 长宽比一致性扫描圈定（geometry_audit）。
+- static/src 为旧快照，本次未同步。
+
+### 2026-10-23 K13续：v3部署状态已更新，v4完整CT输入门禁新增修复
+
+10月9日HANDOFF已记录136／193部署，2026-10-23对现193 P3650生产目录只读核SHA确认v3，旧“生产待部署”系10月2日历史。研究双3090已迁188。新审计实际复现Python读头／读像素丢末片、混矩阵保留多数片、缺源身份后仍success，以及单文件多帧CT绕过门禁。新增v4本地修复且普通单层保持通过；全套152通过／2 eventlet环境跳过，24层真实HU逐值全等。当前生产仍v3，未部署或重启，不能宣布新缺口已在生产消失。具体补丁与空闲验收见[完整交接](CT_GEOMETRY_V4_COMPLETENESS_HANDOFF_20261023.md)，现场解释器独立验证证据亦在交接链接。
+
+转换阶段保留原件，不等于10月18日最终交付清理后永久保存原件；本轮不更改D24。源标签自身错误、均匀缺失输入和探针外像素损坏仍是证据边界。
+
+2026-10-23补充验收：当前生产Python3.12／eventlet／实际生产转换器副本的独立快照全集154通过、0跳过、0失败，源码绑定一致且生产4文件SHA前后未变；无全局包安装、部署或重启。这取代“仅本地152／2跳过”作为候选补丁运行环境证据，~~生产切换及Windows实证仍pending~~。
+
+**2026-10-23 生产切换已完成（193）**：队列空闲窗口部署 convert.py/constants.py（md5 与本地补丁一致），`backups/pre_v4_20261023_convert_constants.tar.gz` 留存 v3 备份；生产解释器对部署后源码跑核心回归（test_ct_source_completeness/orientation_fix/conversion_failures/d24_delivery/organize_cached_modality/mr_clean_exclusions）**131 通过／0 失败／0 跳过**（eventlet 专项真实执行）。旧 PID 544624 精确 SIGTERM 后确认退出，新实例 PID 2223784 监听 5005，HTTP 200、PACS connected，`CONVERSION_GEOMETRY_VERSION='20261023-complete-ct-source-geometry-v4'` 生效（缓存指纹自动失配旧产物）。unified/metadata/preview 的 RF 补充此前已在产（SHA 核对一致）。**136 仍待用户手动更新**，正常生产下载路径验收（≤1024/>1024 层、斜位、缺片拒绝等）随真实任务持续观察。

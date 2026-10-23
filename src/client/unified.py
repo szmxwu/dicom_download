@@ -1691,7 +1691,7 @@ class DICOMDownloadClient:
                 logger.warning(f"[CACHE] Skipping cache for {series_name}: dicom_files is empty")
                 return
 
-            read_all = modality in ['DR', 'MG', 'DX', 'CR']
+            read_all = modality in ['DR', 'MG', 'DX', 'CR', 'RF']
             logger.info(f"[CACHE] Collecting metadata for {series_name}, read_all={read_all}")
             # CPU/IO 密集（read_all 时解析高分辨率像素），eventlet 下卸载到真实线程
             records = run_cpu_bound(

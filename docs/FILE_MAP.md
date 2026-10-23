@@ -1,5 +1,9 @@
 # FILE_MAP.md — 目录职责与高风险区域
 
+## 2026-10-23当前：v4已部署193生产
+
+生产当前为`wmx@192.0.0.193:/home/wmx/work/dicom_download_prod`，解释器`/opt/ia-runtime/bin/python3.12`，5005；研究双3090迁188。旧下方yusi／work2路径及“尚未部署v3”是历史。**v4完整CT源集合补丁已于2026-10-23部署193并重启**（PID 2223784，队列空闲窗口，v3备份在`backups/pre_v4_20261023_convert_constants.tar.gz`；部署后生产解释器核心回归131通过／0失败／0跳过含eventlet专项），详见[K13续](KNOWN_ISSUES.md)与[v4交接](CT_GEOMETRY_V4_COMPLETENESS_HANDOFF_20261023.md)。**136仍待手动更新**。
+
 ## 源码布局
 
 ```

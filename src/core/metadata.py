@@ -305,7 +305,7 @@ def extract_dicom_metadata(
                     cached_modality = str(cache.get('modality', '')).upper()
                     sample_tags = cache.get('sample_tags') or {}
                     current_keywords = get_keywords(cached_modality) if cached_modality else []
-                    read_all = cached_modality in ['DR', 'MG', 'DX', 'CR']
+                    read_all = cached_modality in ['DR', 'MG', 'DX', 'CR', 'RF']
                     logger.info(f"[META] Cache loaded for {series_folder}: modality={cached_modality}, records={len(cached_records)}, sample_tags_keys={list(sample_tags.keys()) if sample_tags else []}")
 
                     if cached_records:
@@ -432,7 +432,7 @@ def extract_dicom_metadata(
             logger.info(f"[META] Reading DICOM for {series_folder}: {sample_file}, total_dicom_files={len(dicom_files)}")
             dcm = pydicom.dcmread(sample_file, force=True)
             modality = getattr(dcm, 'Modality', '')
-            need_read_all = modality in ['DR', 'MG', 'DX', 'CR']
+            need_read_all = modality in ['DR', 'MG', 'DX', 'CR', 'RF']
 
             current_keywords = get_keywords(modality)
             logger.info(f"[META] DICOM read OK for {series_folder}: modality={modality}, keywords={len(current_keywords)}")

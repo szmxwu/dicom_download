@@ -558,6 +558,18 @@ def build_dicom_truth_affine(datasets: List[FileDataset]) -> Optional[Tuple[np.n
         return None
 
 
+def _ct_source_set_error(datasets, expected_count):
+    """Do not certify a readable subset or unsupported enhanced CT as a series."""
+    if not datasets or len(datasets) != expected_count:
+        return 'CT source header set incomplete; original DICOM retained'
+    if any(not str(getattr(ds, tag, '')) for ds in datasets
+           for tag in ('StudyInstanceUID', 'SeriesInstanceUID', 'SOPInstanceUID')):
+        return 'CT source identity missing; original DICOM retained'
+    if any(int(getattr(ds, 'NumberOfFrames', 1)) != 1 for ds in datasets):
+        return 'Multiframe CT per-frame geometry unsupported; original DICOM retained'
+    return None
+
+
 def _analyze_signed_permutation(T: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """
     判断相对变换 T 是否为带符号置换矩阵（归一化后元素为 0/±1，平移为整数体素）。
@@ -926,13 +938,15 @@ def verify_and_fix_orientation_file(
             sorted_files = [with_ipp[i][1] for i in order]
 
         slice_loader = None
+        if len(readable_files) == 1:
+            slice_loader = lambda index: pydicom.dcmread(readable_files[index], force=True)
         if sorted_files is not None:
             def slice_loader(sorted_idx):
                 return pydicom.dcmread(sorted_files[sorted_idx], force=True)
 
         fixed_img, result = verify_and_fix_orientation(
             img, datasets, series_name,
-            slice_loader=slice_loader if sorted_files is not None else None
+            slice_loader=slice_loader
         )
         if result.get('fixes'):
             temp_dir = os.path.dirname(nifti_path)
@@ -1355,7 +1369,7 @@ def convert_with_dcm2niix(
 
         output_name = client._sanitize_folder_name(series_name)
 
-        if modality in ['DR', 'MG', 'DX', 'CR']:
+        if modality in ['DR', 'MG', 'DX', 'CR', 'RF']:
             logger.info("Detected %s modality, converting each DICOM to NIfTI", modality)
 
             success_count = 0
@@ -1511,7 +1525,7 @@ def convert_with_dcm2niix(
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
                 client._record_orientation_check(series_dir, orientation_check)
 
-                if modality=='CT' and len(dicom_files)>1 and orientation_check.get('action') not in (ORIENTATION_CHECK_OK,ORIENTATION_CHECK_MIRROR_CORRECTED):
+                if modality=='CT' and orientation_check.get('action') not in (ORIENTATION_CHECK_OK,ORIENTATION_CHECK_MIRROR_CORRECTED):
                     return {'success':False,'error':'CT geometry not verified; original DICOM retained',
                             'orientation_check':orientation_check}
 
@@ -1819,7 +1833,7 @@ def convert_with_python_libs(
             first_dcm = pydicom.dcmread(dicom_files[0], force=True)
             modality = modality or getattr(first_dcm, 'Modality', '')
 
-        if modality in ['DR', 'MG', 'DX', 'CR']:
+        if modality in ['DR', 'MG', 'DX', 'CR', 'RF']:
             logger.info("Detected %s modality; converting each DICOM file to NIfTI (Python libs)", modality)
 
             success_count = 0
@@ -1925,6 +1939,13 @@ def convert_with_python_libs(
 
         print(f"   ℹ️  {modality} modality: converting entire series to a single NIfTI file")
 
+        if modality == 'CT' and len(dicom_files) == 1:
+            # Read actual current source rather than trusting a caller's sample.
+            first_dcm = pydicom.dcmread(dicom_files[0], force=True)
+            error = _ct_source_set_error([first_dcm], 1)
+            if error:
+                return {'success': False, 'error': error}
+
         if len(dicom_files) == 1:
             dcm = first_dcm
             if not hasattr(dcm, 'pixel_array'):
@@ -1953,6 +1974,9 @@ def convert_with_python_libs(
             nifti_img, orientation_check = verify_and_fix_orientation(
                 nifti_img, [dcm], series_name
             )
+            if modality == 'CT' and orientation_check.get('action') not in (ORIENTATION_CHECK_OK, ORIENTATION_CHECK_MIRROR_CORRECTED):
+                return {'success': False, 'error': 'CT geometry not verified; original DICOM retained',
+                        'orientation_check': orientation_check}
 
             output_filename = f"{client._sanitize_folder_name(series_name)}.nii.gz"
 
@@ -2003,6 +2027,10 @@ def convert_with_python_libs(
 
         if not slice_info:
             return {'success': False, 'error': 'Could not sort slices'}
+        if modality == 'CT':
+            error = _ct_source_set_error([entry[2] for entry in slice_info], len(dicom_files))
+            if error:
+                return {'success': False, 'error': error}
 
         if all(item[3] is not None for item in slice_info):
             order,_=_canonical_slice_order(np.asarray([item[3] for item in slice_info]))
@@ -2024,10 +2052,15 @@ def convert_with_python_libs(
         if not slices:
             return {'success': False, 'error': 'No pixel data found'}
 
+        if modality == 'CT' and len(valid_info) != len(dicom_files):
+            return {'success': False, 'error': 'CT source pixel set incomplete; original DICOM retained'}
+
         # 同一序列混入不同矩阵尺寸的图像（打印排版/AI 报告等拼装序列）时，
         # np.stack 会整体崩溃。保留多数派 shape 的切片，丢弃少数派并记录数量。
         shape_counts = Counter(s.shape for s in slices)
         if len(shape_counts) > 1:
+            if modality == 'CT':
+                return {'success': False, 'error': 'Mixed CT pixel matrices; original DICOM retained'}
             modal_shape = shape_counts.most_common(1)[0][0]
             keep_idx = [i for i, s in enumerate(slices) if s.shape == modal_shape]
             logger.warning(
@@ -2083,7 +2116,7 @@ def convert_with_python_libs(
             nifti_img, [dcm for _, _, dcm, _ in valid_info], series_name
         )
 
-        if modality=='CT' and len(dicom_files)>1 and orientation_check.get('action') not in (ORIENTATION_CHECK_OK,ORIENTATION_CHECK_MIRROR_CORRECTED):
+        if modality=='CT' and orientation_check.get('action') not in (ORIENTATION_CHECK_OK,ORIENTATION_CHECK_MIRROR_CORRECTED):
             return {'success':False,'error':'CT geometry not verified; original DICOM retained',
                     'orientation_check':orientation_check}
 

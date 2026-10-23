@@ -1475,7 +1475,7 @@ def generate_series_preview(
         modality = (modality or '').upper()
 
         # 判断是否为2D X射线模态
-        is_2d_xray = modality in ['DR', 'MG', 'DX', 'CR']
+        is_2d_xray = modality in ['DR', 'MG', 'DX', 'CR', 'RF']
         
         # 预加载 DICOM 元数据缓存（避免在循环中重复读取 JSON）
         if cache_data is None:
