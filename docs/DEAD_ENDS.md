@@ -79,3 +79,7 @@
 ### X18. `pkill -f` 远程重启服务
 - 否定：2026-08。模式会匹配到 ssh 远程 shell 自己的命令行，会话自杀。
 - 正解：精确 `kill <pid>`，且先确认旧进程死亡再启动（单实例锁会拒绝第二实例）（D20）。
+
+### X19. 把 `get_fdata()` 换成 `dataobj` 或直接 canonical，就宣称已消除整卷内存
+- 否定：2026-10-24 代码审查实证。`np.asanyarray(img.dataobj)` 仍会加载整卷，非单位 slope/intercept 仍产生 float64；`nib.as_closest_canonical()` 在非恒等仿射下会先整卷重排。抽样先于 NaN/Inf 过滤还会改变旧 QC 口径；自行映射方向时把 `orientation[:,0]` 当输出轴顺序会在循环排列/轴交换叠加翻转时读错切片。
+- 正解：QC 用 `get_unscaled()` 并仅在样本/中间层缩放，浮点先过滤再抽样；预览用源轴翻转 + `argsort` 转置的懒索引代理，且以全部 48 种方向对照 nibabel（D25）。

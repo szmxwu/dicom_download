@@ -314,3 +314,25 @@ def test_real_web_task_delivers_or_fails(workflow, mode, outcome, tmp_path):
         assert not any(n.startswith(workflow.bad.name + '/')
                        and not n.endswith('dicom_metadata_cache.json') for n in names)
         assert f'{workflow.good.name}/converted.nii.gz' in names
+
+
+def test_failed_cleanup_is_recursive_and_fail_closed(tmp_path, monkeypatch):
+    series = tmp_path / 'bad'
+    nested = series / 'temp_0'
+    nested.mkdir(parents=True)
+    (nested / 'source.dcm').write_bytes(b'synthetic')
+    (series / 'partial.nii.gz').write_bytes(b'synthetic')
+    (series / 'dicom_metadata_cache.json').write_text('{}')
+    info = {'bad': {'path': str(series)}}
+
+    unified._drop_failed_series_files(info, {'bad': 'synthetic'})
+
+    assert not list(series.rglob('*.dcm'))
+    assert not list(series.rglob('*.nii.gz'))
+    assert (series / 'dicom_metadata_cache.json').is_file()
+
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / 'source.dcm').write_bytes(b'synthetic')
+    monkeypatch.setattr(unified.os, 'remove', lambda _: (_ for _ in ()).throw(PermissionError('locked')))
+    with pytest.raises(RuntimeError):
+        unified._drop_failed_series_files(info, {'bad': 'synthetic'})

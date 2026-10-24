@@ -66,6 +66,25 @@ METADATA_TIMEOUT_SEC=1800
 - 生成时间小于 `CLEANUP_MIN_AGE_MINUTES` 的结果会被跳过。
 - 其余结果按修改时间 `mtime` 从旧到新删除，直到占用低于 `CLEANUP_TARGET_GB`。
 
+### 内存感知处理
+转换、预览生成和元数据 QC 在所有任务之间共享一个全局重处理闸门，限制叠加的内存峰值，同时不停止 PACS 接收；现有待处理序列队列继续提供生产者背压。
+
+```ini
+# 全系统同时执行的转换/预览/元数据QC单元数（默认 2）
+HEAVY_PROCESSING_MAX_WORKERS=2
+# 可用内存低于该值时，暂缓新增重处理（单位 GiB，默认 2.0）
+MEMORY_MIN_AVAILABLE_GB=2.0
+# 磁盘空闲低于40GiB暂停PACS下载，恢复到60GiB时继续
+DOWNLOAD_LOW_WATERMARK_GB=40
+DOWNLOAD_HIGH_WATERMARK_GB=60
+# 空闲低于50GiB时清理旧结果（恢复到60GiB）
+CLEANUP_MIN_FREE_GB=50
+# 专用下载服务器的大缓存上限
+CACHE_MAX_GB=180
+```
+
+即使低于阈值，也始终允许一个重处理单元继续工作，避免共享服务器长期低内存导致流水线饿死。未安装 `psutil` 时，Linux 会读取 `/proc/meminfo`；其他平台若没有 `psutil`，则仅限制重处理并发数。`NUM_CONVERTERS` 仍表示单任务内的转换线程数。
+
 ### 元数据模板配置
 您可以通过编辑 `dicom_tags/` 目录下的 JSON 文件来自定义不同模态提取的 DICOM 标签：
 - `mr.json`: 磁共振 (MRI)

@@ -48,6 +48,7 @@ from src.core.qc import assess_converted_file_quality as assess_converted_file_q
 from src.core.qc import assess_series_quality_converted as assess_series_quality_converted_impl
 from src.core.qc import assess_series_quality as assess_series_quality_impl
 from src.utils.offload import run_cpu_bound
+from src.utils.memory import heavy_processing_slot
 from pynetdicom import AE, evt, AllStoragePresentationContexts
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
@@ -72,17 +73,24 @@ def _drop_failed_series_files(series_info, conversion_errors):
         if not series_dir or not os.path.isdir(series_dir):
             continue
         removed = 0
-        for fname in os.listdir(series_dir):
-            if fname.lower() == 'dicom_metadata_cache.json':
-                continue
-            fpath = os.path.join(series_dir, fname)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                os.remove(fpath)
-                removed += 1
-            except OSError as exc:
-                logger.warning(f"⚠️  Failed to remove file from dropped series {name}: {fpath}: {exc}")
+        # 必须递归清理：单文件转换会在 temp_<idx>/ 中复制源 DICOM，
+        # 打包器同样递归遍历子目录。删除失败必须 fail closed，不能继续打包。
+        for root, dirs, files in os.walk(series_dir, topdown=False):
+            for fname in files:
+                if fname.lower() == 'dicom_metadata_cache.json':
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    os.remove(fpath)
+                    removed += 1
+                except OSError as exc:
+                    logger.error(f"❌  Failed to remove file from dropped series {name}: {fpath}: {exc}")
+                    raise RuntimeError(f"Failed to purge dropped series {name}: {fpath}: {exc}") from exc
+            for dname in dirs:
+                try:
+                    os.rmdir(os.path.join(root, dname))
+                except OSError:
+                    pass
         logger.info(f"🗑️  Dropped failed series {name}: removed {removed} file(s), "
                     f"raw DICOM not delivered (privacy policy)")
 
@@ -483,9 +491,12 @@ class DICOMDownloadClient:
         except Exception:
             return
 
-        warned = False
+        # 首次立即告警，等待期间每 5 分钟更新一次剩余空间。
+        # 旧实现只记录一次，水位配置错误时任务会静默等待数小时（K17）。
+        last_wait_log = None
         while free < low:
-            if not warned:
+            now = time.monotonic()
+            if last_wait_log is None or now - last_wait_log >= 300:
                 try:
                     logger.warning(
                         f"Disk free space low ({free:.2f}GB < {low}GB). "
@@ -493,7 +504,7 @@ class DICOMDownloadClient:
                     )
                 except Exception:
                     pass
-                warned = True
+                last_wait_log = now
             time.sleep(sleep_sec)
             try:
                 free = _free_gb()
@@ -1663,13 +1674,20 @@ class DICOMDownloadClient:
         return removed
     
     def organize_dicom_files(self, extract_dir, organized_dir=None, output_format='nifti', min_series_files=None):
-        """按Series整理DICOM文件并转换为指定格式 (nifti 或 npz)"""
-        return organize_dicom_files_impl(self, extract_dir, organized_dir, output_format, min_series_files=min_series_files)
+        """按Series整理并转换；串行路径与并行worker共用全局重处理背压。"""
+        with heavy_processing_slot():
+            return organize_dicom_files_impl(
+                self, extract_dir, organized_dir, output_format,
+                min_series_files=min_series_files
+            )
 
     def _process_single_series(self, series_path, series_folder, output_format='nifti', min_series_files=None):
-        """处理单个Series目录：统计、转换（原地处理，不再移动到 organized_dir）。"""
-        return process_single_series_impl(self, series_path, series_folder, series_path,
-                                          output_format=output_format, min_series_files=min_series_files)
+        """处理单个Series目录；转换和预览共享跨任务重内存槽位。"""
+        with heavy_processing_slot():
+            return process_single_series_impl(
+                self, series_path, series_folder, series_path,
+                output_format=output_format, min_series_files=min_series_files
+            )
     
     def convert_dicom_to_nifti(self, series_dir, series_name, dicom_files=None, sample_dcm=None, modality=None):
         """将DICOM序列转换为NIfTI格式"""
@@ -1985,15 +2003,17 @@ class DICOMDownloadClient:
         return run_cpu_bound(convert_with_python_libs_impl, self, series_dir, series_name)
     
     def extract_dicom_metadata(self, organized_dir, output_excel=None):
-        return extract_dicom_metadata_impl(
-            organized_dir=organized_dir,
-            output_excel=output_excel,
-            get_keywords=self.get_keywords,
-            get_converted_files=self._get_converted_files,
-            assess_converted_file_quality=self._assess_converted_file_quality,
-            assess_series_quality_converted=self._assess_series_quality_converted,
-            append_mr_cleaned_sheet=self._append_mr_cleaned_sheet
-        )
+        # 元数据阶段包含整卷 QC；与转换/预览共用跨任务重内存槽位。
+        with heavy_processing_slot():
+            return extract_dicom_metadata_impl(
+                organized_dir=organized_dir,
+                output_excel=output_excel,
+                get_keywords=self.get_keywords,
+                get_converted_files=self._get_converted_files,
+                assess_converted_file_quality=self._assess_converted_file_quality,
+                assess_series_quality_converted=self._assess_series_quality_converted,
+                append_mr_cleaned_sheet=self._append_mr_cleaned_sheet
+            )
 
     def _append_mr_cleaned_sheet(self, df: pd.DataFrame, output_excel: str) -> None:
         """对 MR 记录做治理/规范化，并写回到同一个 Excel 的 MR_Cleaned sheet。"""

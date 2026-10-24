@@ -6,5 +6,6 @@
 """
 
 from src.utils.packaging import create_result_zip
+from src.utils.memory import get_available_memory_gb, heavy_processing_slot
 
-__all__ = ["create_result_zip"]
+__all__ = ["create_result_zip", "get_available_memory_gb", "heavy_processing_slot"]

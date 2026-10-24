@@ -1151,6 +1151,11 @@ def convert_to_npz(
             client, series_dir, series_name,
             dicom_files=dicom_files, sample_dcm=sample_dcm, modality=modality
         )
+        intermediate_nifti_files = []
+        if isinstance(nifti_res, dict):
+            intermediate_nifti_files.extend(nifti_res.get('output_files') or [])
+            if nifti_res.get('output_file'):
+                intermediate_nifti_files.append(nifti_res['output_file'])
         used_python_libs_memory = False
         if not (nifti_res and nifti_res.get('success')):
             # Python-libs 回退：跳过中间 NIfTI 写入，直接在内存中生成 NPZ
@@ -1257,6 +1262,12 @@ def convert_to_npz(
             sample_dcm=sample_dcm,
             file_count=len(output_files)
         )
+
+        # NPZ 是唯一需要交付的图像格式。Python 内存回退不会在转换阶段
+        # 清理源文件，因此必须在这里递归删除源 DICOM 和中间 NIfTI；
+        # 删除失败由外层返回失败，禁止把含患者头信息的文件打入 ZIP。
+        _remove_intermediate_nifti(series_dir)
+        _remove_source_dicoms(series_dir, dicom_files)
 
         return {
             'success': True,
@@ -1412,23 +1423,44 @@ def convert_with_dcm2niix(
                         nifti_file = f"{file_output_name}.nii.gz"
                         nifti_path = os.path.join(series_dir, nifti_file)
                         if os.path.exists(nifti_path):
-                            output_files.append(nifti_file)
-                            success_count += 1
                             try:
                                 dcm = pydicom.dcmread(dcm_file, force=True)
-                                # 探针归一化显示布局（需在删除 DICOM 之前，依赖其像素真值）：
-                                # dcm2niix 缺 IOP 时输出布局不稳定，逐文件实测校正
-                                # CPU 密集（高分辨率像素探针），eventlet 下卸载到真实线程
-                                run_cpu_bound(normalize_2d_nifti_display, nifti_path, dcm, series_name)
-                                entry = _build_conversion_entry(
-                                    nifti_file,
-                                    dcm,
-                                    file_index=idx + 1,
-                                    source_file=os.path.basename(dcm_file)
+                                # 只有源像素证明布局可信的文件才可交付；不可信/空白结果
+                                # 会计入转换失败并触发 Python 源像素回退，最终失败则放弃。
+                                normalization = run_cpu_bound(
+                                    normalize_2d_nifti_display, nifti_path, dcm, series_name
                                 )
-                                conversion_entries.append(entry)
-                            except Exception:
-                                pass
+                                action = normalization.get('action')
+                                if action not in ('normalized', 'inverted_normalized', 'ok'):
+                                    logger.warning(
+                                        "[2D-NORMALIZE] %s: reject %s (%s)",
+                                        series_name, nifti_file,
+                                        normalization.get('message') or action
+                                    )
+                                    os.remove(nifti_path)
+                                    continue
+
+                                output_files.append(nifti_file)
+                                success_count += 1
+                                try:
+                                    entry = _build_conversion_entry(
+                                        nifti_file,
+                                        dcm,
+                                        file_index=idx + 1,
+                                        source_file=os.path.basename(dcm_file)
+                                    )
+                                    conversion_entries.append(entry)
+                                except Exception:
+                                    pass
+                            except Exception as exc:
+                                logger.warning(
+                                    "[2D-NORMALIZE] %s: reject unprocessable output %s: %s",
+                                    series_name, nifti_file, exc
+                                )
+                                try:
+                                    os.remove(nifti_path)
+                                except OSError:
+                                    pass
                         else:
                             # dcm2niix returncode 为 0 但没有生成文件，记录详细诊断信息
                             logger.warning("dcm2niix returned 0 but no output file for %s, stdout=%s, stderr=%s", 
@@ -1454,7 +1486,13 @@ def convert_with_dcm2niix(
             if success_count != len(dicom_files):
                 error = f'Incomplete conversion: {success_count}/{len(dicom_files)} files; original DICOM retained'
                 logger.error(error)
-                return {'success': False, 'error': error, 'file_count': success_count}
+                return {
+                    'success': False,
+                    'error': error,
+                    'file_count': success_count,
+                    # NPZ 回退成功后需要清除这些中间文件，避免与源 DICOM 一起交付。
+                    'output_files': output_files,
+                }
 
             if success_count > 0:
                 logger.info("dcm2niix conversion succeeded: %d/%d files", success_count, len(dicom_files))
@@ -1462,11 +1500,10 @@ def convert_with_dcm2niix(
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
                 _write_conversion_map(series_dir, conversion_entries)
 
-                for dcm_file in dicom_files:
-                    try:
-                        os.remove(dcm_file)
-                    except Exception:
-                        pass
+                try:
+                    _remove_source_dicoms(series_dir, dicom_files)
+                except Exception as exc:
+                    return {'success': False, 'error': f'Failed to remove source DICOM after conversion: {exc}'}
 
                 return {
                     'success': True,
@@ -1529,14 +1566,10 @@ def convert_with_dcm2niix(
                     return {'success':False,'error':'CT geometry not verified; original DICOM retained',
                             'orientation_check':orientation_check}
 
-                for file in os.listdir(series_dir):
-                    if file.startswith('.'):
-                        continue
-                    if file.endswith('.dcm'):
-                        try:
-                            os.remove(os.path.join(series_dir, file))
-                        except Exception:
-                            pass
+                try:
+                    _remove_source_dicoms(series_dir, dicom_files)
+                except Exception as exc:
+                    return {'success': False, 'error': f'Failed to remove source DICOM after conversion: {exc}'}
 
                 return {
                     'success': True,
@@ -1656,6 +1689,58 @@ def _build_2d_xray_affine(dcm: FileDataset) -> np.ndarray:
     return affine
 
 
+def _has_diagnostic_2d_pixels(pixel_data: np.ndarray) -> bool:
+    """排除真正全黑/全白/全非有限值的 2D 源像素，不评价窗口或对比度。"""
+    try:
+        if pixel_data is None or pixel_data.size == 0:
+            return False
+        if not bool(np.isfinite(pixel_data).any()):
+            return False
+        # 只拒绝真正恒定的像素；合法的小 RescaleSlope 不能把非空白图像
+        # 压到某个绝对动态范围阈值以下后误杀。
+        return bool(np.nanmax(pixel_data) != np.nanmin(pixel_data))
+    except Exception:
+        return False
+
+
+def _remove_intermediate_nifti(series_dir: str) -> None:
+    """NPZ 交付前删除所有中间 NIfTI，包括被拒绝但初次删除失败的输出。"""
+    for root, _, files in os.walk(series_dir):
+        for filename in files:
+            if filename.lower().endswith(('.nii', '.nii.gz')):
+                os.remove(os.path.join(root, filename))
+
+
+def _remove_source_dicoms(series_dir: str, dicom_files=None) -> None:
+    """成功转换后删除源 DICOM；任何删除失败都向上传播以防误交付。"""
+    if dicom_files is not None:
+        for filepath in dicom_files:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+    for root, dirs, files in os.walk(series_dir, topdown=False):
+        for filename in files:
+            filepath = os.path.join(root, filename)
+            if filename.lower().endswith('.dcm'):
+                os.remove(filepath)
+            elif dicom_files is None:
+                # 无后缀/其他后缀的输入按内容识别，不能只靠扩展名。
+                try:
+                    with open(filepath, 'rb') as source:
+                        has_preamble = source.read(132)[128:132] == b'DICM'
+                    if not has_preamble:
+                        try:
+                            pydicom.dcmread(filepath, force=True, stop_before_pixels=True)
+                        except Exception:
+                            continue
+                    os.remove(filepath)
+                except FileNotFoundError:
+                    pass
+        for dirname in dirs:
+            if dirname.startswith('temp_'):
+                shutil.rmtree(os.path.join(root, dirname))
+
+
 def normalize_2d_nifti_display(
     nifti_path: str,
     dcm: FileDataset,
@@ -1691,15 +1776,16 @@ def normalize_2d_nifti_display(
         ref = apply_rescale(ref, dcm)
         ref = apply_photometric(ref, dcm)
         rows, cols = ref.shape
+        if not _has_diagnostic_2d_pixels(ref):
+            result['action'] = 'not_verifiable'
+            result['message'] = 'blank DICOM pixels, reject output'
+            logger.warning("[2D-NORMALIZE] %s: rejecting truly blank DICOM pixels", series_name)
+            return result
 
         # 子采样网格（≤96 点/维），相关系数对线性灰度变换不变
         sr = max(1, rows // 96)
         sc = max(1, cols // 96)
         ref_sub = ref[::sr, ::sc].ravel()
-        if float(ref_sub.std()) < 1e-6:
-            result['action'] = 'not_verifiable'
-            result['message'] = 'blank DICOM pixels, probe skipped'
-            return result
 
         candidates = {
             'identity': data,
@@ -1853,6 +1939,12 @@ def convert_with_python_libs(
                     pixel_data = dcm.pixel_array
                     pixel_data = apply_rescale(pixel_data, dcm)
                     pixel_data = apply_photometric(pixel_data, dcm)
+                    if not _has_diagnostic_2d_pixels(pixel_data):
+                        logger.warning(
+                            "Rejecting truly blank 2D X-ray file %d: %s",
+                            idx + 1, os.path.basename(dcm_file)
+                        )
+                        continue
 
                     # 确保数据为 3D (添加单切片维度)
                     if len(pixel_data.shape) == 2:
@@ -1913,13 +2005,12 @@ def convert_with_python_libs(
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
                 _write_conversion_map(series_dir, conversion_entries)
                 
-                # 清理原始 DICOM 文件
+                # 清理原始 DICOM 文件；删除失败不得作为成功交付。
                 if save_to_disk:
-                    for dcm_file in dicom_files:
-                        try:
-                            os.remove(dcm_file)
-                        except Exception:
-                            pass
+                    try:
+                        _remove_source_dicoms(series_dir, dicom_files)
+                    except Exception as exc:
+                        return {'success': False, 'error': f'Failed to remove source DICOM after conversion: {exc}'}
 
                 logger.info("   ✅ Python libs conversion succeeded: %d/%d files", success_count, len(dicom_files))
                 result = {
@@ -1986,11 +2077,10 @@ def convert_with_python_libs(
 
                 client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
                 client._record_orientation_check(series_dir, orientation_check)
-                for file in dicom_files:
-                    try:
-                        os.remove(file)
-                    except Exception:
-                        pass
+                try:
+                    _remove_source_dicoms(series_dir, dicom_files)
+                except Exception as exc:
+                    return {'success': False, 'error': f'Failed to remove source DICOM after conversion: {exc}'}
 
                 print(f"   ✅ Python libs conversion succeeded: {output_filename}")
             else:
@@ -2128,11 +2218,10 @@ def convert_with_python_libs(
 
             client._ensure_metadata_cache(series_dir, series_name, dicom_files, modality)
             client._record_orientation_check(series_dir, orientation_check)
-            for file in dicom_files:
-                try:
-                    os.remove(file)
-                except Exception:
-                    pass
+            try:
+                _remove_source_dicoms(series_dir, dicom_files)
+            except Exception as exc:
+                return {'success': False, 'error': f'Failed to remove source DICOM after conversion: {exc}'}
 
             print(f"   ✅ Python libs conversion succeeded: {output_filename} ({len(slices)} slices)")
         else:

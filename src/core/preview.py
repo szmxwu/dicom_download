@@ -1171,6 +1171,127 @@ def _extract_orthogonal_slices(
         return blank, blank, blank
 
 
+class _LazyReorientedData:
+    """把 canonical 索引映射回源 dataobj，只对取出的切片做轴翻转/转置。"""
+
+    def __init__(self, dataobj, orientation, source_shape):
+        self._dataobj = dataobj
+        self._orientation = np.asarray(orientation)
+        self._source_shape = tuple(source_shape)
+        # apply_orientation 在源轴上翻转，再按 argsort 转置；输出轴顺序
+        # 不是 orientation[:, 0] 本身（循环排列时尤其不同）。
+        self._transpose = np.argsort(self._orientation[:, 0])
+        spatial = tuple(self._source_shape[int(axis)] for axis in self._transpose)
+        self.shape = spatial + self._source_shape[len(spatial):]
+        self.ndim = len(self.shape)
+        self.dtype = getattr(dataobj, 'dtype', None)
+
+    @staticmethod
+    def _reverse_index(index, size):
+        if isinstance(index, (int, np.integer)):
+            if index < 0:
+                index += size
+            return size - 1 - index
+        start, stop, step = index.indices(size)
+        count = len(range(start, stop, step))
+        if count == 0:
+            return slice(0, 0, 1)
+        last = start + (count - 1) * step
+        source_start = size - 1 - start
+        source_last = size - 1 - last
+        source_step = -step
+        source_stop = source_last + source_step
+        return slice(source_start, None if source_stop < 0 else source_stop, source_step)
+
+    @staticmethod
+    def _preserve_dimension(index, size):
+        if isinstance(index, (int, np.integer)):
+            if index < 0:
+                index += size
+            return slice(index, index + 1, 1)
+        return index
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        if sum(item is Ellipsis for item in key) > 1:
+            raise IndexError('Only one ellipsis is allowed')
+        if Ellipsis in key:
+            position = key.index(Ellipsis)
+            missing = self.ndim - len(key) + 1
+            key = key[:position] + (slice(None),) * missing + key[position + 1:]
+        if len(key) < self.ndim:
+            key = key + (slice(None),) * (self.ndim - len(key))
+        if len(key) != self.ndim or any(item is None for item in key):
+            raise IndexError('Only basic indexing without new axes is supported')
+
+        source_key = [slice(None)] * self.ndim
+        spatial_axes = self._orientation.shape[0]
+        for output_axis, index in enumerate(key):
+            if output_axis < spatial_axes:
+                input_axis = int(self._transpose[output_axis])
+                flip = self._orientation[input_axis, 1]
+            else:
+                input_axis, flip = output_axis, 1
+            size = self._source_shape[input_axis]
+            if flip == -1:
+                # 先逆转调用方的切片顺序，再映射到翻转轴；随后
+                # apply_orientation 的翻转才会得到所请求的 canonical 序列。
+                if isinstance(index, slice):
+                    step = -1 if index.step is None else -index.step
+                    index = slice(index.stop, index.start, step)
+                index = self._reverse_index(index, size)
+            source_key[input_axis] = self._preserve_dimension(index, size)
+
+        # 整数索引也保留为单元素维度，先在小切片上应用完整方向变换。
+        # 源索引已经覆盖调用方的 slice，这里只需移除整数索引对应的维度。
+        data = self._dataobj[tuple(source_key)]
+        data = nib.orientations.apply_orientation(data, self._orientation)
+        output_key = tuple(
+            0 if isinstance(index, (int, np.integer)) else slice(None) for index in key
+        )
+        return data[output_key]
+
+
+def _canonical_triplane_slices(img):
+    """从 canonical NIfTI 直接读取三张中心切片，避免实例化完整体积。"""
+    orientation = nib.io_orientation(img.affine)
+    if np.array_equal(orientation, [[0, 1], [1, 1], [2, 1]]):
+        img_canonical = img
+    else:
+        lazy_data = _LazyReorientedData(img.dataobj, orientation, img.shape)
+        canonical_affine = img.affine.dot(
+            nib.orientations.inv_ornt_aff(orientation, img.shape)
+        )
+        img_canonical = nib.Nifti1Image(lazy_data, canonical_affine, img.header)
+
+    if len(img_canonical.shape) < 3:
+        raise ValueError(f'Expected at least 3D data, got shape={img_canonical.shape}')
+
+    shape = img_canonical.shape[:3]
+    trailing = (0,) * (len(img_canonical.shape) - 3)
+
+    def read_slice(axis, index):
+        spatial = [slice(None), slice(None), slice(None)]
+        spatial[axis] = index
+        data = np.asarray(img_canonical.dataobj[tuple(spatial) + trailing])
+        data = np.squeeze(data)
+        if data.ndim != 2:
+            raise ValueError(f'Expected a 2D triplane slice, got shape={data.shape}')
+        return data.astype(np.float32, copy=False)
+
+    # canonical volume is (X, Y, Z)；显示布局与原有整卷路径完全一致。
+    axial = read_slice(2, shape[2] // 2)
+    sagittal = read_slice(0, shape[0] // 2)
+    coronal = read_slice(1, shape[1] // 2)
+    return (
+        img_canonical,
+        np.transpose(axial, (1, 0))[::-1, ::-1],
+        np.transpose(sagittal, (1, 0))[::-1, ::-1],
+        np.transpose(coronal, (1, 0))[::-1, ::-1],
+    )
+
+
 def _generate_3d_triplane_preview(
     preview_file: str,
     series_dir: str,
@@ -1201,55 +1322,27 @@ def _generate_3d_triplane_preview(
         raw_orientation = _get_orientation_from_dcm(sample_dcm)
         orientation = normalize_orientation(raw_orientation, sample_dcm)
 
-        # 加载原始3D数据用于提取三视图（使用nibabel canonical格式）
-        # P2 优化：移除冗余的 _load_3d_volume 调用。该函数会完整加载 NIfTI/NPZ 体积到内存，
-        # 但下方的 NIfTI/NPZ 分支又会重新加载一次，导致同一个文件被加载两次。
-        # 改为直接让各分支自行加载，避免重复内存分配和 I/O。
+        # NIfTI 正常路径只读取三张中心切片；不再为三视图实例化完整首卷/体积。
         if preview_file.endswith(('.nii', '.nii.gz')):
             img = nib.load(preview_file)
-            if len(img.shape) > 3:
-                try:
-                    slicer = (slice(None), slice(None), slice(None)) + (0,) * (len(img.shape) - 3)
-                    first_volume = np.asarray(img.dataobj[slicer])
-                    while first_volume.ndim > 3:
-                        first_volume = first_volume[..., 0]
-                    img = nib.Nifti1Image(first_volume, img.affine)
-                except Exception:
-                    pass
-
             try:
-                img_canonical = nib.as_closest_canonical(img)
-                # 优化：使用 dataobj 避免 get_fdata() 的 float64 全量转换和内存拷贝。
-                # get_fdata() 会返回 float64 并应用 scl_slope/scl_inter，对大体积（如 512x512x594）
-                # 会分配 ~1GB 内存。dataobj 保持原始 dtype（如 int16），内存占用仅 1/4。
-                # np.asarray(dataobj) 触发数据加载，但避免了不必要的类型转换。
-                raw_volume = np.asarray(img_canonical.dataobj)
-                while raw_volume.ndim > 3:
-                    raw_volume = raw_volume[..., 0]
-                volume = raw_volume.astype(np.float32)
+                img_canonical, slice_axial, slice_sagittal, slice_coronal = \
+                    _canonical_triplane_slices(img)
+                volume_shape = img_canonical.shape[:3]
             except Exception:
-                volume = np.asarray(img.get_fdata()).astype(np.float32)
+                # 特殊损坏文件的兼容兜底；正常数据不会承担这次整卷分配。
+                try:
+                    img_canonical = nib.as_closest_canonical(img)
+                except Exception:
+                    img_canonical = img
+                volume = np.asarray(img_canonical.get_fdata()).astype(np.float32)
                 while volume.ndim > 3:
                     volume = volume[..., 0]
-
-            # canonical volume is (X, Y, Z)
-            # X: Left->Right, Y: Posterior->Anterior, Z: Inferior->Superior
-            mid_x = volume.shape[0] // 2
-            mid_y = volume.shape[1] // 2
-            mid_z = volume.shape[2] // 2
-
-            # 提取三个正交切片的中间层面
-            # Axial (横断位): Z轴中间
-            slice_axial = volume[:, :, mid_z]
-            slice_axial = np.transpose(slice_axial, (1, 0))[::-1, ::-1]
-
-            # Sagittal (矢状位): X轴中间
-            slice_sagittal = volume[mid_x, :, :]
-            slice_sagittal = np.transpose(slice_sagittal, (1, 0))[::-1, ::-1]
-
-            # Coronal (冠状位): Y轴中间
-            slice_coronal = volume[:, mid_y, :]
-            slice_coronal = np.transpose(slice_coronal, (1, 0))[::-1, ::-1]
+                volume_shape = volume.shape
+                mid_x, mid_y, mid_z = (size // 2 for size in volume_shape)
+                slice_axial = np.transpose(volume[:, :, mid_z], (1, 0))[::-1, ::-1]
+                slice_sagittal = np.transpose(volume[mid_x, :, :], (1, 0))[::-1, ::-1]
+                slice_coronal = np.transpose(volume[:, mid_y, :], (1, 0))[::-1, ::-1]
 
         elif preview_file.endswith('.npz'):
             with np.load(preview_file) as npz:
@@ -1261,9 +1354,10 @@ def _generate_3d_triplane_preview(
                     return None
 
             # npz data is saved as (Z, Y, X)
-            mid_z = volume.shape[0] // 2
-            mid_y = volume.shape[1] // 2
-            mid_x = volume.shape[2] // 2
+            volume_shape = volume.shape
+            mid_z = volume_shape[0] // 2
+            mid_y = volume_shape[1] // 2
+            mid_x = volume_shape[2] // 2
 
             # 提取三个正交切片的中间层面
             slice_axial = volume[mid_z, :, :]
@@ -1273,7 +1367,7 @@ def _generate_3d_triplane_preview(
             return None
 
         # 获取总层数
-        total_slices = volume.shape[2] if preview_file.endswith(('.nii', '.nii.gz')) else volume.shape[0]
+        total_slices = volume_shape[2] if preview_file.endswith(('.nii', '.nii.gz')) else volume_shape[0]
 
         # 应用窗宽窗位
         slice_axial = apply_windowing(slice_axial, sample_dcm, modality)
@@ -1282,13 +1376,13 @@ def _generate_3d_triplane_preview(
 
         # 获取各方向的实际层数，用于判断原始采集方向
         if preview_file.endswith(('.nii', '.nii.gz')):
-            n_axial = volume.shape[2]  # Z方向层数
-            n_sagittal = volume.shape[0]  # X方向层数
-            n_coronal = volume.shape[1]  # Y方向层数
+            n_axial = volume_shape[2]  # Z方向层数
+            n_sagittal = volume_shape[0]  # X方向层数
+            n_coronal = volume_shape[1]  # Y方向层数
         else:  # npz
-            n_axial = volume.shape[0]  # Z方向层数
-            n_sagittal = volume.shape[2]  # X方向层数
-            n_coronal = volume.shape[1]  # Y方向层数
+            n_axial = volume_shape[0]  # Z方向层数
+            n_sagittal = volume_shape[2]  # X方向层数
+            n_coronal = volume_shape[1]  # Y方向层数
 
         # 判断原始采集方向：层数最少的方向是扫描层厚方向（原始采集方向）
         layer_counts = {'axial': n_axial, 'sagittal': n_sagittal, 'coronal': n_coronal}

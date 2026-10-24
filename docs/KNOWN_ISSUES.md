@@ -142,3 +142,23 @@ PJT059原1025层与153层厚重建在原物理框架下对齐但共享解剖方�
 2026-10-23补充验收：当前生产Python3.12／eventlet／实际生产转换器副本的独立快照全集154通过、0跳过、0失败，源码绑定一致且生产4文件SHA前后未变；无全局包安装、部署或重启。这取代“仅本地152／2跳过”作为候选补丁运行环境证据，~~生产切换及Windows实证仍pending~~。
 
 **2026-10-23 生产切换已完成（193）**：队列空闲窗口部署 convert.py/constants.py（md5 与本地补丁一致），`backups/pre_v4_20261023_convert_constants.tar.gz` 留存 v3 备份；生产解释器对部署后源码跑核心回归（test_ct_source_completeness/orientation_fix/conversion_failures/d24_delivery/organize_cached_modality/mr_clean_exclusions）**131 通过／0 失败／0 跳过**（eventlet 专项真实执行）。旧 PID 544624 精确 SIGTERM 后确认退出，新实例 PID 2223784 监听 5005，HTTP 200、PACS connected，`CONVERSION_GEOMETRY_VERSION='20261023-complete-ct-source-geometry-v4'` 生效（缓存指纹自动失配旧产物）。unified/metadata/preview 的 RF 补充此前已在产（SHA 核对一致）。**136 仍待用户手动更新**，正常生产下载路径验收（≤1024/>1024 层、斜位、缺片拒绝等）随真实任务持续观察。
+
+### K16. 多任务大体积 QC/预览的整卷副本导致内存墙风险 —— 已修复并部署193（2026-10-24）
+
+- 现场：193（46.8 GiB）运行多个服务，可用内存约 2.75–4.8 GiB、2 GiB swap 已满，但当前无持续 swap I/O；可查日志未见 OOM/MemoryError。DICOM 服务 RSS 约 1.5–2.5 GiB、VmHWM 5.2 GiB，任务间回落，未证明存在泄漏。
+- 根因：单序列 QC 先 `get_fdata()` 生成 float64 整卷，再转 float32、做全量 `np.isfinite` 和索引复制；三视图 canonical 后又复制 float32 整卷。默认 3 任务 × 每任务 2 converters，峰值可在阶段重叠时叠加。`MAX_PENDING_SERIES` 只管目录队列，不能限制这些数组。
+- 修复：见 D25。QC 延迟缩放并先抽样（浮点仍先过滤非有限值），三视图用懒重定向仅读取切片；全局重处理默认 2 槽并带低内存防叠加/单工作防饿死。代码审查曾发现 `np.asanyarray(dataobj)`、直接 canonical、NaN 抽样顺序及循环轴排列问题，均已补真实回归后解除。
+- 验证：166 passed / 2 skipped；48 方向逐一对照；512³ 非单位仿射基准 QC 2326→663 MiB、预览 920→168 MiB，p98/切片值一致。193 已同步全部改动并核对 md5，生产解释器 145 项回归全过后于 2026-10-24 重启（PID 2002530）；HTTP 200、PACS connected，客户端已自动重试原任务。136 未同步，生产内存峰值仍需随真实大体积任务持续观察。
+
+### K17. 下载恢复水位高于清理能力，C-MOVE 持锁永久等待 —— 已修复并部署193（2026-10-24）
+
+- 现象：重启后 3 个 running、6 个 pending，最早任务超过 2 小时停在 40% `Downloading DICOM files`，无 C-MOVE 网络连接；C-ECHO 正常、SCP 1235 在监听、HTTP 正常。
+- 根因：任务 519102102092CT 于 16:09:28 读到 `Disk free space low (129.65GB < 130.0GB). Pausing downloads until free >= 160.0GB...`，随后在 `_wait_for_disk_low()` 内持 `_cmove_lock` 等待。实际配置为下载暂停 130/恢复 160，但自动清理只在空闲 <60 或 results ≥180 时触发，且清理目标最多 70，不可能满足 160 的恢复条件。等待只记录一次日志，表现为“卡死”；与新增内存背压无关。
+- 处置：用户选择不删除文件，将 193 的 `DOWNLOAD_LOW_WATERMARK_GB` 改为 100、`DOWNLOAD_HIGH_WATERMARK_GB` 改为 120（当前空闲约 129.7，重启即恢复）；`_wait_for_disk_low` 增加每 5 分钟等待日志。`test/test_disk_backpressure.py` 覆盖恢复线和周期日志。
+- 验证：本地 168 passed / 2 skipped，生产解释器 147 passed；193 新 PID 2676150。重启后 C-MOVE、转换和 ZIP 均恢复，M20091202427 已完成，其他任务继续推进。D10 已记录水位一致性要求；136 未同步。
+
+### K18. 136 旧版 X-ray 全黑/全白/XY 颠倒 —— 当前193未复现，已补交付门禁（2026-10-24）
+
+- 用户报告：Z21050200397 的 V04_0016/V04_0014 全黑，Z24031801632 与 Z21051000117 胸部横向/XY 颠倒，Z21052001013 全白。`logs/app (4).log` 未覆盖这些检查，无法从该文件还原旧处理链。
+- 从193重下四个检查并逐张读取预览与主 NIfTI：均为正常直立胸片，灰度分布非恒定，方向无横向；旧问题在当前版本未复现。Z21051000117 目录中的 `*_ROI1.nii.gz` 是 ROI 而非主图，不能误作主图比较。
+- 决策见 D26：真正空白源图放弃、不可信归一化回退、最终失败不交付、NPZ/源文件递归清理且 fail closed。新增回归 175 passed / 2 skipped，终审无阻断项。193 已完成同步、生产解释器 154 项回归并重启（PID 3086791），新缓存/水位配置同时生效，重启后已有 3 个任务完成。136 仍是旧版，需用户手动同步后才能获得这些保证。

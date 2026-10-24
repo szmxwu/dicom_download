@@ -63,7 +63,7 @@ def partial_dcm2niix(monkeypatch):
         if name.endswith('0002'):
             return SimpleNamespace(returncode=1, stdout='', stderr='simulated WinError 32')
         target = Path(cmd[cmd.index('-o') + 1]) / (name + '.nii.gz')
-        nib.save(nib.Nifti1Image(np.ones((16, 16, 1)), np.eye(4)), target)
+        nib.save(nib.Nifti1Image(np.arange(256, dtype=np.float32).reshape(16, 16, 1), np.eye(4)), target)
         return SimpleNamespace(returncode=0, stdout='', stderr='')
     monkeypatch.setattr(convert, '_run_subprocess_with_timeout', run)
     monkeypatch.setattr(convert.time, 'sleep', lambda _: None)
@@ -237,3 +237,116 @@ def test_windows_timeout_kills_tree_before_parent(monkeypatch, taskkill_fails):
     result = convert._run_native_subprocess(['synthetic'], .1)
     assert result.returncode == -1
     assert calls == (['taskkill', 'kill'] if taskkill_fails else ['taskkill'])
+
+
+def test_python_libs_rejects_truly_blank_xray(study):
+    client, folder, files, ds = study
+    blank = pydicom.dcmread(files[1])
+    blank.PixelData = np.full(256, 4095, dtype=np.uint16).tobytes()
+    blank.save_as(files[1])
+
+    result = convert.convert_with_python_libs(client, str(folder), 'DX', files, ds, 'DX')
+
+    assert result['success'] is False
+    assert result['file_count'] == 1
+    assert all(Path(path).exists() for path in files)
+
+
+def test_python_libs_accepts_nonblank_pixels_with_tiny_rescale_slope(study):
+    client, folder, files, ds = study
+    tiny = pydicom.dcmread(files[0])
+    tiny.RescaleSlope = 1e-9
+    tiny.save_as(files[0])
+
+    result = convert.convert_with_python_libs(client, str(folder), 'DX', files, ds, 'DX')
+
+    assert result['success'] is True
+    assert result['file_count'] == 2
+
+
+def test_dcm2niix_rejects_unverified_normalization(study, monkeypatch):
+    client, folder, files, ds = study
+    def run(cmd, **kwargs):
+        if '-h' in cmd:
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        name = cmd[cmd.index('-f') + 1]
+        target = Path(cmd[cmd.index('-o') + 1]) / (name + '.nii.gz')
+        data = np.arange(256, dtype=np.float32).reshape(16, 16, 1)
+        nib.save(nib.Nifti1Image(data, np.eye(4)), target)
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+    monkeypatch.setattr(convert, '_run_subprocess_with_timeout', run)
+    monkeypatch.setattr(
+        convert, 'normalize_2d_nifti_display',
+        lambda *args, **kwargs: {'action': 'not_verifiable', 'message': 'synthetic mismatch'}
+    )
+
+    result = convert.convert_with_dcm2niix(client, str(folder), 'DX', files, ds, 'DX')
+
+    assert result['success'] is False
+    assert result['file_count'] == 0
+    assert all(Path(path).exists() for path in files)
+
+
+def test_npz_fallback_removes_sources_and_intermediate_nifti(study, monkeypatch):
+    client, folder, files, ds = study
+    partial_dcm2niix(monkeypatch)
+    client._assess_series_quality_converted = lambda *args, **kwargs: {
+        'low_quality': 0, 'low_quality_ratio': 0.0,
+        'qc_mode': 'sample', 'qc_sample_indices': [0],
+    }
+
+    result = convert.convert_to_npz(client, str(folder), 'DX', files, ds, 'DX')
+
+    assert result['success'] is True
+    assert len(result['output_files']) == 2
+    assert not list(folder.rglob('*.dcm'))
+    assert not list(folder.rglob('*.nii.gz'))
+    assert all((folder / name).is_file() for name in result['output_files'])
+
+
+def test_npz_fails_closed_when_rejected_nifti_cannot_be_removed(study, monkeypatch):
+    client, folder, files, ds = study
+    client._assess_series_quality_converted = lambda *args, **kwargs: {
+        'low_quality': 0, 'low_quality_ratio': 0.0,
+        'qc_mode': 'sample', 'qc_sample_indices': [0],
+    }
+    def run(cmd, **kwargs):
+        if '-h' in cmd:
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        name = cmd[cmd.index('-f') + 1]
+        target = Path(cmd[cmd.index('-o') + 1]) / (name + '.nii.gz')
+        data = np.arange(256, dtype=np.float32).reshape(16, 16, 1)
+        nib.save(nib.Nifti1Image(data, np.eye(4)), target)
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+    monkeypatch.setattr(convert, '_run_subprocess_with_timeout', run)
+    monkeypatch.setattr(
+        convert, 'normalize_2d_nifti_display',
+        lambda *args, **kwargs: {'action': 'not_verifiable', 'message': 'synthetic mismatch'}
+    )
+    original_remove = convert.os.remove
+    def locked_nifti(path):
+        if str(path).endswith('.nii.gz'):
+            raise PermissionError('synthetic file lock')
+        return original_remove(path)
+    monkeypatch.setattr(convert.os, 'remove', locked_nifti)
+
+    result = convert.convert_to_npz(client, str(folder), 'DX', files, ds, 'DX')
+
+    assert result['success'] is False
+    assert list(folder.rglob('*.nii.gz'))
+
+
+def test_python_libs_removes_extensionless_sources(study):
+    client, folder, files, ds = study
+    extensionless = []
+    for index, path in enumerate(files):
+        target = folder / str(index)
+        Path(path).rename(target)
+        extensionless.append(str(target))
+
+    result = convert.convert_with_python_libs(
+        client, str(folder), 'DX', extensionless, ds, 'DX'
+    )
+
+    assert result['success'] is True
+    assert not any(Path(path).exists() for path in extensionless)

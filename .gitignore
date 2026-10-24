@@ -222,3 +222,5 @@ test/*
 
 !test/test_ct_source_completeness.py
 !test/verify_ct_geometry_v4_real_source.py
+!test/test_memory_pipeline.py
+!test/test_disk_backpressure.py

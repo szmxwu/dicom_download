@@ -70,6 +70,25 @@ Key behavior:
 - Items newer than `CLEANUP_MIN_AGE_MINUTES` are skipped.
 - Oldest items (by modification time `mtime`) are deleted first until usage falls below `CLEANUP_TARGET_GB`.
 
+### Memory-aware Processing
+Conversion, preview generation, and metadata QC share a global heavy-work gate across tasks. This limits peak memory without stopping PACS reception; the existing pending-series queue continues to provide producer backpressure.
+
+```ini
+# Maximum concurrent conversion/preview/metadata-QC units (default 2)
+HEAVY_PROCESSING_MAX_WORKERS=2
+# Defer additional heavy work below this available-memory level (GiB, default 2.0)
+MEMORY_MIN_AVAILABLE_GB=2.0
+# Pause PACS downloads below 40 GiB free; resume at 60 GiB free
+DOWNLOAD_LOW_WATERMARK_GB=40
+DOWNLOAD_HIGH_WATERMARK_GB=60
+# Trigger old-result cleanup below 50 GiB free (resumes at 60 GiB)
+CLEANUP_MIN_FREE_GB=50
+# Large cache allowance for a dedicated download host
+CACHE_MAX_GB=180
+```
+
+One heavy operation is always allowed to make progress, even below the threshold, so a persistently busy host cannot starve the pipeline. If `psutil` is unavailable, Linux uses `/proc/meminfo`; on other platforms without `psutil`, only the worker limit is enforced. `NUM_CONVERTERS` remains the per-task converter setting.
+
 ### Metadata Templates
 You can customize the DICOM tags extracted for each modality by editing the JSON files in the `dicom_tags/` directory:
 - `mr.json`: MRI

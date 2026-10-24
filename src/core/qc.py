@@ -445,7 +445,8 @@ def assess_image_quality(dcm, modality: Optional[str] = None) -> ImageQualityRes
 
 def assess_image_quality_from_array(
     pixel_data: np.ndarray,
-    modality: Optional[str] = None
+    modality: Optional[str] = None,
+    rescale: Optional[Tuple[float, float]] = None
 ) -> ImageQualityResult:
     """
     从像素数组评估图像质量
@@ -460,6 +461,7 @@ def assess_image_quality_from_array(
     Args:
         pixel_data: 像素数据数组
         modality: 模态代码 (CT, MR, DX, etc.)，用于选择不同阈值
+        rescale: 可选的 (slope, intercept)，仅对统计样本和中间层应用缩放
 
     Returns:
         ImageQualityResult: 质量评估结果
@@ -480,19 +482,30 @@ def assess_image_quality_from_array(
                 metrics=metrics
             )
 
-        pixel_data = np.asarray(pixel_data, dtype=np.float32)
-        flat = pixel_data[np.isfinite(pixel_data)].ravel()
-        
+        # 保留原数组供中间层分割掩码检测。延续旧规则：先过滤非有限值，
+        # 再等距抽样；整数类型天然全部有限，可跳过整卷布尔掩码和索引副本。
+        pixel_data = np.asarray(pixel_data)
+        flat = pixel_data.ravel()
+        if np.issubdtype(flat.dtype, np.inexact):
+            flat = flat[np.isfinite(flat)]
+        if flat.size > 200000:
+            flat = flat[:: max(1, flat.size // 200000)]
+
+        # NIfTI 的 slope/intercept 只在样本上计算，避免非单位缩放生成
+        # float64 整卷。直接输入的 DICOM/NPZ 已完成各自缩放，无需此步骤。
+        if rescale is not None:
+            slope, intercept = rescale
+            flat = np.asarray(flat, dtype=np.float64) * slope + intercept
+        flat = np.asarray(flat, dtype=np.float32)
+        if rescale is not None:
+            flat = flat[np.isfinite(flat)]
+
         if flat.size == 0:
             return ImageQualityResult(
                 is_low_quality=True,
                 reasons=[QualityReasons.EMPTY_DATA],
                 metrics=metrics
             )
-
-        # 大数据集时进行采样以提高性能
-        if flat.size > 200000:
-            flat = flat[:: max(1, flat.size // 200000)]
 
         # 获取百分位阈值
         p_low = thresholds.get('percentile_low', 2.0)
@@ -627,8 +640,21 @@ def assess_image_quality_from_array(
             bright_thresh = seg_thresholds.get('seg_bright_threshold', 0.05)
             components_thresh = seg_thresholds.get('seg_max_components', 10)
 
+            # 旧实现对完整体积转 float32 后只检查中间层；现在仅转换该层，
+            # 数值与检测规则不变，非单位 NIfTI 缩放也只应用到这个 2D 切片。
+            segmentation_data = pixel_data
+            if pixel_data.ndim == 3:
+                segmentation_data = pixel_data[:, :, pixel_data.shape[2] // 2]
+            if pixel_data.ndim in (2, 3):
+                if rescale is not None:
+                    slope, intercept = rescale
+                    segmentation_data = (
+                        np.asarray(segmentation_data, dtype=np.float64) * slope + intercept
+                    )
+                segmentation_data = np.asarray(segmentation_data, dtype=np.float32)
+
             is_seg, seg_details = is_segmentation_mask(
-                pixel_data,
+                segmentation_data,
                 bright_threshold=bright_thresh,
                 max_components_threshold=components_thresh
             )
@@ -668,33 +694,41 @@ def detect_nifti_orientation_error(
     Returns:
         bool: 恒为 False
     """
+    # 2D X-ray 的显示方向已在转换阶段保证正确：
+    # convert.normalize_2d_nifti_display 用源 DICOM 像素探针实测归一化布局，
+    # python-libs 路径原生即为 DICOM 布局。此处任何基于"缺 IOP"或仿射形状的
+    # 启发式翻转都会二次翻转正确的数组（生产事故：M20112002685 全脊柱预览
+    # 头脚颠倒；归一化仿射恰为轴交换形态，会被旧的 y_axis_x>y_axis_y 规则误杀）。
+    # 因此本函数保留签名但不再判定方向，也绝不为此加载整卷像素。
+    return False
+
+
+def _nifti_data_and_rescale(img):
+    """读取未缩放数据，并把 NIfTI 缩放延迟到 QC 样本/中间层。"""
+    dataobj = img.dataobj
+    get_unscaled = getattr(dataobj, 'get_unscaled', None)
+    if callable(get_unscaled):
+        data = np.asanyarray(get_unscaled())
+        slope = getattr(dataobj, 'slope', 1.0)
+        intercept = getattr(dataobj, 'inter', 0.0)
+    else:
+        data = np.asanyarray(dataobj)
+        slope, intercept = img.header.get_slope_inter()
+
     try:
-        modality = (modality or '').upper()
-        
-        # 只对2D X-ray模态进行检测（MG 钼靶同样是 2D 摄影，缺 IOP 时 dcm2niix 也会翻转）
-        if modality not in ['DX', 'DR', 'CR', 'RF', 'MG']:
-            return False
-        
-        data = img.get_fdata()
-        
-        # 只检查2D或伪3D（第三维为1）的图像
-        if data.ndim == 2:
-            pass
-        elif data.ndim == 3 and data.shape[2] == 1:
-            pass
-        else:
-            return False
-
-        # 2D X-ray 的显示方向已在转换阶段保证正确：
-        # convert.normalize_2d_nifti_display 用源 DICOM 像素探针实测归一化布局，
-        # python-libs 路径原生即为 DICOM 布局。此处任何基于"缺 IOP"或仿射形状的
-        # 启发式翻转都会二次翻转正确的数组（生产事故：M20112002685 全脊柱预览
-        # 头脚颠倒；归一化仿射恰为轴交换形态，会被旧的 y_axis_x>y_axis_y 规则误杀）。
-        # 因此本函数保留签名但不再判定 2D 方向错误。
-        return False
-
-    except Exception:
-        return False
+        slope = float(slope)
+    except (TypeError, ValueError):
+        slope = 1.0
+    try:
+        intercept = float(intercept)
+    except (TypeError, ValueError):
+        intercept = 0.0
+    if not np.isfinite(slope):
+        slope = 1.0
+    if not np.isfinite(intercept):
+        intercept = 0.0
+    rescale = None if slope == 1.0 and intercept == 0.0 else (slope, intercept)
+    return data, rescale
 
 
 def assess_converted_file_quality(
@@ -737,6 +771,7 @@ def assess_converted_file_quality(
                 except Exception:
                     pass
         
+        rescale = None
         if filepath.endswith('.npz'):
             with np.load(filepath) as npz:
                 if 'data' in npz.files:
@@ -751,11 +786,11 @@ def assess_converted_file_quality(
                     )
             # NPZ 文件不受 dcm2niix bug 影响
             orientation_error = False
-            
+
         elif filepath.endswith(('.nii', '.nii.gz')):
             img = nib.load(filepath)
-            data = img.get_fdata()
-            
+            data, rescale = _nifti_data_and_rescale(img)
+
             # 检测NIfTI方向错误（dcm2niix bug）
             orientation_error = False
             if check_orientation:
@@ -767,7 +802,7 @@ def assess_converted_file_quality(
                 metrics={'filepath': filepath, 'extension': os.path.splitext(filepath)[1]}
             )
 
-        result = assess_image_quality_from_array(data, modality)
+        result = assess_image_quality_from_array(data, modality, rescale=rescale)
         
         # 检查assess_image_quality_from_array是否检测到灰度反转
         grayscale_inverted = QualityReasons.GRAYSCALE_INVERTED in result.reasons
