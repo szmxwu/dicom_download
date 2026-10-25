@@ -85,9 +85,13 @@ DOWNLOAD_HIGH_WATERMARK_GB=60
 CLEANUP_MIN_FREE_GB=50
 # Large cache allowance for a dedicated download host
 CACHE_MAX_GB=180
+# Cache also evicts LRU entries when free disk falls below this level
+CACHE_MIN_FREE_GB=60
 ```
 
 One heavy operation is always allowed to make progress, even below the threshold, so a persistently busy host cannot starve the pipeline. If `psutil` is unavailable, Linux uses `/proc/meminfo`; on other platforms without `psutil`, only the worker limit is enforced. `NUM_CONVERTERS` remains the per-task converter setting.
+
+**Client reconnect recovery:** server workflows continue after a client disconnect. Resubmitting the same accession with identical options reuses the running task (`status='existing'`, `reused=True`) instead of downloading twice; after completion, the same request loads the result from disk cache. Interrupting a ZIP download does not invalidate the cached result.
 
 ### Metadata Templates
 You can customize the DICOM tags extracted for each modality by editing the JSON files in the `dicom_tags/` directory:

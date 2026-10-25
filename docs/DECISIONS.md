@@ -138,3 +138,11 @@ CTA017真实完整DICOM及1,024/1,025层边界实验确认dcm2niix超1,024层提
 - `_drop_failed_series_files` 同步递归并 fail closed，避免“只删顶层、失败仍打包”的隐私与质量缺口。
 
 回归覆盖空白、小 slope、不可信归一化、锁定拒绝输出、无后缀源文件、NPZ 回退与递归清理，全套 175 passed / 2 skipped，独立终审无 Critical/Important。193 已部署并重启（PID 3086791），生产解释器 154 项回归全过。
+
+### D27. 客户端断连不影响服务端续跑；任务去重与缓存自愈（2026-10-25）
+
+保持现有无状态客户端模型：服务端工作流不依赖轮询连接，完成后按 accession+options 保存缓存；客户端重跑时，运行中的同工作负载复用 task_id，完成后命中缓存，ZIP 下载中断不回滚缓存。`process_single` 在 `_task_lock` 临界区内原子查找并登记，pending/running 且未 `slot_released` 才复用，响应 `status='existing'`、`reused=True`，无需客户端协议修改或持久化数据库。
+
+缓存淘汰同时约束 `CACHE_MAX_GB` 和 `CACHE_MIN_FREE_GB`（默认跟随下载恢复线）：任一越线均按 atime 淘汰，直到容量与真实空闲均达标。删除后必须重新 `disk_usage` 采样，硬链接不能按逻辑大小虚增空闲量。save/copy 与 LRU 按 cache key 互斥，冲突时回退 PACS 或下轮重试；互斥锁在 eventlet 下必须来自 `original('threading')`，只允许微秒级状态操作。普通结果清理的 `finally` 和服务启动都会异步调度缓存维护，避免“没有普通可删项”阻断恢复。
+
+options 指纹补入 `auto_metadata/auto_organize/rename_mr_series/extra_derived_keywords`，防止不同交付语义错误合并；该变更使旧缓存键失配一次。回归覆盖并发重连、options 差异、容量/空闲双阈值、硬链接、活跃 IO 与 eventlet 原生锁竞争，全套 193 passed / 3 skipped。

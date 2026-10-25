@@ -224,3 +224,4 @@ test/*
 !test/verify_ct_geometry_v4_real_source.py
 !test/test_memory_pipeline.py
 !test/test_disk_backpressure.py
+!test/test_task_recovery.py

@@ -14,6 +14,7 @@ import stat
 import threading
 import time
 import logging
+from functools import wraps
 from typing import Optional, Dict
 
 from src.utils.offload import run_cpu_bound
@@ -129,7 +130,13 @@ def _compute_param_hash(accession_number: str, options: Dict) -> str:
         "exclude_derived": options.get("exclude_derived", True),
         "output_format": options.get("output_format", "nifti"),
         "conversion_geometry": CONVERSION_GEOMETRY_VERSION if options.get("output_format", "nifti") == "nifti" else None,
+        "auto_metadata": options.get("auto_metadata", True),
+        "auto_organize": options.get("auto_organize", True),
+        "rename_mr_series": options.get("rename_mr_series", False),
         "derived_keywords": sorted(str(k).upper() for k in task_keywords) if task_keywords else None,
+        "extra_derived_keywords": sorted(
+            str(k).upper() for k in options.get("extra_derived_keywords") or []
+        ) or None,
         "filter_rules": get_filter_rules_fingerprint(),
     }
     param_str = json.dumps(params, sort_keys=True, ensure_ascii=False)
@@ -141,6 +148,71 @@ def get_cache_dir(results_base_dir: str, accession_number: str, options: Dict) -
     sanitized = _sanitize_accession(accession_number)
     param_hash = _compute_param_hash(accession_number, options)
     return os.path.join(results_base_dir, CACHE_DIR_NAME, f"{sanitized}_{param_hash}")
+
+
+# 缓存读写与 LRU 淘汰的互斥状态。锁只保护微秒级集合操作，
+# 但会同时被 eventlet greenlet 和 tpool 真实线程使用，必须是真实 OS 锁，
+# 不能是 monkey-patched green Lock（D19 的 lost-wakeup 死锁风险）。
+def _create_cache_state_lock():
+    try:
+        from eventlet.patcher import is_monkey_patched, original
+        if is_monkey_patched('thread'):
+            return original('threading').Lock()
+    except ImportError:
+        pass
+    return threading.Lock()
+
+
+_cache_state_lock = _create_cache_state_lock()
+_cache_active_paths = set()
+_cache_evicting_paths = set()
+
+
+def _cache_path_key(path):
+    return os.path.abspath(path)
+
+
+def _try_mark_cache_active(path):
+    key = _cache_path_key(path)
+    with _cache_state_lock:
+        if key in _cache_evicting_paths or key in _cache_active_paths:
+            return False
+        _cache_active_paths.add(key)
+        return True
+
+
+def _unmark_cache_active(path):
+    with _cache_state_lock:
+        _cache_active_paths.discard(_cache_path_key(path))
+
+
+def _try_mark_evicting(path):
+    key = _cache_path_key(path)
+    with _cache_state_lock:
+        if key in _cache_active_paths or key in _cache_evicting_paths:
+            return False
+        _cache_evicting_paths.add(key)
+        return True
+
+
+def _unmark_evicting(path):
+    with _cache_state_lock:
+        _cache_evicting_paths.discard(_cache_path_key(path))
+
+
+def _cache_operation_guard(func):
+    """保存/读取与 LRU 删除互斥；冲突时安全回退到 PACS 或下次重试。"""
+    @wraps(func)
+    def wrapper(cache_dir, *args, **kwargs):
+        if not _try_mark_cache_active(cache_dir):
+            if func.__name__ == 'save_to_cache':
+                return False
+            return {'success': False, 'error': 'cache operation in progress'}
+        try:
+            return func(cache_dir, *args, **kwargs)
+        finally:
+            _unmark_cache_active(cache_dir)
+    return wrapper
 
 
 def cache_exists(cache_dir: str) -> bool:
@@ -159,6 +231,7 @@ def cache_exists(cache_dir: str) -> bool:
     return valid
 
 
+@_cache_operation_guard
 def copy_from_cache(cache_dir: str, target_dir: str, task_id: str) -> Dict:
     """从缓存复制结果到任务目录。"""
     organized_dir = os.path.join(cache_dir, "organized")
@@ -222,6 +295,7 @@ def copy_from_cache(cache_dir: str, target_dir: str, task_id: str) -> Dict:
     }
 
 
+@_cache_operation_guard
 def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = None,
                   excel_path: Optional[str] = None) -> bool:
     """将任务结果保存到缓存目录。"""
@@ -286,6 +360,16 @@ def get_cache_max_gb() -> float:
         return DEFAULT_CACHE_MAX_GB
 
 
+def get_cache_min_free_gb() -> float:
+    """缓存需要协助恢复的磁盘空闲水位（GB），默认跟随下载恢复线。"""
+    try:
+        default = os.getenv('DOWNLOAD_HIGH_WATERMARK_GB', '45')
+        value = float(os.getenv('CACHE_MIN_FREE_GB', default))
+        return value if value >= 0 else 0.0
+    except Exception:
+        return 0.0
+
+
 def enforce_cache_limit(cache_base: str, async_run: bool = True) -> int:
     """LRU 淘汰入口：缓存超限时从最旧访问的条目开始删除。
 
@@ -348,6 +432,12 @@ def _evict_lru_sync(cache_base: str) -> int:
 
     max_gb = get_cache_max_gb()
     limit_bytes = max_gb * (1024 ** 3)
+    min_free_gb = get_cache_min_free_gb()
+    target_free_bytes = min_free_gb * (1024 ** 3)
+    try:
+        free_bytes = shutil.disk_usage(cache_base).free
+    except Exception:
+        free_bytes = None
 
     entries = []
     total_bytes = 0
@@ -367,11 +457,13 @@ def _evict_lru_sync(cache_base: str) -> int:
         logger.warning(f"[CACHE] Failed to scan cache for LRU: {e}")
         return 0
 
-    if total_bytes <= limit_bytes:
+    if total_bytes <= limit_bytes and (free_bytes is None or free_bytes >= target_free_bytes):
         return 0
 
+    free_desc = 'unknown' if free_bytes is None else f'{free_bytes / (1024**3):.2f}'
     logger.info(
-        f"[CACHE] Cache size {total_bytes / (1024**3):.2f}GB exceeds limit {max_gb}GB, starting LRU eviction"
+        f"[CACHE] Starting LRU eviction: cache={total_bytes / (1024**3):.2f}GB "
+        f"(limit={max_gb}GB), free={free_desc}GB (target={min_free_gb}GB)"
     )
     entries.sort(key=lambda x: x[0])  # 最旧访问的在前
 
@@ -379,11 +471,15 @@ def _evict_lru_sync(cache_base: str) -> int:
     skipped_locked = 0
     now = time.time()
     for _atime, size, path in entries:
-        if total_bytes <= limit_bytes:
+        if total_bytes <= limit_bytes and (free_bytes is None or free_bytes >= target_free_bytes):
             break
         # 冷却期内跳过此前删不掉的条目（文件被 Excel/杀毒/索引器占用等）
         last_fail = _evict_failures.get(path)
         if last_fail is not None and now - last_fail < _EVICT_FAIL_COOLDOWN_SEC:
+            skipped_locked += 1
+            continue
+        if not _try_mark_evicting(path):
+            # 正在保存/读取或另一轮淘汰中的条目留到下一轮，避免半成品缓存。
             skipped_locked += 1
             continue
         try:
@@ -406,12 +502,21 @@ def _evict_lru_sync(cache_base: str) -> int:
                 hint = _find_readonly_file(path)
                 extra = f" [诊断: 存在只读文件 {hint}]" if hint else " [诊断: 非只读问题，文件可能被外部进程(Excel/杀毒/索引器)占用或 ACL 拒绝]"
                 logger.warning(f"[CACHE] Failed to evict {path}: {e}{extra}")
+        finally:
+            _unmark_evicting(path)
+            try:
+                # 硬链接可能让删除逻辑目录并不释放空间，必须重新采样真实空闲量。
+                free_bytes = shutil.disk_usage(cache_base).free
+            except Exception:
+                free_bytes = None
 
     if evicted or skipped_locked:
+        final_free_desc = 'unknown' if free_bytes is None else f'{free_bytes / (1024**3):.2f}'
         logger.info(
             f"[CACHE] LRU eviction done: removed {evicted} entries, "
             f"skipped {skipped_locked} locked entries (cooldown), "
-            f"cache now {total_bytes / (1024**3):.2f}GB (limit {max_gb}GB)"
+            f"cache now {total_bytes / (1024**3):.2f}GB (limit {max_gb}GB), "
+            f"free={final_free_desc}GB (target={min_free_gb}GB)"
         )
     return evicted
 

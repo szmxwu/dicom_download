@@ -99,7 +99,7 @@ from src.utils.packaging import create_result_zip
 from src.utils.offload import run_cpu_bound
 from src.utils.cache import (
     get_cache_dir, cache_exists, copy_from_cache,
-    save_to_cache, clear_all_cache, get_cache_stats,
+    save_to_cache, clear_all_cache, get_cache_stats, enforce_cache_limit,
     CACHE_DIR_NAME
 )
 from src.core.constants import (
@@ -209,7 +209,7 @@ _running_task_count = 0
 
 # 全局变量存储处理任务
 processing_tasks = {}
-_task_lock = threading.Lock()  # 任务字典锁，防止竞态条件
+_task_lock = threading.RLock()  # 任务字典锁；允许查找并登记任务在同一临界区完成
 
 # 已完成任务缓存，避免每次请求全量序列化
 _completed_tasks_lock = threading.Lock()
@@ -826,6 +826,9 @@ def cleanup_old_results():
             )
     finally:
         _cleanup_lock.release()
+        # 普通结果清理没有可删项时，缓存 LRU 仍必须运行；否则缓存占满后
+        # 下载会永远等不到恢复水位。该调用内部异步并走 run_cpu_bound。
+        enforce_cache_limit(os.path.join(results_dir, CACHE_DIR_NAME))
 
 def check_and_cleanup_results():
     """检查并清理结果目录的后台任务"""
@@ -857,6 +860,8 @@ _periodic_cleanup_thread = threading.Thread(
     target=_periodic_disk_cleanup_loop, daemon=True, name='PeriodicDiskCleanup'
 )
 _periodic_cleanup_thread.start()
+# 启动即异步检查缓存容量和磁盘空闲，尽早解除下载背压，不在 hub 上同步删除。
+enforce_cache_limit(os.path.join(app.config['RESULT_FOLDER'], CACHE_DIR_NAME))
 
 class ProcessingTask:
     """处理任务类 - 修复版"""
@@ -1107,6 +1112,27 @@ def download_client_script():
     cli_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cli', file_name)
     return send_file(cli_path, as_attachment=True, download_name=file_name, mimetype='text/x-python')
 
+def _find_reusable_single_task(accession_number, options):
+    """查找客户端重连时可复用的同工作负载任务，避免重复 PACS 下载。"""
+    cache_dir = get_cache_dir(app.config['RESULT_FOLDER'], accession_number, options)
+    with _task_lock:
+        candidates = list(processing_tasks.values())
+    for task in candidates:
+        if task.task_type != 'single' or task.status not in ('pending', 'running'):
+            continue
+        if getattr(task, 'slot_released', False):
+            continue
+        params = task.parameters or {}
+        if params.get('accession_number') != accession_number:
+            continue
+        task_cache_dir = get_cache_dir(
+            app.config['RESULT_FOLDER'], accession_number, params.get('options') or {}
+        )
+        if task_cache_dir == cache_dir:
+            return task
+    return None
+
+
 @app.route('/api/process/single', methods=['POST'])
 def process_single():
     """处理单个AccessionNumber"""
@@ -1122,16 +1148,30 @@ def process_single():
         # INFO 级审计：记录提交来源与完整 options（历史上出现过客户端自定义
         # derived_keywords 覆盖默认列表导致过滤漏网，DEBUG 级日志无法事后溯源）
         logger.info(f"process_single submit: IP={request.remote_addr}, accession={accession_number}, options={options}")
-        
-        # 创建任务
-        task_id = str(uuid.uuid4())
-        task = ProcessingTask(task_id, 'single', {
-            'accession_number': accession_number,
-            'options': options
-        })
-        task.client_ip = request.remote_addr
-        
-        processing_tasks[task_id] = task
+
+        # 查找与登记必须在同一临界区，避免并发重试创建重复任务。
+        with _task_lock:
+            existing_task = _find_reusable_single_task(accession_number, options)
+            if existing_task is not None:
+                logger.info(
+                    f"Reusing task {existing_task.task_id} for reconnecting client "
+                    f"{request.remote_addr}, accession={accession_number}"
+                )
+                return jsonify({
+                    'task_id': existing_task.task_id,
+                    'status': 'existing',
+                    'reused': True,
+                    'message': f'复用进行中的任务，继续处理AccessionNumber: {accession_number}'
+                })
+
+            # 创建任务
+            task_id = str(uuid.uuid4())
+            task = ProcessingTask(task_id, 'single', {
+                'accession_number': accession_number,
+                'options': options
+            })
+            task.client_ip = request.remote_addr
+            processing_tasks[task_id] = task
 
         # 提交到任务队列
         if not _submit_task_to_queue(task):

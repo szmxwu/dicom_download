@@ -81,9 +81,13 @@ DOWNLOAD_HIGH_WATERMARK_GB=60
 CLEANUP_MIN_FREE_GB=50
 # 专用下载服务器的大缓存上限
 CACHE_MAX_GB=180
+# 磁盘空闲低于该值时，缓存也会按LRU淘汰旧条目
+CACHE_MIN_FREE_GB=60
 ```
 
 即使低于阈值，也始终允许一个重处理单元继续工作，避免共享服务器长期低内存导致流水线饿死。未安装 `psutil` 时，Linux 会读取 `/proc/meminfo`；其他平台若没有 `psutil`，则仅限制重处理并发数。`NUM_CONVERTERS` 仍表示单任务内的转换线程数。
+
+**客户端断线恢复**：客户端断连不会取消服务端任务。使用相同 AccessionNumber 和 options 重新提交时，若任务仍在运行，会复用原任务（`status='existing'`、`reused=True`），避免重复下载；任务完成后，相同请求直接从磁盘缓存读取。ZIP 下载中断不会使缓存失效。
 
 ### 元数据模板配置
 您可以通过编辑 `dicom_tags/` 目录下的 JSON 文件来自定义不同模态提取的 DICOM 标签：
