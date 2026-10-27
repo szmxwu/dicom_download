@@ -169,3 +169,15 @@ PJT059原1025层与153层厚重建在原物理框架下对齐但共享解剖方�
 - 根因：缓存上限扩至 180GB 后占满空间，LRU 只在保存后按容量淘汰，普通结果清理排除 cache；磁盘水位不足时下载持锁等待，客户端断连也无法解除。不是 PACS 故障，也不是新增内存闸门故障。
 - 修复：见 D27。LRU 同时按容量与 `CACHE_MIN_FREE_GB` 淘汰，并在启动及普通清理 `finally` 中异步执行；真实空闲重采样处理硬链接；save/copy 与淘汰互斥，锁为 eventlet 原生 OS 锁。运行中同 accession+options 复用任务，避免断连重试制造重复下载。
 - 验证：本地 193 passed / 3 skipped；193 生产解释器 173 passed（含 eventlet 专项）。新进程 PID 4066592，启动 LRU 淘汰 107 个旧缓存条目，空闲恢复至 60GB 以上（复核时 81.84GB），C-MOVE 与完成任务继续推进。真实重复提交复用原 task_id；M23110801983 重连后 `Completed (from cache)`，ZIP 下载 234,724,037 字节成功。
+
+### K20. 单序列几何标签为空导致 `float(NoneType)` —— 属源数据拒绝，非转换器故障（2026-10-25）
+
+- 案例：Z23063000083 的唯一序列 101_Unknown。dcm2niix 已生成 NIfTI，但 CT 几何核验在 `build_dicom_truth_affine()` 的单层步进计算中读取 `SliceThickness=None`，直接 `float(None)` 报错，最终按 `CT geometry not verified` 拒绝。
+- C-FIND 同样未返回 SliceThickness/PixelSpacing/IOP/IPP 等可选几何标签（PACS 不保证这些字段完整），说明属于源数据几何信息缺失/不完整，不能靠 dcm2niix 成功输出反推坐标可信。失败序列按隐私策略删除，整检查因唯一序列全部失败而失败，无 ZIP。
+- 阻断语义：部分序列失败不会株连整检查；有任一成功序列时任务部分成功，失败清单写入 `conversion_errors`。只有全部序列失败（本例仅 1 个）才使整个检查失败。若需处理此类数据，应补充可靠几何标签或明确人工可接受的回退规则，不能静默假定层厚。
+
+### K21. 结果 ZIP 权限异常导致 HTTP 回传 Permission denied —— 已修复（2026-10-27）
+
+- 现象：其他 agent 报告部分结果为 200（只写不可读），日志确认 Z24030601798、M21053102971 的下载请求连续 `PermissionError: [Errno 13] Permission denied`。排查时异常文件已于 15:27 被外部改为 600，279 个现存 ZIP 均可读，无法从日志唯一确定 200 的初始来源；进程 umask=0002，不是当前进程默认权限导致。
+- 修复：`create_result_zip` 完成后显式 `chmod 0o640`；缓存保存和缓存命中复制也显式设置 0o640，避免依赖 umask 或历史权限。新增生成与缓存权限回归。
+- 验证：本地 195 passed / 3 skipped，193 生产解释器 175 passed；重启 PID 313858。重新注册两个原失败检查后均 `Completed (from cache)`，HTTP HEAD 200（约 887MB/935MB），新结果 ZIP 权限均为 0o640。

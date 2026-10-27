@@ -101,4 +101,7 @@ def create_result_zip(
                 arc_name = os.path.basename(extra_path)
                 zipf.write(extra_path, arc_name)
 
+    # 结果 ZIP 必须可被服务进程和客户端回传读取；不要依赖启动环境 umask
+    # 或历史文件的异常权限（曾有 ZIP 变为 200，导致 HTTP 下载 Permission denied）。
+    os.chmod(zip_path, 0o640)
     return zip_path

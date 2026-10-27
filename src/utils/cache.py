@@ -252,6 +252,7 @@ def copy_from_cache(cache_dir: str, target_dir: str, task_id: str) -> Dict:
     if os.path.exists(target_zip):
         _remove_file_robust(target_zip)
     _link_or_copy(zip_file, target_zip)
+    os.chmod(target_zip, 0o640)
 
     # 刷新目标 ZIP 的时间戳（关键，勿删）：
     # Windows 下硬链接沿用缓存原件的旧 mtime/ctime（NTFS 建链不刷新），
@@ -316,9 +317,10 @@ def save_to_cache(source_dir: str, cache_dir: str, zip_path: Optional[str] = Non
         if os.path.isdir(source_dir):
             n_files = _copytree_link(source_dir, cache_organized)
 
-        # 复制 ZIP
+        # 复制 ZIP，并显式保证缓存及硬链接目标可回传读取
         if zip_path and os.path.isfile(zip_path):
             _link_or_copy(zip_path, cache_zip)
+            os.chmod(cache_zip, 0o640)
 
         # 复制 Excel
         if excel_path and os.path.isfile(excel_path):

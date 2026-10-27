@@ -25,6 +25,7 @@ from src.client.unified import DICOMDownloadClient
 from src.core import convert
 from src.core.organize import organize_dicom_files, process_single_series
 from src.utils.packaging import create_result_zip
+from src.utils.cache import save_to_cache, copy_from_cache
 
 
 @pytest.fixture(autouse=True)
@@ -336,3 +337,31 @@ def test_failed_cleanup_is_recursive_and_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(unified.os, 'remove', lambda _: (_ for _ in ()).throw(PermissionError('locked')))
     with pytest.raises(RuntimeError):
         unified._drop_failed_series_files(info, {'bad': 'synthetic'})
+
+
+def test_result_zip_has_owner_readable_permissions(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'converted.nii.gz').write_bytes(b'synthetic')
+
+    zip_path = create_result_zip(str(source), 'synthetic-task', str(tmp_path / 'out'))
+
+    assert Path(zip_path).stat().st_mode & 0o777 == 0o640
+    with zipfile.ZipFile(zip_path) as archive:
+        assert archive.read('converted.nii.gz') == b'synthetic'
+
+
+def test_cached_zip_has_owner_readable_permissions(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'converted.nii.gz').write_bytes(b'synthetic')
+    zip_path = create_result_zip(str(source), 'synthetic-task', str(tmp_path / 'out'))
+    cache_dir = tmp_path / 'cache' / 'A'
+    target_dir = tmp_path / 'task'
+
+    assert save_to_cache(str(source), str(cache_dir), str(zip_path))
+    result = copy_from_cache(str(cache_dir), str(target_dir), 'task')
+
+    assert result['success'] is True
+    assert (cache_dir / 'result.zip').stat().st_mode & 0o777 == 0o640
+    assert Path(result['result_zip']).stat().st_mode & 0o777 == 0o640
