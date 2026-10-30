@@ -61,3 +61,11 @@ src/
 - 日志：`logs/app.log`（INFO 级；提交审计含 IP+options）
 
 - 2026-10-02：生产几何v3剩余验收已移交[具体交接清单](CTA_GEOMETRY_V3_PRODUCTION_ACCEPTANCE_HANDOFF_20261002.md)，下载空闲时实施；不阻塞CT_YOLO存量数据清理与主线。
+
+
+## MR 语义扩展（2026-10-31）
+
+- `src/core/mr_semantics.py`：统一多值解析、逐属性证据/冲突、规则版本与监督掩码。
+- `src/core/mr_index.py`：增强 MR 功能组来源解析、可选 header 帧索引及 Excel 摘要；不声称转换体积已对齐。
+- `test/test_mr_semantics.py`：语义反例、标准/增强 DICOM、缓存与 Excel 集成回归。
+- `docs/MR_SEMANTICS_V2.md`：输出契约、默认开关、兼容性与未完成的实证验证。

@@ -14,13 +14,13 @@
     "stir_ti_max": 250,
     "dixon_water_tokens": ["W", "WATER"],
     "scan_options_fs_token": "FS",
-    "protocol_keywords": ["fs", "fatsat", "spair", "stir", "fat sep", "dixon"]
+    "protocol_keywords": ["fs", "fatsat", "spair", "stir", "fat sep"]
   },
   "atomic_features": {
     "contrast_protocol_regex": "\\+c|post|gd|enh|contrast|增强|dyn",
     "motion_correction_protocol_regex": "propeller|blade|radial|star",
     "refined_image_type": {
-      "derived_keywords": ["derived", "secondary"],
+      "derived_keywords": ["derived"],
       "localizer_keywords": ["localizer", "survey", "scout"],
       "original_requires": ["original", "primary"],
       "default": "OTHER"
@@ -197,7 +197,7 @@
   },
   "post_processing": {
     "contrast_enhancement_override": {
-      "enabled": true,
+      "enabled": false,
       "protocol_prefix": "t1",
       "contrast_bolus_required": true,
       "contrast_bolus_exclude_regex": "no",
@@ -205,12 +205,13 @@
     }
   },
   "propagate": {
+    "enabled": false,
     "t1_contains": "T1",
     "propagated_phase": "POST_PROPAGATED"
   },
   "excluded_patterns": {
     "exam_card_keywords": ["examcard", "exam_card"],
-    "empty_series_description": true,
+    "empty_series_description": false,
     "derived_screen_save_keywords": ["screen save", "processed images", "filming", "inline_vf_results", "posdisp", "new series"],
     "unknown_protocol_names": ["____"],
     "localizer_keywords": ["3-plane", "3plane", "aahscout", "define_sax", "localiser", "localizer", "scout", "smartprep", "surv", "定位"],
@@ -230,7 +231,7 @@
     "T2_MAP": "T2_anatomic",
     "T2_NAME_BASED": "T2_anatomic",
     "T2_STIR": "T2_fat_suppressed",
-    "T2_TSE_FAT": "T2_fat_suppressed",
+    "T2_TSE_FAT": "T2_fat_only",
     "T1_TSE": "T1_anatomic",
     "T1_SE": "T1_anatomic",
     "T1_GRE": "T1_anatomic",
@@ -239,8 +240,8 @@
     "T1_MAP": "T1_anatomic",
     "T1_NAME_BASED": "T1_anatomic",
     "T1_GRE_FLASH3D": "T1_anatomic",
-    "T1_TSE_FAT": "T1_fat_suppressed",
-    "T1_GRE_STEADY_STATE_FAT": "T1_fat_suppressed",
+    "T1_TSE_FAT": "T1_fat_only",
+    "T1_GRE_STEADY_STATE_FAT": "T1_fat_only",
     "T1_TSE_INPHASE": "T1_in_phase",
     "T1_GRE_STEADY_STATE_INPHASE": "T1_in_phase",
     "T1_TSE_OUTPHASE": "T1_out_phase",
@@ -267,3 +268,4 @@
     "BREATH MOVEMENT": "OTHER"
   }
 }
+

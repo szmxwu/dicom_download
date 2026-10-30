@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Set, Callable, Any, Tuple
 from types import SimpleNamespace
 from src.core.constants import get_derived_keywords, match_derived_keyword, is_derived_series, is_non_image_modality
 from src.core.metadata import extract_dicom_metadata as extract_dicom_metadata_impl
+from src.core.mr_index import representative_metadata, attach_mr_index
 from src.core.organize import organize_dicom_files as organize_dicom_files_impl
 from src.core.organize import process_single_series as process_single_series_impl
 from src.core.convert import convert_dicom_to_nifti as convert_dicom_to_nifti_impl
@@ -1389,6 +1390,8 @@ class DICOMDownloadClient:
             except Exception as e:
                 logger.warning(f"[TAGS] Failed to get tag {tag_name}: {e}")
                 tags[tag_name] = None
+        if str(getattr(dcm, 'Modality', '')).upper() == 'MR':
+            tags.update(representative_metadata(dcm))
         logger.info(f"[TAGS] Built {len(tags)} tags")
         return tags
 
@@ -1719,6 +1722,13 @@ class DICOMDownloadClient:
                 modality=modality,
                 read_all=read_all
             )
+            if str(modality).upper() == 'MR':
+                try:
+                    run_cpu_bound(attach_mr_index, records, dicom_files, series_dir)
+                except Exception as exc:
+                    for record in records:
+                        record['mr_index_status'] = 'failed'
+                    logger.warning('MR frame index failed: %s', type(exc).__name__)
             logger.info(f"[CACHE] _collect_metadata_from_dicoms returned {len(records)} records for {series_name}")
             if not records:
                 logger.warning(f"[CACHE] records empty for {series_name}, creating fallback record")
@@ -1838,6 +1848,8 @@ class DICOMDownloadClient:
                 except Exception:
                     metadata['Rows'] = metadata.get('Rows', '')
                     metadata['Columns'] = metadata.get('Columns', '')
+                if str(modality).upper() == 'MR':
+                    metadata.update(representative_metadata(dcm))
                 # P0: 修复 Carestream BPE 乱码
                 from src.core.metadata import repair_bodypart_examined
                 repair_bodypart_examined(metadata)
@@ -2027,7 +2039,7 @@ class DICOMDownloadClient:
 
             print(f"\n🔬 MR_clean: processing {len(mr_df)} MR records...")
 
-            from src.core.mr_clean import process_mri_dataframe
+            from src.core.mr_clean import process_mri_dataframe, build_v2_dataframe
 
             # forward optional progress callback
             try:
@@ -2042,7 +2054,8 @@ class DICOMDownloadClient:
                 mode='a',
                 if_sheet_exists='replace',
             ) as writer:
-                cleaned_df.to_excel(writer, sheet_name='MR_Cleaned', index=False)
+                cleaned_df.drop(columns=['mr_semantics_v2'], errors='ignore').to_excel(writer, sheet_name='MR_Cleaned', index=False)
+                build_v2_dataframe(cleaned_df).to_excel(writer, sheet_name='MR_Cleaned_v2', index=False)
 
             print("✅ MR_clean: MR_Cleaned sheet written.")
         except Exception as e:
@@ -2539,3 +2552,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

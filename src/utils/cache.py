@@ -122,6 +122,8 @@ def _compute_param_hash(accession_number: str, options: Dict) -> str:
     - filter_rules：constants.py 过滤规则指纹（关键词默认值/例外表/白名单），
       规则代码修改后旧缓存条目自动失配，避免旧过滤逻辑的结果被命中。
     """
+    from src.core.mr_semantics import rules_fingerprint
+    from src.core.mr_index import indexing_enabled
     task_keywords = options.get("derived_keywords")
     params = {
         "accession_number": accession_number,
@@ -138,6 +140,8 @@ def _compute_param_hash(accession_number: str, options: Dict) -> str:
             str(k).upper() for k in options.get("extra_derived_keywords") or []
         ) or None,
         "filter_rules": get_filter_rules_fingerprint(),
+        "mr_semantic_rules": rules_fingerprint() if options.get('auto_metadata', True) or options.get('rename_mr_series') else None,
+        "mr_frame_index": indexing_enabled(),
     }
     param_str = json.dumps(params, sort_keys=True, ensure_ascii=False)
     return hashlib.md5(param_str.encode("utf-8")).hexdigest()[:8]
@@ -598,3 +602,4 @@ def get_cache_stats(results_base_dir: str) -> Dict:
         "entries": entries,
         "size_gb": total_bytes / (1024 ** 3),
     }
+

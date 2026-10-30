@@ -146,3 +146,8 @@ CTA017真实完整DICOM及1,024/1,025层边界实验确认dcm2niix超1,024层提
 缓存淘汰同时约束 `CACHE_MAX_GB` 和 `CACHE_MIN_FREE_GB`（默认跟随下载恢复线）：任一越线均按 atime 淘汰，直到容量与真实空闲均达标。删除后必须重新 `disk_usage` 采样，硬链接不能按逻辑大小虚增空闲量。save/copy 与 LRU 按 cache key 互斥，冲突时回退 PACS 或下轮重试；互斥锁在 eventlet 下必须来自 `original('threading')`，只允许微秒级状态操作。普通结果清理的 `finally` 和服务启动都会异步调度缓存维护，避免“没有普通可删项”阻断恢复。
 
 options 指纹补入 `auto_metadata/auto_organize/rename_mr_series/extra_derived_keywords`，防止不同交付语义错误合并；该变更使旧缓存键失配一次。回归覆盖并发重连、options 差异、容量/空闲双阈值、硬链接、活跃 IO 与 eventlet 原生锁竞争，全套 193 passed / 3 skipped。
+
+
+### D28. MR 属性证据与交付分类分离（2026-10-31）
+
+依据 main `062ff9e` 的源码及 `test/test_mr_semantics.py` 合成反例，移除 T1+对比剂字段强制增强、重复采集自动 PRE/POST、Dixon 全输出压脂等路径。保留旧分类/命名接口，新增 MR_Cleaned_v2 逐属性证据、未知/冲突状态与监督掩码；历史 `_FAT` 必须从原始证据重新判定，不批量迁移。多帧/多回波/多 b 值 header 索引通过 MR_FRAME_INDEX_ENABLED 显式启用，默认不增加生产全量头部 I/O；候选体积与转换输出的映射保留 UNVERIFIED。结果缓存包含语义版本/配置/索引开关。理由：交付便利与可用训练真值是不同契约，缺失或重复采集不能自动成为阴性或增强证据。边界与真实队列后续验证见 [MR_SEMANTICS_V2.md](MR_SEMANTICS_V2.md)。此次没有部署生产。
