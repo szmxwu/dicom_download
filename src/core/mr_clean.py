@@ -21,6 +21,9 @@ import json
 import re
 import warnings
 from time import time
+from .mr_semantics import (parse_multivalue, fat_attributes, water_fat_component,
+                           contrast_attributes, is_stir_candidate, field_thresholds,
+                           acquisition_time, text_value, number, v2_record, build_semantics)
 # 忽略Pandas在进行apply操作时可能产生的性能警告
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 
@@ -96,32 +99,14 @@ def get_orientation(row, cfg: dict, iop_col='ImageOrientationPatient', fallback_
     """
     orientation_cfg = cfg.get('orientation', {})
     oblique_ratio = float(orientation_cfg.get('oblique_dominance_ratio', 0.9))
-
-    # 1. 优先从ImageOrientationPatient计算
-    iop_val = row.get(iop_col)
-    if pd.notnull(iop_val):
-        try:
-            # 安全地将字符串 '[-1.0, 0.0, ...]' 转换为数值列表
-            iop = ast.literal_eval(str(iop_val))
-            if isinstance(iop, list) and len(iop) == 6:
-                row_vec = np.array(iop[0:3])
-                col_vec = np.array(iop[3:6])
-                normal = np.cross(row_vec, col_vec)
-
-                # 检查是否为斜位：如果没有一个轴占绝对主导，则为斜位
-                # 判断依据：主轴分量的平方是否小于向量模长平方的 oblique_ratio
-                if np.max(np.abs(normal))**2 < oblique_ratio * np.sum(normal**2):
-                    return 'OBL'
-
-                main_axis = np.argmax(np.abs(normal))
-                if main_axis == 0:
-                    return 'SAG'  # 法向量主轴为X
-                elif main_axis == 1:
-                    return 'COR'  # 法向量主轴为Y
-                elif main_axis == 2:
-                    return 'AX'  # 法向量主轴为Z
-        except (ValueError, SyntaxError, TypeError):
-            pass  # 解析失败则继续执行回退逻辑
+    vals = [number(v) for v in parse_multivalue(row.get(iop_col))]
+    if len(vals) == 6 and all(v is not None for v in vals):
+        a, b = np.array(vals[:3]), np.array(vals[3:])
+        if abs(np.linalg.norm(a) - 1) < .01 and abs(np.linalg.norm(b) - 1) < .01 and abs(a @ b) < .01:
+            normal = np.cross(a, b)
+            if np.max(np.abs(normal)) ** 2 < oblique_ratio * np.sum(normal ** 2):
+                return 'OBL'
+            return ('SAG', 'COR', 'AX')[np.argmax(np.abs(normal))]
 
     # 2. 回退逻辑：从协议名搜索
     protocol_name = str(row.get(fallback_col, '')).lower()
@@ -136,9 +121,9 @@ def get_orientation(row, cfg: dict, iop_col='ImageOrientationPatient', fallback_
 
 def detect_fat_suppression(row, cfg: dict):
     """
-    通过层级化规则判断序列是否应用了脂肪抑制技术。
+    兼容布尔视图：名义脂肪去除为真时返回 True，未知/冲突返回 False。
 
-    优先级从高到低：STIR物理参数 -> Dixon技术标签 -> ScanOptions标签 -> 协议名关键词。
+    技术意图与水脂成分分别判断；真实压脂效果必须由图像质控验证。
 
     Args:
         row (pd.Series): DataFrame的一行数据。
@@ -146,37 +131,9 @@ def detect_fat_suppression(row, cfg: dict):
     Returns:
         bool: 如果是脂肪抑制序列，则返回True，否则返回False。
     """
-    fs_cfg = cfg.get('fat_suppression', {})
-
-    # 方法一：基于TI识别STIR序列 (最高优先级)
-    if str(fs_cfg.get('ir_token', 'IR')) in str(row.get('ScanningSequence', '')):
-        ti = safe_to_numeric(row.get('InversionTime'))
-        # STIR的典型TI范围
-        stir_ti_min = safe_to_numeric(fs_cfg.get('stir_ti_min', 100))
-        stir_ti_max = safe_to_numeric(fs_cfg.get('stir_ti_max', 250))
-        if stir_ti_min <= ti <= stir_ti_max:
-            return True
-
-    # 方法二：识别Dixon（水脂分离）技术的“纯水像”
-    image_type_str = str(row.get('ImageType', '')).upper()
-    # 更鲁棒地解析多值字符串
-    image_type_parts = image_type_str.split('\\')
-    dixon_tokens = [str(x).upper() for x in fs_cfg.get('dixon_water_tokens', ['W', 'WATER'])]
-    if any(t in image_type_parts for t in dixon_tokens):
-        return True
-
-    # 方法三：解析专用的扫描选项（ScanOptions）标签
-    fs_token = str(fs_cfg.get('scan_options_fs_token', 'FS')).upper()
-    if fs_token and fs_token in str(row.get('ScanOptions', '')).upper():
-        return True
-
-    # 方法四：关键词匹配（作为补充和回退）
-    protocol_name = str(row.get('protocolName_lower', '')).lower()
-    fat_sat_keywords = [str(x).lower() for x in fs_cfg.get('protocol_keywords', ['fs', 'fatsat', 'spair', 'stir', 'fat sep', 'dixon'])]
-    if any(keyword in protocol_name for keyword in fat_sat_keywords):
-        return True
-
-    return False
+    nominal = fat_attributes(row, cfg)['nominal_fat_signal_removed']
+    # Compatibility bool only; UNKNOWN/CONFLICT remain explicit in V2.
+    return nominal['value'] is True
 
 # ==============================================================================
 # Part 1b: 行级过滤 (Row-level Filtering)
@@ -199,7 +156,7 @@ def _is_excluded_row(row, cfg: dict) -> bool:
     exc_cfg = cfg.get('excluded_patterns', {})
 
     # 空 SeriesDescription
-    if exc_cfg.get('empty_series_description', True):
+    if exc_cfg.get('empty_series_description', False):
         series_desc = str(row.get('SeriesDescription', '')).strip()
         if not series_desc or series_desc.lower() == 'nan':
             return True
@@ -305,6 +262,10 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
     # ImageType是权威的DICOM标签，应优先使用
     df['imageType_lower'] = df.get('ImageType', pd.Series(
         index=df.index, dtype=str)).astype(str).str.lower().fillna('')
+    if 'DiffusionBValue' in df.columns:
+        standard_b = pd.to_numeric(df['DiffusionBValue'], errors='coerce')
+        legacy_b = pd.to_numeric(df.get('b_value', pd.Series(index=df.index, dtype=float)), errors='coerce')
+        df['b_value'] = standard_b.where(standard_b.notna(), legacy_b)
     # NaN-safe: SeriesDescription 可能包含 NaN(float)，统一转为空字符串
     if 'SeriesDescription' in df.columns:
         df['SeriesDescription'] = df['SeriesDescription'].fillna('').astype(str)
@@ -324,12 +285,8 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
     # 3. 附加技术特征 (布尔型)
     df['isFatSuppressed'] = df.apply(lambda r: detect_fat_suppression(r, cfg), axis=1)
 
-    contrast_regex = str(atomic_cfg.get('contrast_protocol_regex', r'\+c|post|gd|enh|contrast|增强|dyn'))
-    # P1 fix: 同时检查 ProtocolName 和 SeriesDescription
-    df['isContrastEnhanced'] = (
-        df['protocolName_lower'].str.contains(contrast_regex, na=False, regex=True)
-        | df.get('SeriesDescription', pd.Series(index=df.index, dtype=str)).astype(str).str.lower().str.contains(contrast_regex, na=False, regex=True)
-    )
+    df['isContrastEnhanced'] = df.apply(
+        lambda r: contrast_attributes(r)['contrast_administration_state']['value'] == 'POST', axis=1)
 
     motion_regex = str(atomic_cfg.get('motion_correction_protocol_regex', 'propeller|blade|radial|star'))
     # P0 fix: 同时检查 ProtocolName 和 SeriesDescription，因为 ProtocolName 可能不包含 motion correction 关键词
@@ -341,7 +298,7 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
     # 4. 图像类型 (Refined ImageType)
     # 优先从权威的'ImageType'字段判断，若无则尝试从协议名猜测
     refined_cfg = atomic_cfg.get('refined_image_type', {})
-    derived_keywords = [str(x).lower() for x in refined_cfg.get('derived_keywords', ['derived', 'secondary'])]
+    derived_keywords = [str(x).lower() for x in refined_cfg.get('derived_keywords', ['derived'])]
     localizer_keywords = [str(x).lower() for x in refined_cfg.get('localizer_keywords', ['localizer', 'survey', 'scout'])]
     original_requires = [str(x).lower() for x in refined_cfg.get('original_requires', ['original', 'primary'])]
     refined_default = str(refined_cfg.get('default', 'OTHER'))
@@ -364,7 +321,7 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
     df['refinedImageType'] = df.apply(get_refined_type, axis=1)
     # 派生图/二次成像便捷标记列（与 MR_YOLO 侧输出对齐）
     df['isDerivedImage'] = df['refinedImageType'].eq('DERIVED')
-    df['isSecondaryImage'] = df['imageType_lower'].str.contains('secondary', na=False)
+    df['isSecondaryImage'] = df.get('ImageType', pd.Series('', index=df.index)).apply(lambda v: 'SECONDARY' in parse_multivalue(v))
 
     if progress_callback:
         progress_callback("Done. Added columns: standardOrientation, standardDimension, isFatSuppressed, etc.", "extract_atomic_features_done")
@@ -390,31 +347,13 @@ def get_subtype_suffix(row, cfg: dict):
     Returns:
         str: 标准化的亚型后缀 (如 '_WATER', '_FAT')，如果没有找到则返回空字符串。
     """
-    # 准备待检查的文本，优先使用更规范的ImageType
-    # SeriesDescription作为补充
-    desc = str(row.get('protocolName_lower', '') + ' ' +
-               row.get('SeriesDescription', '')).lower()
-    img_type_parts = str(row.get('ImageType', '')).upper().split('\\')
-
+    desc = ' '.join(text_value(row.get(k)) for k in ('ProtocolName', 'protocolName_lower', 'SeriesDescription')).lower()
+    component = water_fat_component(row)
+    suffix = {'WATER_ONLY': '_WATER', 'FAT_ONLY': '_FAT',
+              'IN_PHASE': '_INPHASE', 'OPPOSED_PHASE': '_OUTPHASE'}.get(component['value'])
+    if suffix:
+        return suffix
     subtype_cfg = cfg.get('subtype_suffix', {})
-
-    # --- 识别Dixon序列的输出类型 ---
-    # 使用if/elif确保一个序列只被赋予一个亚型
-    water_tokens = [str(x) for x in subtype_cfg.get('water_tokens', ['WATER', ' W ', 'water'])]
-    fat_tokens = [str(x) for x in subtype_cfg.get('fat_tokens', ['FAT', ' F ', 'fat'])]
-    inphase_tokens = [str(x) for x in subtype_cfg.get('inphase_tokens', ['INPHASE', ' IP ', 'in_phase', 'inphase'])]
-    outphase_tokens = [str(x) for x in subtype_cfg.get('outphase_tokens', ['OUTPHASE', ' OP ', 'out_phase', 'outphase'])]
-
-    image_type_tokens = subtype_cfg.get('image_type_tokens', {
-        'WATER': '_WATER',
-        'FAT': '_FAT',
-        'INPHASE': '_INPHASE',
-        'OUTPHASE': '_OUTPHASE'
-    })
-    for token, suffix in image_type_tokens.items():
-        search_tokens = [str(t).lower() for t in subtype_cfg.get(f'{token.lower()}_tokens', [token])]
-        if token in img_type_parts or any(t in desc for t in search_tokens):
-            return suffix
 
     # --- 识别其他可能的多回波/多参数输出 ---
     # 示例：识别不同回波时间的T2*序列
@@ -456,7 +395,6 @@ def classify_sequence(row, cfg: dict):
     seq_variant = str(row.get('SequenceVariant', '')).lower()
     img_type = row.get('refinedImageType', '')
     raw_image_type = str(row.get('ImageType', '')).lower()
-    field_strength = row.get('standardFieldStrength', 'default')
     standardDimension= row.get('standardDimension', '')
     # NaN-safe: 确保拼接时不因 NaN(float) 导致 TypeError
     if name != name:  # NaN check
@@ -474,10 +412,7 @@ def classify_sequence(row, cfg: dict):
     seq_family = 'UNKNOWN'
 
     classification_cfg = cfg.get('classification', {})
-    thresholds_cfg = cfg.get('thresholds', {})
-
-    field_strength_thresholds = thresholds_cfg.get('field_strength', {})
-    P = field_strength_thresholds.get(field_strength, field_strength_thresholds.get('default', {}))
+    P = field_thresholds(row, cfg)
 
 
     # --- 3. 分类规则引擎 (按优先级) ---
@@ -563,6 +498,14 @@ def classify_sequence(row, cfg: dict):
         if matches:
             base_class = str(mrcp_cfg.get('class', 'MRCP'))
 
+    # Structured acquisition attributes precede parameter/name inference.
+    if base_class == 'UNKNOWN':
+        attrs = build_semantics(row, cfg)
+        weight, family = attrs['contrast_weighting'], attrs['pulse_family']
+        if weight['status'] == 'known' and family['status'] in ('known', 'inferred'):
+            if weight['value'] in ('T1', 'T2', 'PD') and family['value'] in ('SE', 'TSE', 'GRE'):
+                base_class = weight['value'] + '_' + family['value']
+
     # --- 规则B: 基于物理参数的核心分类 (仅当规则A未命中时执行) ---
     if base_class == 'UNKNOWN':
         # 物理规则0: DWI关键词检查（优先于b_value检查，因为b_value可能缺失）
@@ -589,13 +532,10 @@ def classify_sequence(row, cfg: dict):
         # 物理规则2/3: 仅当仍未知时，继续形态学判断
         if base_class == 'UNKNOWN':
             # 物理规则2: 反转恢复 (FLAIR, STIR)
-            fat_cfg = cfg.get('fat_suppression', {})
-            stir_ti_min = safe_to_numeric(fat_cfg.get('stir_ti_min', 90))
             flair_ti_min = safe_to_numeric(P.get('flair_ti_min'))
-            stir_ti_max = safe_to_numeric(P.get('stir_ti_max'))
-            if pd.notnull(ti) and ti >= flair_ti_min:
+            if ('IR' in parse_multivalue(row.get('ScanningSequence')) or str(row.get('InversionRecovery', '')).upper() == 'YES') and pd.notnull(ti) and ti >= flair_ti_min:
                 base_class = 'T2_FLAIR'
-            elif pd.notnull(ti) and stir_ti_min <= ti <= stir_ti_max:
+            elif is_stir_candidate(row, cfg):
                 base_class = 'T2_STIR'
             else:
                 # 物理规则3: 形态学成像 (T1, T2, PD)
@@ -800,230 +740,101 @@ def extract_hardware_features(df, cfg: dict, progress_callback=None):
     return df
 
 
+def _update_contrast_columns(df):
+    states = df.apply(lambda r: contrast_attributes(r)['contrast_administration_state']['value'], axis=1)
+    df['contrast_administration_state'] = states
+    df['dynamicPhase'] = states
+    df['isContrastEnhanced'] = states.eq('POST')
+    return df
+
+
 def analyze_dynamic_series(df, cfg: dict, progress_callback=None):
+    """Find candidate repeated acquisitions; repetition alone says nothing about contrast.
+
+    Missing geometry or acquisition parameters never match each other. Candidate
+    correspondence is not a registration claim. Time ties are left unindexed.
     """
-    分析时空关系以识别动态序列。
-
-    功能：
-    - 自动推断增强时相，不再依赖关键词标签。
-    - 指纹中包含ImagePositionPatient和ImageOrientationPatient，确保空间位置精确匹配。
-    - 稳健地处理空间标签的列表字符串格式及空值。
-    """
-    if progress_callback:
-        progress_callback("Stage 4: analyzing dynamic series...", "analyze_dynamic_series")
-    else:
-        print("Stage 4: analyzing dynamic series...")
-    df['dynamicGroup'] = np.nan
-    df['dynamicPhase'] = ''
-    dynamic_cfg = cfg.get('dynamic', {})
-    exclude_from_dynamics = dynamic_cfg.get('exclude_sequence_classes', [])
-    # --- 1. 稳健的数据类型和格式转换 ---
-
-    # 转换数值型列
-    numeric_cols = dynamic_cfg.get('numeric_cols', ['RepetitionTime', 'EchoTime', 'FlipAngle', 'SliceThickness', 'SeriesTime'])
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        else:
-            if progress_callback:
-                progress_callback(f"Warning: key column '{col}' is missing, some features may be limited.", "warning_missing_col")
-            else:
-                print(f"Warning: key column '{col}' is missing, some features may be limited.")
-
-    # 定义一个函数来安全地解析和规范化列表格式的字符串
-    def normalize_list_string(val, decimals=2):
-        if pd.isnull(val):
-            return 'NA'
-        try:
-            # 安全地将字符串 '[-125.0, -125.0, 80.0]' 转换为实际的列表
-            list_val = ast.literal_eval(str(val))
-            # 对列表中的每个数字四舍五入，以处理微小的浮点差异
-            rounded_list = [round(float(v), decimals) for v in list_val]
-            return str(rounded_list)
-        except (ValueError, SyntaxError):
-            # 如果值不是一个合法的列表字符串（例如，普通文本），则返回 'INVALID'
-            return 'INVALID'
-
-    # 为指纹创建规范化的空间特征列
-    spatial_cols = dynamic_cfg.get('spatial_cols', ['ImagePositionPatient', 'ImageOrientationPatient'])
-    list_round_decimals = int(dynamic_cfg.get('list_round_decimals', 2))
-    for col in spatial_cols:
-        if col in df.columns:
-            df[f'{col}_str'] = df[col].apply(lambda v: normalize_list_string(v, decimals=list_round_decimals))
-        else:
-            if progress_callback:
-                progress_callback(f"Warning: spatial column '{col}' is missing; fingerprint precision may be reduced.", "warning_missing_spatial_col")
-            else:
-                print(f"Warning: spatial column '{col}' is missing; fingerprint precision may be reduced.")
-            df[f'{col}_str'] = 'NA'  # 如果列不存在，创建一个默认列
-
-    # --- 2. 排除不适合进行动态分析的序列类型 ---
-    # exclude_from_dynamics = ['DWI', 'DTI', 'ADC', 'FA', 'MRS', 'PWI', 'ASL', 'LOCALIZER']
-    eligible_mask = ~df['sequenceClass'].isin(exclude_from_dynamics)
-    df_eligible = df[eligible_mask].copy()
-
-    # --- 3. 创建包含精确空间定位的“终极指纹” ---
-    fingerprint_cols = dynamic_cfg.get(
-        'fingerprint_cols',
-        ['ImagePositionPatient_str', 'ImageOrientationPatient_str', 'sequenceClass', 'SliceThickness', 'RepetitionTime', 'EchoTime', 'FlipAngle'],
-    )
-
-    # 确保 fingerprint 所需列都存在
-    for col in fingerprint_cols:
-        if col not in df_eligible.columns:
-            df_eligible[col] = 'NA'
-
-    # 临时填充空值以确保它们能被包含在指纹中
-    temp_fp_df = df_eligible[fingerprint_cols].copy()
-    numeric_round_decimals = int(dynamic_cfg.get('numeric_round_decimals', 1))
-    for col in fingerprint_cols:
-        if temp_fp_df[col].dtype in ['float64', 'float32']:
-            temp_fp_df[col] = temp_fp_df[col].round(numeric_round_decimals).fillna('NA')
-        else:
-            temp_fp_df[col] = temp_fp_df[col].fillna('NA')
-
-    df_eligible['fingerprint'] = temp_fp_df.astype(str).agg('_'.join, axis=1)
-
-    # --- 4. 按研究（Study）分组并识别动态集合 ---
-    if 'StudyInstanceUID' not in df_eligible.columns:
-        if progress_callback:
-            progress_callback("Warning: StudyInstanceUID column missing, skipping dynamic analysis.", "warning_missing_study_uid")
-        else:
-            print("Warning: StudyInstanceUID column missing, skipping dynamic analysis.")
+    df['dynamicGroup'] = pd.Series(index=df.index, dtype='Int64')
+    df['temporal_group'] = pd.Series(index=df.index, dtype='Int64')
+    df['temporal_index'] = pd.Series(index=df.index, dtype='Int64')
+    df['temporal_relation_status'] = 'unknown'
+    df['temporal_evidence'] = ''
+    df = _update_contrast_columns(df)
+    if 'StudyInstanceUID' not in df.columns:
         return df
-    grouped = df_eligible.groupby('StudyInstanceUID')
-    next_dynamic_group_id = 1
-
-    for study_id, group in grouped:
-        fingerprint_counts = group['fingerprint'].value_counts()
-        dynamic_fingerprints = fingerprint_counts[fingerprint_counts > 1].index
-
-        for fp in dynamic_fingerprints:
-            dynamic_set_indices = group[group['fingerprint'] == fp].index
-
-            # --- 5. 核心逻辑：基于时间排序来推断时相 ---
-            dynamic_set_df = df.loc[dynamic_set_indices].copy()
-
-            # 排序必须基于SeriesTime，否则无法进行时相判断
-            if 'SeriesTime' not in dynamic_set_df.columns or dynamic_set_df['SeriesTime'].isnull().all():
-                msg = f"Severe warning: Study {study_id} (fingerprint: {fp[:30]}...) dynamic set lacks valid 'SeriesTime', cannot determine phases."
-                if progress_callback:
-                    progress_callback(msg, "severe_warning_missing_series_time")
-                else:
-                    print(msg)
-                continue  # 跳过这个无法处理的组
-
-            # 按SeriesTime升序排列
-            sorted_set = dynamic_set_df.sort_values(by='SeriesTime')
-
-            # 分配动态组ID
-            df.loc[dynamic_set_indices, 'dynamicGroup'] = next_dynamic_group_id
-
-            # 第一个即为增强前，其余为增强后
-            phase_labels = dynamic_cfg.get('phase_labels', {'pre': 'PRE', 'post_template': 'POST_{index}'})
-            pre_label = str(phase_labels.get('pre', 'PRE'))
-            post_template = str(phase_labels.get('post_template', 'POST_{index}'))
-            df.loc[sorted_set.index[0], 'dynamicPhase'] = pre_label
-            for i, idx in enumerate(sorted_set.index[1:]):
-                df.loc[idx, 'dynamicPhase'] = post_template.format(index=i+1)
-
-            next_dynamic_group_id += 1
-
-    # 清理为指纹创建的临时列
-    df.drop(columns=[f'{col}_str' for col in spatial_cols], inplace=True)
-    contrast_regex = str(dynamic_cfg.get('contrast_protocol_regex', r'\+c|post|gd|enh|contrast|增强|dyn'))
-    agent_exclude_regex = str(dynamic_cfg.get('contrast_agent_exclude_regex', 'no'))
-    exclude_seq_regex = str(dynamic_cfg.get('exclude_sequence_regex', 'DWI|T2|LOCALIZER'))
-
-    # 保护 ContrastBolusAgent 列缺失的情况
-    contrast_bolus_present = df.get('ContrastBolusAgent', pd.Series(index=df.index)).notna()
-    contrast_bolus_valid = ~df.get('ContrastBolusAgent', pd.Series(index=df.index, dtype=str)).astype(str).str.contains(agent_exclude_regex, case=False, na=True, regex=True)
-    # P1 fix: 同时检查 ProtocolName 和 SeriesDescription 中的增强关键词
-    has_contrast_keyword = (
-        df['protocolName_lower'].str.contains(contrast_regex, na=False, regex=True)
-        | df.get('SeriesDescription', pd.Series(index=df.index, dtype=str)).astype(str).str.lower().str.contains(contrast_regex, na=False, regex=True)
-    )
-    df['isContrastEnhanced'] = (
-        (df['dynamicPhase'].str.startswith('POST', na=False) | has_contrast_keyword)
-        & contrast_bolus_present
-        & contrast_bolus_valid
-        & (~df['sequenceClass'].astype(str).str.contains(exclude_seq_regex, case=False, na=True, regex=True))
-    )
-    # done message already handled above
+    excluded = set(cfg.get('dynamic', {}).get('exclude_sequence_classes', [])) | {'EXCLUDED', 'UNKNOWN'}
+    fingerprints = {}
+    for idx, row in df.iterrows():
+        study = text_value(row.get('StudyInstanceUID'))
+        uid = text_value(row.get('SeriesInstanceUID'))
+        if not study or not uid or row.get('sequenceClass') in excluded:
+            continue
+        # No NA sentinel may make missing values into positive matching evidence.
+        fp = [study, text_value(row.get('FrameOfReferenceUID')), row.get('sequenceClass')]
+        for key, length in [('ImageOrientationPatient', 6), ('ImagePositionPatient', 3)]:
+            vals = [number(v) for v in parse_multivalue(row.get(key))]
+            if len(vals) != length or any(v is None for v in vals):
+                break
+            if key == 'ImageOrientationPatient':
+                a, b = np.array(vals[:3]), np.array(vals[3:])
+                if abs(np.linalg.norm(a) - 1) > .01 or abs(np.linalg.norm(b) - 1) > .01 or abs(a @ b) > .01:
+                    break
+            fp.append(tuple(round(v, 2) for v in vals))
+        else:
+            params = [number(row.get(k)) for k in ('SliceThickness', 'RepetitionTime', 'EchoTime', 'FlipAngle')]
+            if any(v is None for v in params):
+                continue
+            fp.extend(round(v, 1) for v in params)
+            fp.extend((text_value(row.get('MRAcquisitionType')), water_fat_component(row)['value']))
+            fingerprints.setdefault(tuple(fp), []).append((idx, uid))
+    group_id = 1
+    for fp, members in fingerprints.items():
+        if len({uid for _, uid in members}) < 2 or len({uid for _, uid in members}) != len(members):
+            continue
+        indices = [idx for idx, _ in members]
+        df.loc[indices, 'dynamicGroup'] = group_id
+        df.loc[indices, 'temporal_group'] = group_id
+        # Frame UID and coverage are desirable evidence, never assumed from missing values.
+        df.loc[indices, 'temporal_relation_status'] = 'candidate'
+        relation = dict(rule_id='repeated-acquisition-candidate', rule_version='mr-semantic-v2.1',
+                        geometry='representative_position_and_orientation',
+                        frame_of_reference_present=bool(fp[1]), coverage='unverified', registration='unverified')
+        df.loc[indices, 'temporal_evidence'] = json.dumps(relation)
+        timed = [(idx, *acquisition_time(df.loc[idx])) for idx in indices]
+        valid = all(t[1] is not None for t in timed)
+        if valid and len({t[1][0] for t in timed}) == 1 and len({t[1] for t in timed}) == len(timed):
+            for order, (idx, _, source) in enumerate(sorted(timed, key=lambda t: t[1])):
+                df.loc[idx, 'temporal_index'] = order
+                df.loc[idx, 'temporal_evidence'] = json.dumps(dict(relation, time_source=source))
+        group_id += 1
     return df
 
 
 def propagate_enhancement_status(df, cfg: dict, progress_callback=None):
+    """Optional conservative propagation using complete comparable acquisition dates.
+
+    Explicit PRE/CONFLICT is protected. Time-only values cannot resolve midnight.
     """
-    阶段五：传播增强状态以识别单次延迟增强序列。
-
-    此函数在已识别出多时相动态组的基础上，进一步处理。
-    它将识别出在已知增强扫描发生之后、且本身为T1加权的序列，
-    并将它们也标记为增强序列。这解决了“单次、不同方位”的延迟期增强扫描的识别问题。
-
-    Args:
-        df (pd.DataFrame): 已执行过动态分析的DataFrame。
-
-    Returns:
-        pd.DataFrame: 更新了'dynamicPhase'和'isContrastEnhanced'列的DataFrame。
-    """
-    propagate_cfg = cfg.get('propagate', {})
-    if progress_callback:
-        progress_callback("Stage 5: propagating enhancement status to detect delayed single-phase enhancement...", "propagate_enhancement_status")
-    else:
-        print("Stage 5: propagating enhancement status to detect delayed single-phase enhancement...")
-
-    # 在同一个Study内部进行状态传播
-    if 'StudyInstanceUID' not in df.columns:
-        if progress_callback:
-            progress_callback("Warning: StudyInstanceUID column missing, skipping enhancement propagation.", "warning_missing_study_uid")
-        else:
-            print("Warning: StudyInstanceUID column missing, skipping enhancement propagation.")
+    if not cfg.get('propagate', {}).get('enabled', False) or 'StudyInstanceUID' not in df:
         return df
-    grouped = df.groupby('StudyInstanceUID')
-
-    for study_id, group in grouped:
-        # 1. 寻找该Study中是否存在已确认的“增强后(POST)”序列
-        post_contrast_series = group[group['isContrastEnhanced'] == True]
-
-        if post_contrast_series.empty:
-            # 如果没有增强序列，则无需进行任何操作，跳到下一个Study
-            continue
-
-        # 2. 确定该Study中“最晚的增强时间点”
-        # 这是判断后续序列是否为延迟期的关键时间戳
-        last_post_contrast_time = post_contrast_series['SeriesTime'].max()
-
-        # 3. 筛选出需要被判断的“候选序列”
-        # 候选序列必须满足以下条件：
-        # - 尚未被分配任何时相 (即不是多期动态组的一员)
-        # - 本身是T1加权序列 (增强扫描的基础)
-        t1_contains = str(propagate_cfg.get('t1_contains', 'T1'))
-        candidate_mask = (
-            (group['dynamicPhase'] == '')
-            & (group['sequenceClass'].astype(str).str.contains(t1_contains, na=False))
-        )
-        candidate_indices = group[candidate_mask].index
-
-        if candidate_indices.empty:
-            continue
-
-        # 4. 应用传播规则
-        for idx in candidate_indices:
-            candidate_time = df.loc[idx, 'SeriesTime']
-
-            # 如果一个T1序列的扫描时间晚于已知的最晚增强时间，
-            # 则将其标记为传播而来的增强序列。
-            if pd.notnull(candidate_time) and candidate_time > last_post_contrast_time:
-                # 在主DataFrame上更新状态
-                df.loc[idx, 'dynamicPhase'] = str(propagate_cfg.get('propagated_phase', 'POST_PROPAGATED'))
+    for _, group in df.groupby('StudyInstanceUID'):
+        posts = [(idx, acquisition_time(r)[0]) for idx, r in group.iterrows()
+                 if contrast_attributes(r)['contrast_administration_state']['value'] == 'POST']
+        for idx, row in group.iterrows():
+            if contrast_attributes(row)['contrast_administration_state']['value'] != 'UNKNOWN':
+                continue
+            if not str(row.get('sequenceClass', '')).startswith('T1_'):
+                continue
+            key, _ = acquisition_time(row)
+            if key and key[0] != 'TM' and any(t and t[0] == key[0] and key[1] > t[1] for _, t in posts):
+                propagated = str(cfg.get('propagate', {}).get('propagated_phase', 'POST_PROPAGATED'))
+                df.loc[idx, 'dynamicPhase'] = propagated
+                df.loc[idx, 'contrast_administration_state'] = propagated
                 df.loc[idx, 'isContrastEnhanced'] = True
-
-    if progress_callback:
-        progress_callback("Done. 'dynamicPhase' and 'isContrastEnhanced' columns updated.", "propagate_enhancement_status_done")
-    else:
-        print("Done. 'dynamicPhase' and 'isContrastEnhanced' columns updated.")
+    # 不再从原始字段重算，避免覆盖刚传播的阶段和自定义 propagated_phase。
     return df
+
+
 # ==============================================================================
 # 主流程封装 (Main Workflow)
 # ==============================================================================
@@ -1035,6 +846,9 @@ def process_mri_dataframe(df, cfg: Optional[Dict] = None, config_path: Optional[
     """
     cfg = _get_cfg(cfg, config_path)
     df_copy = df.copy()
+    if df_copy.empty:
+        df_copy['mr_semantics_v2'] = pd.Series(index=df_copy.index, dtype=str)
+        return df_copy
 
     # Stage 0: 排除空元数据、ExamCard 等非诊断行
     if progress_callback:
@@ -1076,32 +890,38 @@ def process_mri_dataframe(df, cfg: Optional[Dict] = None, config_path: Optional[
 
     # Stage 4: dynamic contrast analysis
     df_dynamic = analyze_dynamic_series(df_hardware_featured, cfg, progress_callback=progress_callback)
-    post_cfg = cfg.get('post_processing', {}).get('contrast_enhancement_override', {})
-    if post_cfg.get('enabled', True):
-        protocol_prefix = str(post_cfg.get('protocol_prefix', 't1'))
-        bolus_required = post_cfg.get('contrast_bolus_required', True)
-        bolus_exclude = str(post_cfg.get('contrast_bolus_exclude_regex', 'no'))
-        case_sensitive = post_cfg.get('case_sensitive', False)
-        flags = 0 if case_sensitive else re.IGNORECASE
-
-        mask = df_dynamic['protocolName_lower'].str.startswith(protocol_prefix, na=False)
-        if bolus_required:
-            bolus_series = df_dynamic.get('ContrastBolusAgent', pd.Series(index=df_dynamic.index))
-            mask = mask & bolus_series.notna()
-            mask = mask & (~bolus_series.astype(str).str.contains(bolus_exclude, flags=flags, na=True, regex=True))
-        # P1 fix: 只更新符合条件的行，不覆盖 Stage 4 已识别的增强序列
-        df_dynamic.loc[mask, 'isContrastEnhanced'] = True
-    else:
-        # 保持 analyze_dynamic_series 计算的值
-        pass
     # Stage 5: propagate enhancement status
     df_final = propagate_enhancement_status(df_dynamic, cfg, progress_callback=progress_callback)
+
+    df_final['mr_semantics_v2'] = df_final.apply(lambda r: json.dumps(v2_record(r, cfg), ensure_ascii=False, allow_nan=False), axis=1)
 
     if progress_callback:
         progress_callback("All processing steps completed. Saving results...", "process_complete")
     else:
         print("\n>>> All processing steps completed! Saving results... <<<")
     return df_final
+
+
+def build_v2_dataframe(cleaned_df):
+    """Parallel view with independently maskable attributes and compact JSON evidence."""
+    identifiers = ['StudyInstanceUID', 'SeriesInstanceUID', 'SeriesFolder', 'SampleFileName',
+                   'FileName', 'sequenceClass', 'sequenceFamily', 'temporal_group',
+                   'temporal_index', 'temporal_relation_status', 'temporal_evidence',
+                   'mr_metadata_scope', 'mr_index_status', 'echo_times', 'b_values',
+                   'mr_heterogeneous', 'mr_frame_index_file', 'mr_output_volume_mapping_status']
+    out = cleaned_df[[c for c in identifiers if c in cleaned_df]].copy()
+    for idx, row in cleaned_df.iterrows():
+        record = json.loads(row['mr_semantics_v2'])
+        out.loc[idx, 'mr_metadata_scope'] = record['metadata_scope']
+        out.loc[idx, 'rule_version'] = record['schema_version']
+        out.loc[idx, 'config_digest'] = record['config_digest']
+        for name, attr in record['attributes'].items():
+            val = attr['value']
+            out.loc[idx, name] = json.dumps(val) if isinstance(val, (dict, list)) else val
+            out.loc[idx, name + '_status'] = attr['status']
+        out.loc[idx, 'attribute_evidence_json'] = json.dumps(record['attributes'], ensure_ascii=False)
+        out.loc[idx, 'supervision_mask_json'] = json.dumps(record['supervision_mask'])
+    return out
 
 
 def generate_standardized_name(row):
@@ -1165,3 +985,4 @@ if __name__ == '__main__':
 
     df_classified.to_excel('classified_data.xlsx', index=False)
     print("消耗时间%.1f秒" % (time()-startTime))
+

@@ -74,3 +74,10 @@ src/
 - `H217_RESEARCH_EXPORT_DEPLOYMENT_20261030.md`：当前入口、用法、边界、发布门、部署回执与定点回退。
 
 多日增量：`src/research_export/leases.py`维护固定批准内的短租约，`queue.py`负责217持久串行队列/批次/恢复/退避；`deploy/research_export/upgrade_multiday.py`校验包摘要后仅更新并重启研究服务。当前上线状态以部署说明的增量回执为准。
+
+## MR 语义扩展（2026-10-31）
+
+- `src/core/mr_semantics.py`：统一多值解析、逐属性证据/冲突、规则版本与监督掩码。
+- `src/core/mr_index.py`：增强 MR 功能组来源解析、可选 header 帧索引及 Excel 摘要；不声称转换体积已对齐。
+- `test/test_mr_semantics.py`：语义反例、标准/增强 DICOM、缓存与 Excel 集成回归。
+- `docs/MR_SEMANTICS_V2.md`：输出契约、默认开关、兼容性与未完成的实证验证。

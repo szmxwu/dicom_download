@@ -156,3 +156,7 @@ options 指纹补入 `auto_metadata/auto_organize/rename_mr_series/extra_derived
 用户批准多日传输。root可用--days 1..14一次批准固定export/manifest/证书/病例及总额；服务账号只能取得600秒租约，在原批准内自动刷新，租约token稳定并由SQLite保存以支持网关重启，服务端逐块重查root批准及租约；刷新不写policy、不清零usage。217单worker持久SQLite队列先提交后回复，断网退避、重启恢复、If-Match续传和SHA终验；撤销/过期/配额拒绝停止，不能创建新grant自救。发布区无自动清理，磁盘水位暂停而不删数据。覆盖已发布产物，不接入原5005/PACS写接口。理由：数天工作不能依赖终端或单个24小时令牌，同时不能靠续期扩大批准范围。验证与部署进度见部署说明增量节。
 
 多日现场验收补充：并发名额冲突用429与授权拒绝404区分；短租约续期不清零额度；持久任务成功清除历史error。网关启用SO_REUSEADDR以恢复TIME_WAIT后的监听，不启用SO_REUSEPORT，重复监听由专项证明仍失败。源码/193/217部署与故障证据见交付说明。
+
+### D30. MR 属性证据与交付分类分离（2026-10-31）
+
+依据 main `062ff9e` 的源码及 `test/test_mr_semantics.py` 合成反例，移除 T1+对比剂字段强制增强、重复采集自动 PRE/POST、Dixon 全输出压脂等路径。保留旧分类/命名接口，新增 MR_Cleaned_v2 逐属性证据、未知/冲突状态与监督掩码；历史 `_FAT` 必须从原始证据重新判定，不批量迁移。多帧/多回波/多 b 值 header 索引通过 MR_FRAME_INDEX_ENABLED 显式启用，默认不增加生产全量头部 I/O；候选体积与转换输出的映射保留 UNVERIFIED。结果缓存包含语义版本/配置/索引开关。理由：交付便利与可用训练真值是不同契约，缺失或重复采集不能自动成为阴性或增强证据。边界与真实队列后续验证见 [MR_SEMANTICS_V2.md](MR_SEMANTICS_V2.md)。此次没有部署生产。

@@ -32,6 +32,8 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import pandas as pd
 import pydicom
 import re
+from src.core.mr_index import representative_metadata, attach_mr_index
+from src.utils.offload import run_cpu_bound
 
 from src.core.qc import ImageQualityResult, assess_converted_file_quality as _default_assess_file_qc, assess_series_quality_converted as _default_assess_series_qc
 
@@ -592,6 +594,13 @@ def extract_dicom_metadata(
                             metadata[keyword] = ""
                     except Exception:
                         metadata[keyword] = ""
+                if str(modality).upper() == 'MR':
+                    metadata.update(representative_metadata(dcm))
+                    try:
+                        run_cpu_bound(attach_mr_index, [metadata], dicom_files, series_path)
+                    except Exception as exc:
+                        metadata['mr_index_status'] = 'failed'
+                        logger.warning('MR frame index failed: %s', type(exc).__name__)
                 series_quality_result = assess_series_quality_converted(converted_files, modality, series_path)
                 metadata['Low_quality'] = series_quality_result.get('low_quality', 1)
                 metadata['Low_quality_reason'] = series_quality_result.get('low_quality_reason', '')
@@ -708,3 +717,4 @@ def extract_dicom_metadata(
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return None
+

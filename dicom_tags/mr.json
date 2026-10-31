@@ -54,5 +54,20 @@
   "MiddleSOPInstanceUID",
   "dcm",
   "metafilename",
-  "b_value"
+  "b_value",
+  "DiffusionBValue",
+  "DiffusionGradientOrientation",
+  "FrameOfReferenceUID",
+  "AcquisitionDateTime",
+  "AcquisitionDate",
+  "AcquisitionTime",
+  "FrameAcquisitionDateTime",
+  "TemporalPositionIndex",
+  "AcquisitionContrast",
+  "EchoPulseSequence",
+  "SteadyStatePulseSequence",
+  "SpectrallySelectedSuppression",
+  "InversionRecovery",
+  "ComplexImageComponent",
+  "ContrastBolusAgentAdministered"
 ]
