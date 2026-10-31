@@ -320,7 +320,7 @@ def extract_atomic_features(df, cfg: dict, progress_callback=None):
         return refined_default
     df['refinedImageType'] = df.apply(get_refined_type, axis=1)
     # 派生图/二次成像便捷标记列（与 MR_YOLO 侧输出对齐）
-    df['isDerivedImage'] = df.get('ImageType', pd.Series('', index=df.index)).apply(lambda v: 'DERIVED' in parse_multivalue(v))
+    df['isDerivedImage'] = df['refinedImageType'].eq('DERIVED')
     df['isSecondaryImage'] = df.get('ImageType', pd.Series('', index=df.index)).apply(lambda v: 'SECONDARY' in parse_multivalue(v))
 
     if progress_callback:
@@ -827,8 +827,12 @@ def propagate_enhancement_status(df, cfg: dict, progress_callback=None):
                 continue
             key, _ = acquisition_time(row)
             if key and key[0] != 'TM' and any(t and t[0] == key[0] and key[1] > t[1] for _, t in posts):
-                df.loc[idx, 'dynamicPhase'] = 'POST_PROPAGATED'
-    return _update_contrast_columns(df)
+                propagated = str(cfg.get('propagate', {}).get('propagated_phase', 'POST_PROPAGATED'))
+                df.loc[idx, 'dynamicPhase'] = propagated
+                df.loc[idx, 'contrast_administration_state'] = propagated
+                df.loc[idx, 'isContrastEnhanced'] = True
+    # 不再从原始字段重算，避免覆盖刚传播的阶段和自定义 propagated_phase。
+    return df
 
 
 # ==============================================================================

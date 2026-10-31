@@ -33,6 +33,7 @@ import pandas as pd
 import pydicom
 import re
 from src.core.mr_index import representative_metadata, attach_mr_index
+from src.utils.offload import run_cpu_bound
 
 from src.core.qc import ImageQualityResult, assess_converted_file_quality as _default_assess_file_qc, assess_series_quality_converted as _default_assess_series_qc
 
@@ -596,7 +597,7 @@ def extract_dicom_metadata(
                 if str(modality).upper() == 'MR':
                     metadata.update(representative_metadata(dcm))
                     try:
-                        attach_mr_index([metadata], dicom_files, series_path)
+                        run_cpu_bound(attach_mr_index, [metadata], dicom_files, series_path)
                     except Exception as exc:
                         metadata['mr_index_status'] = 'failed'
                         logger.warning('MR frame index failed: %s', type(exc).__name__)

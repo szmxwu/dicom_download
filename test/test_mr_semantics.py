@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.core.mr_clean import (process_mri_dataframe, load_mr_clean_config, detect_fat_suppression,
                                get_subtype_suffix, build_v2_dataframe, generate_standardized_name)
 from src.core.mr_semantics import (parse_multivalue, contrast_attributes, fat_attributes,
-                                  build_semantics, acquisition_time)
+                                  build_semantics, acquisition_time, water_fat_component)
 from src.core.mr_index import (build_mr_frame_index, representative_metadata, attach_mr_index)
 
 
@@ -48,7 +48,8 @@ def test_multivalue_encodings_equivalent(encoding, cfg):
 
 
 @pytest.mark.parametrize('token,expected,fs', [('WATER', 'WATER_ONLY', True), ('FAT', 'FAT_ONLY', False),
-                                            ('INPHASE', 'IN_PHASE', False), ('OUTPHASE', 'OPPOSED_PHASE', False)])
+                                            ('INPHASE', 'IN_PHASE', False), ('OUTPHASE', 'OPPOSED_PHASE', False),
+                                            ('OPP_PHASE', 'OPPOSED_PHASE', False)])
 def test_dixon_four_outputs(cfg, token, expected, fs):
     r = process_mri_dataframe(pd.DataFrame([row(ProtocolName='t1_dixon', SeriesDescription='t1_dixon',
                                                 ImageType=['ORIGINAL', 'PRIMARY', token])]), cfg).iloc[0]
@@ -400,3 +401,108 @@ def test_standard_diffusion_b_dataframe_alias(cfg):
                                                DiffusionBValue=1000)]), cfg).iloc[0]
     assert r.sequenceClass == 'DWI'
     assert r.b_value == 1000
+
+
+@pytest.mark.parametrize('phrase', ['no contrast', 'not enhanced', '未增强', '非增强'])
+def test_negative_enhancement_phrases_stay_pre(cfg, phrase):
+    r = process_mri_dataframe(pd.DataFrame([row(ProtocolName=phrase, SeriesDescription=phrase)]), cfg).iloc[0]
+    assert r.dynamicPhase == 'PRE'
+    assert not r.isContrastEnhanced
+    assert '_C+' not in generate_standardized_name(r)
+
+
+def test_single_letter_components_require_dixon_context(cfg):
+    for name, expected in [('t1_ax_w', 'UNKNOWN'), ('t1_ax_f', 'UNKNOWN')]:
+        assert water_fat_component(row(ProtocolName=name, SeriesDescription=name))['value'] == expected
+    for name, expected in [('t1_dixon_w', 'WATER_ONLY'), ('t1_dixon_f', 'FAT_ONLY'),
+                           ('t1_dixon_opp', 'OPPOSED_PHASE')]:
+        assert water_fat_component(row(ProtocolName=name, SeriesDescription=name))['value'] == expected
+
+
+def test_dixon_component_family_mapping(cfg):
+    cases = [
+        ('T1_GRE_SPOILED_FAT', 'T1_fat_only'),
+        ('T1_GRE_SPOILED_WATER', 'T1_fat_suppressed'),
+        ('T1_GRE_SPOILED_INPHASE', 'T1_in_phase'),
+        ('T1_GRE_SPOILED_OUTPHASE', 'T1_out_phase'),
+        ('T2_TSE_WATER', 'T2_fat_suppressed'),
+        ('T2_GRE', 'T2_anatomic'),
+        ('T2_GRE_SPOILED', 'T2_anatomic'),
+        ('T2_GRE_STEADY_STATE', 'T2_anatomic'),
+        ('PD_UNKNOWN', 'PD'),
+    ]
+    for sequence_class, expected in cases:
+        r = row(ProtocolName='t1_vibe_dixon', SeriesDescription='t1_vibe_dixon')
+        r['sequenceClass'] = sequence_class
+        from src.core.mr_clean import _get_sequence_family
+        assert _get_sequence_family(sequence_class, cfg) == expected
+
+
+def test_derived_boolean_matches_refined_type(cfg):
+    for description in ['motion curve', 'report', 'efilm']:
+        r = process_mri_dataframe(pd.DataFrame([row(SeriesDescription=description)]), cfg).iloc[0]
+        assert r.refinedImageType == 'DERIVED'
+        assert r.isDerivedImage
+
+
+def test_failed_cleanup_preserves_frame_index_sidecar(tmp_path):
+    from src.client.unified import _drop_failed_series_files
+    series = tmp_path / 'bad'
+    series.mkdir()
+    (series / 'dicom_metadata_cache.json').write_text('{}')
+    (series / 'mr_frame_index.json').write_text('{}')
+    (series / 'partial.nii.gz').write_bytes(b'synthetic')
+    _drop_failed_series_files({'bad': {'path': str(series)}}, {'bad': 'synthetic'})
+    assert (series / 'dicom_metadata_cache.json').is_file()
+    assert (series / 'mr_frame_index.json').is_file()
+    assert not (series / 'partial.nii.gz').exists()
+
+
+def test_rename_updates_all_three_sheets(tmp_path):
+    from src.client.unified import DICOMDownloadClient
+    organized = tmp_path / 'organized'
+    old = organized / 'old'
+    old.mkdir(parents=True)
+    excel = tmp_path / 'metadata.xlsx'
+    pd.DataFrame([row(Modality='MR', SeriesFolder='old', SeriesNumber=1)]).to_excel(
+        excel, sheet_name='DICOM_Metadata', index=False)
+    client = DICOMDownloadClient.__new__(DICOMDownloadClient)
+    client.progress_callback = None
+
+    mapping = client.rename_mr_series_folders(str(organized), str(excel))
+
+    assert mapping
+    new_folder = mapping['old']
+    assert (organized / new_folder).is_dir()
+    with pd.ExcelFile(excel) as book:
+        for sheet in ['DICOM_Metadata', 'MR_Cleaned', 'MR_Cleaned_v2']:
+            assert pd.read_excel(book, sheet).iloc[0].SeriesFolder == new_folder
+
+
+def test_custom_propagated_phase_is_not_overwritten(cfg):
+    cfg['propagate']['enabled'] = True
+    cfg['propagate']['propagated_phase'] = 'CUSTOM_DELAYED'
+    rows = [row(dynamicPhase='POST', AcquisitionDate='20261030', AcquisitionTime='120000'),
+            row(SeriesInstanceUID='1.2.3.9', dynamicPhase='UNKNOWN', AcquisitionDate='20261030', AcquisitionTime='120100')]
+    r = process_mri_dataframe(pd.DataFrame(rows), cfg).iloc[1]
+    assert r.dynamicPhase == 'CUSTOM_DELAYED'
+    assert r.contrast_administration_state == 'CUSTOM_DELAYED'
+    assert r.isContrastEnhanced
+
+
+def test_direct_metadata_index_uses_cpu_offload(tmp_path, monkeypatch):
+    from src.core import metadata as metadata_module
+    from src.client.unified import DICOMDownloadClient
+    client = DICOMDownloadClient.__new__(DICOMDownloadClient)
+    client.progress_callback = None
+    client.modality_keywords = {'MR': json.loads((Path(__file__).parents[1]/'dicom_tags/mr.json').read_text())}
+    folder = tmp_path/'series'; folder.mkdir()
+    ds, path = dicom_file(folder, 'single.dcm')
+    ds.save_as(path)
+    calls = []
+    monkeypatch.setattr(metadata_module, 'run_cpu_bound', lambda func, *args: calls.append(func.__name__) or func(*args))
+    out = tmp_path/'direct.xlsx'
+    result = metadata_module.extract_dicom_metadata(str(tmp_path), str(out), client.get_keywords,
+        lambda _: ([], None), lambda *a, **k: 0, lambda *a: {'low_quality': 0}, client._append_mr_cleaned_sheet)
+    assert result == str(out)
+    assert 'attach_mr_index' in calls

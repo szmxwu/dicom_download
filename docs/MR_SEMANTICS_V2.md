@@ -131,4 +131,38 @@ STIR、标准 b 值、增强型 MR 多帧优先级、帧成员关系、索引失
    图像压脂效果、组织强化和跨对比度组织一致性另做图像验证。
 
 这次 PR 建立了错误修复、证据输出、可选索引和新旧并行比较的基础。
-真实数据差异审计、精确输出体积映射及 MRI_YOLO 训练收益尚未完成。
+精确输出体积映射及 MRI_YOLO 训练收益尚未完成；下述真实数据审计不替代人工金标准验证。
+
+## 2026-10-31 审查加固
+
+- 否定增强短语覆盖 `no contrast / not enhanced / 未增强 / 非增强`；不再输出错误的 POST/C+。
+- 单字母 W/F/IP/OP 仅在明确 Dixon 上下文中用于成分识别；补充西门子
+  `OPP_PHASE` 结构化标记及 Dixon 名称 `_opp` 后缀。
+- 补齐 GRE/SPOILED/TSE 的 fat-only、fat-suppressed、in-phase、opposed-phase 家族映射，
+  以及 `T2_GRE*`、`PD_UNKNOWN` 的既有分类到家族映射。
+- `isDerivedImage` 与 `refinedImageType` 保持一致；失败清理保留 `mr_frame_index.json`。
+- MR 重命名同步 `DICOM_Metadata`、`MR_Cleaned`、`MR_Cleaned_v2` 三表的 SeriesFolder。
+- 自定义 `propagated_phase` 不再被重算覆盖；直接元数据索引使用 `run_cpu_bound()`。
+
+## 2026-10-31 真实数据审计
+
+审计只读取 `/mnt/d/download/MRdownloads` 的元数据 Excel，不读取 NIfTI 像素：
+
+- 全量读取实际存在的 9260 个检查目录、110984 条序列，Excel 读取错误为 0；
+  `isDerivedImage` 与 `refinedImageType` 不一致为 0，否定增强短语误判 POST 为 0。
+- 初轮 8053 条 `sequenceFamily=UNKNOWN` 中，6424 条为 `EXCLUDED`，793 条为
+  `sequenceClass=UNKNOWN`，其余 836 条是家族映射遗漏，不是应当一律修复的分类错误。
+  补齐映射后剩余 7217 条 UNKNOWN 家族，均属于上述排除或保守未知类别。
+- 患者去重分层抽样 484 个检查，覆盖 Siemens、UIH、Philips、GE、安科及多部位；
+  其中 480 个可按内部 AccessionNumber 直接重读，共复核 5442 条序列。
+  4 个检查的目录名与内部 AccessionNumber 不同，不影响全量审计。
+- 分层样本中 367 条 Dixon 序列：水像 184、脂像 123、同相位 31、反相位 28；
+  已分类序列的成分与命名后缀不一致为 0。另有一条已排除 PosDisp 的结构化 WATER
+  与名称 F 冲突，按设计保留 CONFLICT，没有静默覆盖。
+- 与 MR_YOLO 弱标签可按系列匹配的 3565 条中，家族一致 3242 条。323 条分歧主要是
+  本 PR 有意细分的水脂成分、定量图家族口径差异及弱标签误标；弱标签不是人工金标准，
+  该一致率不能解释为准确率。
+- 484 条代表记录的 V2 JSON 均可解析，必需属性、状态和监督掩码检查无错误。
+
+验证：专项 68 passed，全套 253 passed / 3 skipped。仍未验证真实 NIfTI 候选体积映射、
+图像层面的组织强化/压脂效果，以及独立人工测试集上的逐属性 precision。

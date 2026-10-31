@@ -88,8 +88,8 @@ def _component_values(tokens):
     aliases = {'W': 'WATER_ONLY', 'WATER': 'WATER_ONLY', 'WATER_ONLY': 'WATER_ONLY',
                'F': 'FAT_ONLY', 'FAT': 'FAT_ONLY', 'FAT_ONLY': 'FAT_ONLY',
                'IP': 'IN_PHASE', 'INPHASE': 'IN_PHASE', 'IN_PHASE': 'IN_PHASE',
-               'OP': 'OPPOSED_PHASE', 'OUTPHASE': 'OPPOSED_PHASE',
-               'OUT_PHASE': 'OPPOSED_PHASE', 'OPPOSED_PHASE': 'OPPOSED_PHASE'}
+               'OP': 'OPPOSED_PHASE', 'OPP': 'OPPOSED_PHASE', 'OUTPHASE': 'OPPOSED_PHASE',
+               'OPP_PHASE': 'OPPOSED_PHASE', 'OUT_PHASE': 'OPPOSED_PHASE', 'OPPOSED_PHASE': 'OPPOSED_PHASE'}
     return {aliases[t] for t in tokens if t in aliases}
 
 
@@ -99,11 +99,19 @@ def water_fat_component(row):
     # Token boundaries prevent "fat" in fatsat/fat sat/fat suppression becoming a fat image.
     name = name_text(row)
     patterns = {
-        'WATER_ONLY': r'(?<![a-z0-9])(?:water(?![ _-]?exc)(?:[ _-]?only)?|w)(?![a-z0-9])',
-        'FAT_ONLY': r'(?<![a-z0-9])(?:fat(?![ _-]*(?:sat|supp|sep))|fat[ _-]?only|f)(?![a-z0-9])',
-        'IN_PHASE': r'(?<![a-z0-9])(?:in[ _-]?phase|ip)(?![a-z0-9])',
-        'OPPOSED_PHASE': r'(?<![a-z0-9])(?:out[ _-]?phase|opposed[ _-]?phase|op)(?![a-z0-9])',
+        'WATER_ONLY': r'(?<![a-z0-9])(?:water(?![ _-]?exc)(?:[ _-]?only)?)(?![a-z0-9])',
+        'FAT_ONLY': r'(?<![a-z0-9])(?:fat(?![ _-]*(?:sat|supp|sep))|fat[ _-]?only)(?![a-z0-9])',
+        'IN_PHASE': r'(?<![a-z0-9])(?:in[ _-]?phase)(?![a-z0-9])',
+        'OPPOSED_PHASE': r'(?<![a-z0-9])(?:out[ _-]?phase|opposed[ _-]?phase)(?![a-z0-9])',
     }
+    # 单字母 W/F/IP/OP 只在明确 Dixon 上下文中使用，避免普通协议后缀误伤。
+    if 'dixon' in name:
+        patterns.update({
+            'WATER_ONLY': r'(?<![a-z0-9])(?:water(?![ _-]?exc)(?:[ _-]?only)?|w)(?![a-z0-9])',
+            'FAT_ONLY': r'(?<![a-z0-9])(?:fat(?![ _-]*(?:sat|supp|sep))|fat[ _-]?only|f)(?![a-z0-9])',
+            'IN_PHASE': r'(?<![a-z0-9])(?:in[ _-]?phase|ip)(?![a-z0-9])',
+            'OPPOSED_PHASE': r'(?<![a-z0-9])(?:out[ _-]?phase|opposed[ _-]?phase|opp|op)(?![a-z0-9])',
+        })
     candidates += [(v, 'inferred', evidence(row, 'ProtocolName', 'SeriesDescription'))
                    for v, pattern in patterns.items() if re.search(pattern, name)]
     return resolve(candidates, 'water-fat-component')
@@ -185,7 +193,9 @@ def contrast_attributes(row):
         ev = evidence(row, key)
         if text == 'conflict':
             candidates.extend([('PRE', 'inferred', ev), ('POST', 'inferred', ev)])
-        pre = r'(?<![a-z])(?:pre(?:[ _-]?(?:contrast|con|gd|enh))?|non[ _-]?contrast|unenhanced|without[ _-]?contrast)(?![a-z])|平扫|增强前'
+        pre = (r'(?<![a-z])(?:pre(?:[ _-]?(?:contrast|con|gd|enh))?|'
+               r'no[ _-]?contrast|non[ _-]?contrast|not[ _-]?(?:contrast|enhanced)|'
+               r'unenhanced|without[ _-]?contrast)(?![a-z])|平扫|增强前|未增强|非增强')
         if re.search(pre, text):
             candidates.append(('PRE', 'inferred', ev))
         # Remove negative/pre phrases before checking positive evidence in the same field.

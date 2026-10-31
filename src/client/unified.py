@@ -65,9 +65,10 @@ def _drop_failed_series_files(series_info, conversion_errors):
 
     原始 DICOM 含完整患者头信息，随 zip 交付给客户端有隐私泄露风险。
     删除失败序列目录中的全部数据文件（原始 DICOM + 转换残留的部分 nii/npz），
-    仅保留 dicom_metadata_cache.json 供 Excel 记录该序列的失败信息。
+    仅保留 dicom_metadata_cache.json 和 mr_frame_index.json 供 Excel 记录失败信息及索引证据。
     失败清单仍记入 results['conversion_errors'] 供客户端审阅。
     """
+    preserved_files = {'dicom_metadata_cache.json', 'mr_frame_index.json'}
     for name in conversion_errors:
         info = series_info.get(name) or {}
         series_dir = info.get('path')
@@ -78,7 +79,7 @@ def _drop_failed_series_files(series_info, conversion_errors):
         # 打包器同样递归遍历子目录。删除失败必须 fail closed，不能继续打包。
         for root, dirs, files in os.walk(series_dir, topdown=False):
             for fname in files:
-                if fname.lower() == 'dicom_metadata_cache.json':
+                if fname.lower() in preserved_files:
                     continue
                 fpath = os.path.join(root, fname)
                 try:
@@ -2075,7 +2076,7 @@ class DICOMDownloadClient:
         """
         import pandas as pd
         import shutil
-        from src.core.mr_clean import process_mri_dataframe, generate_standardized_name
+        from src.core.mr_clean import process_mri_dataframe, generate_standardized_name, build_v2_dataframe
 
         try:
             if not os.path.isfile(excel_path):
@@ -2155,11 +2156,16 @@ class DICOMDownloadClient:
                 except Exception as e:
                     logger.error(f"[MR_RENAME] Failed to rename {old_name}: {e}")
 
-            # 更新 Excel 中的 SeriesFolder
+            # 原始表和两个清洗表都同步新目录，避免证据/索引指向旧路径。
             if renamed_count > 0:
                 df['SeriesFolder'] = df['SeriesFolder'].astype(str).replace(rename_map)
+                cleaned_df['SeriesFolder'] = cleaned_df['SeriesFolder'].astype(str).replace(rename_map)
                 with pd.ExcelWriter(excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
                     df.to_excel(writer, sheet_name='DICOM_Metadata', index=False)
+                    cleaned_df.drop(columns=['mr_semantics_v2'], errors='ignore').to_excel(
+                        writer, sheet_name='MR_Cleaned', index=False)
+                    build_v2_dataframe(cleaned_df).to_excel(
+                        writer, sheet_name='MR_Cleaned_v2', index=False)
                 logger.info(f"[MR_RENAME] Updated Excel with {renamed_count} renamed folders")
 
             return rename_map
