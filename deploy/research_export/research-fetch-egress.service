@@ -1,0 +1,10 @@
+[Unit]
+Description=Restrict 217 research-fetch network identity
+After=ufw.service
+Before=research-fetch.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/research-fetch-egress fetch
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

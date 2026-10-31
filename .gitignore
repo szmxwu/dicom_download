@@ -225,3 +225,10 @@ test/*
 !test/test_memory_pipeline.py
 !test/test_disk_backpressure.py
 !test/test_task_recovery.py
+
+# Controlled research export source, design and regression coverage
+!test/test_research_export.py
+!docs/
+docs/*
+!docs/H217_RESTRICTED_RESEARCH_EXPORT_DESIGN_20261030.md
+!docs/H217_RESEARCH_EXPORT_DEPLOYMENT_20261030.md

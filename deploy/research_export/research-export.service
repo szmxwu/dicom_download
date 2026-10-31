@@ -1,0 +1,32 @@
+[Unit]
+Description=Approved research artifact mTLS gateway
+After=network-online.target research-export-egress.service
+Requires=research-export-egress.service
+[Service]
+User=research-export
+Group=research-export
+WorkingDirectory=/opt/research-export
+ExecStart=/usr/bin/python3 -I /opt/research-export/launch_gateway.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/research-export
+ReadOnlyPaths=/srv/research-export/published /etc/research-export /opt/research-export
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_UNIX
+MemoryMax=256M
+TasksMax=32
+CPUQuota=100%
+Nice=10
+IOSchedulingClass=idle
+IOWeight=10
+[Install]
+WantedBy=multi-user.target

@@ -146,3 +146,13 @@ CTA017真实完整DICOM及1,024/1,025层边界实验确认dcm2niix超1,024层提
 缓存淘汰同时约束 `CACHE_MAX_GB` 和 `CACHE_MIN_FREE_GB`（默认跟随下载恢复线）：任一越线均按 atime 淘汰，直到容量与真实空闲均达标。删除后必须重新 `disk_usage` 采样，硬链接不能按逻辑大小虚增空闲量。save/copy 与 LRU 按 cache key 互斥，冲突时回退 PACS 或下轮重试；互斥锁在 eventlet 下必须来自 `original('threading')`，只允许微秒级状态操作。普通结果清理的 `finally` 和服务启动都会异步调度缓存维护，避免“没有普通可删项”阻断恢复。
 
 options 指纹补入 `auto_metadata/auto_organize/rename_mr_series/extra_derived_keywords`，防止不同交付语义错误合并；该变更使旧缓存键失配一次。回归覆盖并发重连、options 差异、容量/空闲双阈值、硬链接、活跃 IO 与 eventlet 原生锁竞争，全套 193 passed / 3 skipped。
+
+### D28. 217研究下载采用独立出口与发布授权（2026-10-30）
+
+用户已批准并部署阶段1：193独立8443 mTLS出口，5005保持对217阻断；独立217 fetch身份保管密钥，研究Agent通过Unix socket提交受控ID。可信root发布工具按单文件摘要/像素复核记录净化已有NII/NPZ/Excel/PNG结果，服务端按证书、数据集manifest和额度授权并可撤销。原ZIP不直接发布，原生DICOM和新PACS获取不隐含在诊断或下载授权内；同UID不同Agent及完整root维护者不纳入强隔离保证。具体实现与验收见H217_RESEARCH_EXPORT_DEPLOYMENT_20261030.md。
+
+### D29. 多日批准与短租约分离；队列持久化而非延长HTTP等待（2026-10-30）
+
+用户批准多日传输。root可用--days 1..14一次批准固定export/manifest/证书/病例及总额；服务账号只能取得600秒租约，在原批准内自动刷新，租约token稳定并由SQLite保存以支持网关重启，服务端逐块重查root批准及租约；刷新不写policy、不清零usage。217单worker持久SQLite队列先提交后回复，断网退避、重启恢复、If-Match续传和SHA终验；撤销/过期/配额拒绝停止，不能创建新grant自救。发布区无自动清理，磁盘水位暂停而不删数据。覆盖已发布产物，不接入原5005/PACS写接口。理由：数天工作不能依赖终端或单个24小时令牌，同时不能靠续期扩大批准范围。验证与部署进度见部署说明增量节。
+
+多日现场验收补充：并发名额冲突用429与授权拒绝404区分；短租约续期不清零额度；持久任务成功清除历史error。网关启用SO_REUSEADDR以恢复TIME_WAIT后的监听，不启用SO_REUSEPORT，重复监听由专项证明仍失败。源码/193/217部署与故障证据见交付说明。

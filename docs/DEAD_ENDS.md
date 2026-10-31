@@ -83,3 +83,7 @@
 ### X19. 把 `get_fdata()` 换成 `dataobj` 或直接 canonical，就宣称已消除整卷内存
 - 否定：2026-10-24 代码审查实证。`np.asanyarray(img.dataobj)` 仍会加载整卷，非单位 slope/intercept 仍产生 float64；`nib.as_closest_canonical()` 在非恒等仿射下会先整卷重排。抽样先于 NaN/Inf 过滤还会改变旧 QC 口径；自行映射方向时把 `orientation[:,0]` 当输出轴顺序会在循环排列/轴交换叠加翻转时读错切片。
 - 正解：QC 用 `get_unscaled()` 并仅在样本/中间层缩放，浮点先过滤再抽样；预览用源轴翻转 + `argsort` 转置的懒索引代理，且以全部 48 种方向对照 nibabel（D25）。
+
+## 研究出口把暂时无并发名额当作404授权拒绝（2026-10-30）
+
+真实SIGKILL恢复实验中，旧连接未释放时返回404使合法队列进入BLOCKED，无法无人值守续跑。不得把并发忙混入授权拒绝；按429/Retry-After返回，由队列有界退避。真正撤销/过期仍拒绝，不让客户端通过新建授权绕过。证据：H217_RESEARCH_EXPORT_DEPLOYMENT_20261030.md多日现场验收及test_research_export.py的lingering_stream_slot回归。

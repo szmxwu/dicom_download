@@ -61,3 +61,16 @@ src/
 - 日志：`logs/app.log`（INFO 级；提交审计含 IP+options）
 
 - 2026-10-02：生产几何v3剩余验收已移交[具体交接清单](CTA_GEOMETRY_V3_PRODUCTION_ACCEPTANCE_HANDOFF_20261002.md)，下载空闲时实施；不阻塞CT_YOLO存量数据清理与主线。
+
+## 217受限研究下载设计（2026-10-30）
+
+`H217_RESTRICTED_RESEARCH_EXPORT_DESIGN_20261030.md`：新增193研究出口、217独立下载身份与按批次授权的设计蓝图；阶段1与多日传输现已部署，当前实测与限制以交付说明为准，新PACS获取仍未接入。
+
+## 217受限研究出口（阶段1已部署）
+
+- `src/research_export/`：独立网关、可信发布、root审批CLI和217受控代理，不导入旧5005服务。
+- `deploy/research_export/`：root部署、systemd与专用UID出站限制，私钥不在仓库。
+- `test/test_research_export.py`：合成数据隐私/几何保持、TLS授权、撤销、限额、续传与客户端范围测试。
+- `H217_RESEARCH_EXPORT_DEPLOYMENT_20261030.md`：当前入口、用法、边界、发布门、部署回执与定点回退。
+
+多日增量：`src/research_export/leases.py`维护固定批准内的短租约，`queue.py`负责217持久串行队列/批次/恢复/退避；`deploy/research_export/upgrade_multiday.py`校验包摘要后仅更新并重启研究服务。当前上线状态以部署说明的增量回执为准。

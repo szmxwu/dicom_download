@@ -1,0 +1,36 @@
+[Unit]
+Description=217 scoped research download service
+After=network-online.target research-fetch-egress.service
+Requires=research-fetch-egress.service
+[Service]
+User=research-fetch
+Group=research-fetch
+SupplementaryGroups=research-export-readers
+WorkingDirectory=/opt/research-fetch
+RuntimeDirectory=research-fetch
+RuntimeDirectoryMode=0750
+ExecStartPre=/usr/bin/chgrp research-export-readers /run/research-fetch
+ExecStart=/usr/bin/python3 -I /opt/research-fetch/launch_fetch.py
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/research-fetch /srv/research/research_exports
+ReadOnlyPaths=/etc/research-fetch /opt/research-fetch
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_UNIX
+MemoryMax=128M
+TasksMax=16
+CPUQuota=100%
+Nice=10
+IOSchedulingClass=idle
+IOWeight=10
+[Install]
+WantedBy=multi-user.target

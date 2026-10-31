@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 -I /opt/research-fetch/client.py "$@"

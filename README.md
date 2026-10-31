@@ -19,6 +19,10 @@ Developer/agent documentation lives in `docs/` (see `docs/DOCUMENTATION_SYSTEM.m
 - **Derived Series Filtering**: Automatically filter out MPR, MIP, 3D VR, and other derived/reconstructed series (enabled by default).
 - **Smart Filtering**: Configurable filters for modality, minimum series file count (default: 10 for 3D volumes), and derived series exclusion.
 
+## Restricted research exports
+
+`src/research_export` provides a separate mTLS artifact gateway and an identity-isolated download service for approved NIfTI/NPZ, metadata and PNG exports. Legacy PACS and administration APIs are not exposed through this gateway. Trusted-side publication requires a file-bound review and explicit dataset grants. The fetch service supports durable batches, automatic retry/resume and short access leases within a fixed approval of up to 14 days. See [deployment and usage](docs/H217_RESEARCH_EXPORT_DEPLOYMENT_20261030.md) for supported formats and limits.
+
 ## Installation
 
 1. Clone the repository.

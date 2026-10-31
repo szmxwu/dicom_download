@@ -1,0 +1,10 @@
+[Unit]
+Description=Restrict research gateway new outbound connections
+After=ufw.service
+Before=research-export.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/research-export-egress gateway
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
