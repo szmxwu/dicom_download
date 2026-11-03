@@ -23,7 +23,7 @@ import warnings
 from time import time
 from .mr_semantics import (parse_multivalue, fat_attributes, water_fat_component,
                            contrast_attributes, is_stir_candidate, field_thresholds,
-                           acquisition_time, text_value, number, v2_record, build_semantics)
+                           acquisition_time, text_value, number, v2_record, build_semantics, RULE_VERSION)
 # 忽略Pandas在进行apply操作时可能产生的性能警告
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 
@@ -796,7 +796,7 @@ def analyze_dynamic_series(df, cfg: dict, progress_callback=None):
         df.loc[indices, 'temporal_group'] = group_id
         # Frame UID and coverage are desirable evidence, never assumed from missing values.
         df.loc[indices, 'temporal_relation_status'] = 'candidate'
-        relation = dict(rule_id='repeated-acquisition-candidate', rule_version='mr-semantic-v2.1',
+        relation = dict(rule_id='repeated-acquisition-candidate', rule_version=RULE_VERSION,
                         geometry='representative_position_and_orientation',
                         frame_of_reference_present=bool(fp[1]), coverage='unverified', registration='unverified')
         df.loc[indices, 'temporal_evidence'] = json.dumps(relation)
@@ -813,25 +813,43 @@ def analyze_dynamic_series(df, cfg: dict, progress_callback=None):
 def propagate_enhancement_status(df, cfg: dict, progress_callback=None):
     """Optional conservative propagation using complete comparable acquisition dates.
 
-    Explicit PRE/CONFLICT is protected. Time-only values cannot resolve midnight.
+    Explicit PRE/CONFLICT and negative agent records are protected. Time-only values
+    cannot resolve midnight. Custom phases stay in dynamicPhase; the canonical state
+    and V2 evidence always use POST for an inferred post-contrast acquisition.
     """
     if not cfg.get('propagate', {}).get('enabled', False) or 'StudyInstanceUID' not in df:
         return df
+    if 'contrast_propagation_evidence' not in df.columns:
+        df['contrast_propagation_evidence'] = ''
     for _, group in df.groupby('StudyInstanceUID'):
         posts = [(idx, acquisition_time(r)[0]) for idx, r in group.iterrows()
                  if contrast_attributes(r)['contrast_administration_state']['value'] == 'POST']
         for idx, row in group.iterrows():
-            if contrast_attributes(row)['contrast_administration_state']['value'] != 'UNKNOWN':
+            contrast = contrast_attributes(row)
+            if contrast['contrast_administration_state']['value'] != 'UNKNOWN':
+                continue
+            if contrast['contrast_agent_recorded']['value'] is False:
                 continue
             if not str(row.get('sequenceClass', '')).startswith('T1_'):
                 continue
-            key, _ = acquisition_time(row)
-            if key and key[0] != 'TM' and any(t and t[0] == key[0] and key[1] > t[1] for _, t in posts):
+            key, target_time_source = acquisition_time(row)
+            prior = [(source_idx, t) for source_idx, t in posts
+                     if t and key and t[0] == key[0] and key[1] > t[1]] if key and key[0] != 'TM' else []
+            if prior:
+                source_idx, source_time = max(prior, key=lambda item: item[1][1])
+                source = df.loc[source_idx]
                 propagated = str(cfg.get('propagate', {}).get('propagated_phase', 'POST_PROPAGATED'))
+                evidence = {
+                    'source_series_instance_uid': text_value(source.get('SeriesInstanceUID')),
+                    'source_time_seconds': source_time[1], 'target_time_seconds': key[1],
+                    'time_basis': key[0], 'source_time_field': acquisition_time(source)[1],
+                    'target_time_field': target_time_source,
+                    'rule_id': 'post-acquisition-propagation', 'rule_version': RULE_VERSION,
+                }
                 df.loc[idx, 'dynamicPhase'] = propagated
-                df.loc[idx, 'contrast_administration_state'] = propagated
+                df.loc[idx, 'contrast_administration_state'] = 'POST'
                 df.loc[idx, 'isContrastEnhanced'] = True
-    # 不再从原始字段重算，避免覆盖刚传播的阶段和自定义 propagated_phase。
+                df.loc[idx, 'contrast_propagation_evidence'] = json.dumps(evidence, ensure_ascii=False)
     return df
 
 

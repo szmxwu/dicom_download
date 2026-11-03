@@ -6,7 +6,7 @@ import math
 import re
 
 
-RULE_VERSION = 'mr-semantic-v2.1'
+RULE_VERSION = 'mr-semantic-v2.2'
 MISSING = {'', 'nan', 'none', 'null', 'n/a', 'unknown', '<na>'}
 
 
@@ -203,6 +203,14 @@ def contrast_attributes(row):
         post = r'\+c|(?<![a-z])(?:post(?:[ _-]?contrast)?|gd|enh(?:anced)?|contrast)(?![a-z])|增强后|增强'
         if re.search(post, remainder):
             candidates.append(('POST', 'inferred', ev))
+    propagation = text_value(row.get('contrast_propagation_evidence'))
+    if propagation:
+        try:
+            valid_propagation = isinstance(json.loads(propagation), dict)
+        except (ValueError, TypeError):
+            valid_propagation = False
+        if valid_propagation:
+            candidates.append(('POST', 'inferred', evidence(row, 'contrast_propagation_evidence')))
     # DICOM frame-level administration indicator, unlike an agent name, describes timing.
     administered = text_value(row.get('ContrastBolusAgentAdministered')).upper()
     if administered in ('YES', 'NO'):
@@ -307,6 +315,9 @@ def build_semantics(row, cfg):
     for key, positive, negative in [('is_derived', 'DERIVED', 'ORIGINAL'), ('is_secondary', 'SECONDARY', 'PRIMARY')]:
         attrs[key] = resolve([(t == positive, 'known', evidence(row, 'ImageType'))
                               for t in tokens if t in {positive, negative}], key)
+    refined = text_value(row.get('refinedImageType')).upper()
+    attrs['inferred_derived'] = (fact(refined == 'DERIVED', 'inferred', evidence(row, 'refinedImageType'),
+                                     'refined-image-type-derived') if refined else fact(rule_id='refined-image-type-derived'))
     attrs['orientation'] = fact(rule_id='geometry-missing')
     vals = [number(v) for v in parse_multivalue(row.get('ImageOrientationPatient'))]
     if len(vals) == 6 and all(v is not None for v in vals):
@@ -324,6 +335,11 @@ def v2_record(row, cfg):
     attrs = build_semantics(row, cfg)
     # A mask denotes usable metadata supervision, not empirically calibrated correctness.
     mask = {k: v['status'] == 'known' for k, v in attrs.items()}
+    legacy_derived = row.get('isDerivedImage')
+    if (legacy_derived in (True, False, 0, 1) and attrs['is_derived']['status'] == 'known'
+            and bool(legacy_derived) != attrs['is_derived']['value']):
+        # DICOM source and name-inferred role disagree; do not auto-supervise either meaning.
+        mask['is_derived'] = False
     scope = text_value(row.get('mr_metadata_scope')) or 'series_summary_unverified'
     # No representative-frame label may supervise an entire heterogeneous series.
     heterogeneous = str(row.get('mr_heterogeneous', '')).lower() == 'true'

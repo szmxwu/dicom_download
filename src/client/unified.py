@@ -2135,8 +2135,9 @@ class DICOMDownloadClient:
                 logger.info("[MR_RENAME] No folders need renaming")
                 return {}
 
-            # 执行重命名
+            # 执行重命名，仅将实际成功的目录同步到 Excel 和返回映射。
             renamed_count = 0
+            successful_rename_map = {}
             for old_name, new_name in rename_map.items():
                 old_path = os.path.join(organized_dir, old_name)
                 new_path = os.path.join(organized_dir, new_name)
@@ -2153,13 +2154,14 @@ class DICOMDownloadClient:
                     shutil.move(old_path, new_path)
                     logger.info(f"[MR_RENAME] Renamed: {old_name} -> {new_name}")
                     renamed_count += 1
+                    successful_rename_map[old_name] = new_name
                 except Exception as e:
                     logger.error(f"[MR_RENAME] Failed to rename {old_name}: {e}")
 
             # 原始表和两个清洗表都同步新目录，避免证据/索引指向旧路径。
             if renamed_count > 0:
-                df['SeriesFolder'] = df['SeriesFolder'].astype(str).replace(rename_map)
-                cleaned_df['SeriesFolder'] = cleaned_df['SeriesFolder'].astype(str).replace(rename_map)
+                df['SeriesFolder'] = df['SeriesFolder'].astype(str).replace(successful_rename_map)
+                cleaned_df['SeriesFolder'] = cleaned_df['SeriesFolder'].astype(str).replace(successful_rename_map)
                 with pd.ExcelWriter(excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
                     df.to_excel(writer, sheet_name='DICOM_Metadata', index=False)
                     cleaned_df.drop(columns=['mr_semantics_v2'], errors='ignore').to_excel(
@@ -2168,7 +2170,7 @@ class DICOMDownloadClient:
                         writer, sheet_name='MR_Cleaned_v2', index=False)
                 logger.info(f"[MR_RENAME] Updated Excel with {renamed_count} renamed folders")
 
-            return rename_map
+            return successful_rename_map
         except Exception as e:
             logger.error(f"[MR_RENAME] MR series rename failed: {e}")
             return {}

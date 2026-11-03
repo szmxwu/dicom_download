@@ -484,10 +484,97 @@ def test_custom_propagated_phase_is_not_overwritten(cfg):
     cfg['propagate']['propagated_phase'] = 'CUSTOM_DELAYED'
     rows = [row(dynamicPhase='POST', AcquisitionDate='20261030', AcquisitionTime='120000'),
             row(SeriesInstanceUID='1.2.3.9', dynamicPhase='UNKNOWN', AcquisitionDate='20261030', AcquisitionTime='120100')]
-    r = process_mri_dataframe(pd.DataFrame(rows), cfg).iloc[1]
+    result = process_mri_dataframe(pd.DataFrame(rows), cfg)
+    r = result.iloc[1]
     assert r.dynamicPhase == 'CUSTOM_DELAYED'
-    assert r.contrast_administration_state == 'CUSTOM_DELAYED'
+    assert r.contrast_administration_state == 'POST'
     assert r.isContrastEnhanced
+    attrs = json.loads(r.mr_semantics_v2)['attributes']['contrast_administration_state']
+    assert attrs['value'] == 'POST' and attrs['status'] == 'inferred'
+    assert attrs['evidence'][0]['field'] == 'contrast_propagation_evidence'
+    evidence = json.loads(r.contrast_propagation_evidence)
+    assert evidence['source_series_instance_uid'] == '1.2.3.4'
+    assert build_v2_dataframe(result).iloc[1].contrast_administration_state == 'POST'
+
+
+def test_negative_agent_record_blocks_propagation(cfg):
+    cfg['propagate']['enabled'] = True
+    rows = [row(dynamicPhase='POST'),
+            row(SeriesInstanceUID='1.2.3.9', dynamicPhase='UNKNOWN',
+                AcquisitionTime='120100', ContrastBolusAgent='no')]
+    r = process_mri_dataframe(pd.DataFrame(rows), cfg).iloc[1]
+    assert r.dynamicPhase == 'UNKNOWN'
+    assert r.contrast_administration_state == 'UNKNOWN'
+    assert not r.isContrastEnhanced
+    attrs = json.loads(r.mr_semantics_v2)['attributes']['contrast_administration_state']
+    assert attrs['value'] == 'UNKNOWN' and attrs['status'] == 'unknown'
+
+
+def test_derived_source_and_inferred_role_are_distinct(cfg):
+    r = process_mri_dataframe(pd.DataFrame([row(SeriesDescription='motion curve')]), cfg).iloc[0]
+    record = json.loads(r.mr_semantics_v2)
+    assert r.refinedImageType == 'DERIVED' and r.isDerivedImage
+    assert record['attributes']['is_derived']['value'] is False
+    assert record['attributes']['inferred_derived']['value'] is True
+    assert record['attributes']['inferred_derived']['status'] == 'inferred'
+    assert not record['supervision_mask']['is_derived']
+    assert not record['supervision_mask']['inferred_derived']
+
+
+def test_rename_partial_failure_updates_only_successful(tmp_path, monkeypatch):
+    from src.client.unified import DICOMDownloadClient
+    organized = tmp_path / 'organized'
+    (organized / 'a').mkdir(parents=True)
+    (organized / 'b').mkdir()
+    excel = tmp_path / 'metadata.xlsx'
+    pd.DataFrame([row(Modality='MR', SeriesFolder='a', SeriesNumber=1),
+                  row(Modality='MR', SeriesFolder='b', SeriesNumber=2,
+                      SeriesInstanceUID='1.2.3.9')]).to_excel(
+        excel, sheet_name='DICOM_Metadata', index=False)
+    client = DICOMDownloadClient.__new__(DICOMDownloadClient)
+    client.progress_callback = None
+    import shutil
+    original_move = shutil.move
+
+    def fail_b(src, dst):
+        if Path(src).name == 'b':
+            raise PermissionError('synthetic file lock')
+        return original_move(src, dst)
+
+    monkeypatch.setattr(shutil, 'move', fail_b)
+    mapping = client.rename_mr_series_folders(str(organized), str(excel))
+
+    assert set(mapping) == {'a'}
+    assert (organized / mapping['a']).is_dir() and (organized / 'b').is_dir()
+    with pd.ExcelFile(excel) as book:
+        for sheet in ['DICOM_Metadata', 'MR_Cleaned', 'MR_Cleaned_v2']:
+            folders = pd.read_excel(book, sheet).SeriesFolder.tolist()
+            assert folders == [mapping['a'], 'b']
+            assert all((organized / folder).is_dir() for folder in folders)
+
+
+@pytest.mark.parametrize('scenario', ['all_failed', 'target_exists', 'source_missing'])
+def test_unsuccessful_rename_preserves_old_folder(tmp_path, monkeypatch, scenario):
+    from src.client.unified import DICOMDownloadClient
+    organized = tmp_path / 'organized'
+    organized.mkdir()
+    if scenario != 'source_missing':
+        (organized / 'old').mkdir()
+    if scenario == 'target_exists':
+        (organized / '001_T1_GRE_AX_3D').mkdir()
+    excel = tmp_path / 'metadata.xlsx'
+    pd.DataFrame([row(Modality='MR', SeriesFolder='old', SeriesNumber=1)]).to_excel(
+        excel, sheet_name='DICOM_Metadata', index=False)
+    client = DICOMDownloadClient.__new__(DICOMDownloadClient)
+    client.progress_callback = None
+    if scenario == 'all_failed':
+        import shutil
+        monkeypatch.setattr(shutil, 'move', lambda *args: (_ for _ in ()).throw(PermissionError('locked')))
+
+    assert client.rename_mr_series_folders(str(organized), str(excel)) == {}
+    assert pd.read_excel(excel, sheet_name='DICOM_Metadata').iloc[0].SeriesFolder == 'old'
+    if scenario != 'source_missing':
+        assert (organized / 'old').is_dir()
 
 
 def test_direct_metadata_index_uses_cpu_offload(tmp_path, monkeypatch):

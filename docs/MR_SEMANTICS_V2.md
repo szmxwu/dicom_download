@@ -166,3 +166,16 @@ STIR、标准 b 值、增强型 MR 多帧优先级、帧成员关系、索引失
 
 验证：专项 68 passed，全套 253 passed / 3 skipped。仍未验证真实 NIfTI 候选体积映射、
 图像层面的组织强化/压脂效果，以及独立人工测试集上的逐属性 precision。
+
+## 2026-11-03 三处语义与目录一致性修复
+
+- 延迟增强传播将自定义阶段仅保留在 `dynamicPhase`；规范 `contrast_administration_state`
+  与 V2 均为 POST/inferred。`contrast_propagation_evidence` 记录来源 SeriesInstanceUID、
+  双方时间字段与时间差依据。明确否定对比剂记录不再参与传播，兼容增强标记保持 False。
+- `is_derived` 仅表示 DICOM ImageType 的图像来源；新增 `inferred_derived` 表示
+  `refinedImageType` 的名称/用途推断。两者不一致时保留各自证据，但关闭 `is_derived`
+  自动监督掩码；`inferred_derived` 为 inferred，默认也不自动接受。
+- MR 目录重命名只以实际 `shutil.move` 成功的映射更新三张 Excel 表和返回值；
+  部分失败、全部失败、目标已存在及源目录缺失均保留旧目录引用。
+- 语义规则版本升级为 `mr-semantic-v2.2`，结果缓存指纹随之失效一次，避免拉回旧语义产物。
+  专项回归 74 passed，覆盖上述反例及重命名边界；生产部署不在本次修改范围内。
